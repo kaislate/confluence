@@ -15,7 +15,11 @@ loom.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 assert_no_alloc.workspace = true
+criterion.workspace = true
 
+[[bench]]
+name = "matrix"
+harness = false
 
 [lints]
 workspace = true
