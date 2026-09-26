@@ -2,7 +2,7 @@
 
 Free, open-source, low-latency audio matrix router for Windows. No nag screens, no timers, no lockouts — ever.
 
-Status: Milestone 0 in progress. See `docs/superpowers/specs/2026-09-25-confluence-design.md`.
+Status: Milestone 0 in progress — engine core, clock-drift correction and headless engine.
 
 ## Build and test
 
