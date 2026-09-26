@@ -4,4 +4,6 @@
 pub mod buffer;
 pub mod gain;
 pub mod mailbox;
+pub mod matrix;
+pub mod params;
 mod sync;
