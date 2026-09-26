@@ -179,6 +179,11 @@ impl FillController {
     pub fn output(&self) -> f64 {
         self.output
     }
+
+    /// True while the output is pinned at (or within 10% of) its limit.
+    pub fn is_saturated(&self) -> bool {
+        self.output.abs() >= 0.9 * self.limit_ppm
+    }
 }
 
 #[cfg(test)]

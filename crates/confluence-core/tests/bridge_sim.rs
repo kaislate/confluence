@@ -112,6 +112,8 @@ fn run_output(device_rate: f64, device_ppm: f64, device_block: usize, master_blo
     let (mut dev_frames, mut master_blocks) = (0u64, 0u64);
     let mut cont = Continuity::default();
     let mut xruns_at_settle = None;
+    // Worst correction and fill error once settled: a converged loop holds both small.
+    let (mut worst_corr, mut worst_err) = (0.0f64, 0.0f64);
     loop {
         let t_dev = (dev_frames + device_block as u64) as f64 / dev_rate;
         let t_master = (master_blocks + 1) as f64 * master_block as f64 / MASTER_RATE;
@@ -138,6 +140,11 @@ fn run_output(device_rate: f64, device_ppm: f64, device_block: usize, master_blo
             for n in 0..device_block {
                 cont.push(dev_buf[2 * n]);
             }
+            if cont.armed {
+                let h = stats.snapshot();
+                worst_corr = worst_corr.max(h.correction_ppm.abs());
+                worst_err = worst_err.max((h.fill_frames - h.target_frames).abs());
+            }
         }
     }
     let h = stats.snapshot();
@@ -145,6 +152,9 @@ fn run_output(device_rate: f64, device_ppm: f64, device_block: usize, master_blo
     assert_eq!(h.underruns + h.overruns, 0, "xruns after settling: {h:?}");
     assert!(cont.max < MAX_SECOND_DIFF, "discontinuity {} ({h:?})", cont.max);
     assert!((h.device_ppm - device_ppm).abs() < 5.0, "ppm estimate {h:?}");
+    // The device's drift is fed forward, so a settled loop only trims residual error.
+    assert!(worst_corr < 100.0, "correction still swinging after settling: {worst_corr:.0} ppm ({h:?})");
+    assert!(worst_err < device_block as f64 / 2.0, "fill still swinging after settling: {worst_err:.0} frames ({h:?})");
 }
 
 #[test]
@@ -170,6 +180,14 @@ fn output_tracks_fast_device() {
 #[test]
 fn output_tracks_slow_device() {
     run_output(48_000.0, -300.0, 441, 128, 120.0);
+}
+
+/// Equal large blocks, as on a GoXLR master feeding VB-Matrix VASIO-8 (512/512):
+/// the loop starts well away from its target and must converge without
+/// saturating into a ±1000 ppm limit cycle.
+#[test]
+fn output_with_equal_large_blocks_converges() {
+    run_output(48_000.0, 40.0, 512, 512, 120.0);
 }
 
 #[test]
@@ -332,4 +350,54 @@ fn output_device_underrun_reaches_the_engine_side() {
     assert!(mid.target_frames > base, "the engine side raised its target after the underrun: {mid:?}");
     assert_eq!(end.underruns + end.overruns, mid.underruns + mid.overruns, "clean after recovery: {end:?}");
     assert!(disc < MAX_SECOND_DIFF, "discontinuity {disc} after recovery");
+}
+
+/// Reproduces a hardware limit cycle (GoXLR master, VB-Matrix VASIO-8 output,
+/// 512/512 blocks). Both drift estimates are wild at start-up (the master's
+/// read -3900 ppm, then tens of ppm wandering) and the playback driver starts
+/// 3 s late, so the loop begins ~400 frames short and saturates. The fill then
+/// crosses the target just as the device estimator settles: the loop must
+/// not lock (engaging the 10 ppm/s slew limit) while its correction is still
+/// near ±1000 ppm, or it overshoots by a block and cycles at ±1000 ppm forever.
+#[test]
+fn output_starting_far_from_target_converges_without_a_limit_cycle() {
+    let mut cfg = config(48_000.0, 512, 512);
+    cfg.margin_frames = 96;
+    let (mut eng, mut dev, stats) = soft_output(cfg).unwrap();
+    let dev_rate = 48_000.0 * (1.0 + 40e-6);
+    let (late, block) = (3.0, PlanarBuffer::new(2, 512));
+    let mut jitter = Jitter(0x1234_5678_9ABC_DEF1, 0.0005);
+    let mut buf = vec![0.0f32; 1024];
+    let (mut dev_frames, mut master_blocks) = (0u64, 0u64);
+    let (mut worst_corr, mut worst_err) = (0.0f64, 0.0f64);
+    loop {
+        let t_dev = late + (dev_frames + 512) as f64 / dev_rate;
+        let t_master = (master_blocks + 1) as f64 * 512.0 / MASTER_RATE;
+        if t_master > 90.0 {
+            break;
+        }
+        if t_master <= t_dev {
+            let master_ppm = if t_master < 0.5 {
+                -3900.0
+            } else if t_master < 3.0 {
+                60.0
+            } else {
+                30.0 + 30.0 * (t_master * TAU / 18.0).sin()
+            };
+            eng.write(&block, 0, t_master, master_ppm);
+            master_blocks += 1;
+        } else {
+            dev.read_interleaved(&mut buf, t_dev + jitter.next());
+            dev_frames += 512;
+            if t_dev > 40.0 {
+                let h = stats.snapshot();
+                worst_corr = worst_corr.max(h.correction_ppm.abs());
+                worst_err = worst_err.max((h.fill_frames - h.target_frames).abs());
+            }
+        }
+    }
+    let h = stats.snapshot();
+    assert_eq!(h.underruns + h.overruns, 0, "{h:?}");
+    assert!(worst_corr < 100.0, "correction still swinging after 40 s: {worst_corr:.0} ppm ({h:?})");
+    assert!(worst_err < 256.0, "fill still swinging after 40 s: {worst_err:.0} frames ({h:?})");
 }

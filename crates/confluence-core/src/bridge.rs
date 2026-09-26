@@ -16,8 +16,15 @@ use crate::buffer::PlanarBuffer;
 use crate::clock::{FillController, RateEstimator, DEFAULT_RATE_BANDWIDTH_HZ};
 
 /// Minimum running time after (re)start before the fill controller's slew
-/// limit may engage. It also needs a settled rate estimate and a small fill error.
+/// limit may engage. It also needs a settled rate estimate, a small fill error
+/// and a steady correction.
 const LOCK_AFTER_S: f64 = 5.0;
+/// Time constant of the slow average the correction is compared against to
+/// decide whether it is steady.
+const STEADY_FILTER_S: f64 = 2.0;
+/// A correction within this of its slow average (≈ changing by less than
+/// 10 ppm/s) is steady. A loop still sweeping through its target is not.
+const STEADY_PPM: f64 = 20.0;
 /// Headroom (spare frames in the ring when audio is consumed) is evaluated
 /// over windows of this length.
 const HEADROOM_WINDOW_S: f64 = 5.0;
@@ -138,6 +145,8 @@ struct Tracker {
     last_stamp: Option<f64>,
     /// Low-pass filtered fill; `None` until the first measurement after (re)start.
     fill_filtered: Option<f64>,
+    /// Slow average of the correction, for judging whether the loop is steady.
+    corr_average: Option<f64>,
     stats: Arc<BridgeStats>,
 }
 
@@ -157,6 +166,7 @@ impl Tracker {
             quiet_windows: 0,
             last_stamp: None,
             fill_filtered: None,
+            corr_average: None,
             stats,
         }
     }
@@ -199,13 +209,21 @@ impl Tracker {
         let fill = filtered;
         let err = fill - self.target();
         // Slew-limit only a converged loop; release it on a large disturbance.
+        // Converged means a small error *and* a steady, unsaturated correction:
+        // a loop sweeping through its target with a large correction must not
+        // lock, or the slew limit stops it unwinding and it overshoots.
         let block = self.cfg.device_block as f64;
+        let out = self.ctl.output();
+        let average = self.corr_average.map_or(out, |a| a + (dt / STEADY_FILTER_S).min(1.0) * (out - a));
+        self.corr_average = Some(average);
+        let steady = (out - average).abs() < STEADY_PPM && !self.ctl.is_saturated();
         if self.ctl.is_locked() && err.abs() > block {
             self.ctl.unlock();
         } else if !self.ctl.is_locked()
             && self.run_time >= LOCK_AFTER_S
             && self.device_est.is_settled()
             && err.abs() < block / 4.0
+            && steady
         {
             self.ctl.lock();
         }
@@ -263,6 +281,7 @@ impl Tracker {
         self.run_time = 0.0;
         (self.window_min_headroom, self.window_time, self.quiet_windows) = (f64::INFINITY, 0.0, 0);
         self.fill_filtered = None;
+        self.corr_average = None;
         self.ctl.reset();
         self.grow(self.cfg.device_block as f64);
     }
