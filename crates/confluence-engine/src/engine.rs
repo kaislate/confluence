@@ -142,7 +142,7 @@ impl Engine {
         let (device, side, stats) =
             soft_input(self.bridge_config(spec)).map_err(|e| EngineError::Asrc(e.to_string()))?;
         let id = self.next_id;
-        let entry = Box::new(InputEntry { id, first_channel: first as usize, side });
+        let entry = Box::new(InputEntry { id, first_channel: first as usize, channels: spec.channels, side });
         self.to_audio.try_send(AudioMsg::AddInput(entry)).map_err(|_| EngineError::Busy)?;
         self.next_id += 1;
         self.next_input += spec.channels as u32;
@@ -350,5 +350,24 @@ mod tests {
         e.tick();
         assert!(e.returns.try_recv().is_none(), "returned entry was drained by tick");
         assert_eq!(e.remove_slot(id), Err(EngineError::NoSuchSlot(id)));
+    }
+
+    #[test]
+    fn removed_input_slot_goes_silent_instead_of_looping_its_last_block() {
+        let (mut e, mut audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let (_, _dev_a) = e.add_soft_input(&spec("a", 2)).unwrap();
+        let (b, _dev_b) = e.add_soft_input(&spec("b", 2)).unwrap();
+        e.handle(&Command::SetPoint { input: 2, output: 0, gain_db: 0.0, mute: false, invert: false });
+        e.tick();
+        audio.process_block(0.0);
+        // The last block slot `b` delivered before it was unplugged.
+        audio.inputs.channel_mut(2).fill(0.5);
+        audio.inputs.channel_mut(3).fill(0.5);
+        e.remove_slot(b).unwrap();
+        for n in 1..40 {
+            audio.process_block(n as f64 * 0.005);
+        }
+        assert!(audio.inputs.channel(2).iter().chain(audio.inputs.channel(3)).all(|&s| s == 0.0));
+        assert!(audio.outputs.channel(0).iter().all(|&s| s == 0.0), "no stale audio reaches outputs");
     }
 }

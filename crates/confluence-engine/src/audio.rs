@@ -16,6 +16,7 @@ pub const MAX_SLOTS: usize = 64;
 pub(crate) struct InputEntry {
     pub id: u32,
     pub first_channel: usize,
+    pub channels: usize,
     pub side: InputEngineSide,
 }
 
@@ -92,6 +93,11 @@ impl AudioEngine {
                 AudioMsg::Remove(id) => {
                     if let Some(i) = self.soft_inputs.iter().position(|e| e.id == id) {
                         let e = self.soft_inputs.swap_remove(i);
+                        // Nothing writes these channels any more: silence them so
+                        // the router does not keep mixing the last delivered block.
+                        for ch in e.first_channel..e.first_channel + e.channels {
+                            self.inputs.channel_mut(ch).fill(0.0);
+                        }
                         self.give_back(Returned::Input(e));
                     }
                     if let Some(i) = self.soft_outputs.iter().position(|e| e.id == id) {
