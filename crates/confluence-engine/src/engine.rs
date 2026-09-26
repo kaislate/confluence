@@ -14,6 +14,7 @@ use confluence_core::gain::PointParams;
 use confluence_core::mailbox::{self, Receiver, Sender};
 use confluence_core::matrix::{matrix, MatrixController};
 
+use crate::alloc::ChannelAllocator;
 use crate::audio::{AudioEngine, AudioMsg, InputEntry, OutputEntry, Returned, MAX_SLOTS};
 
 #[derive(Clone, Copy, Debug)]
@@ -23,12 +24,12 @@ pub struct EngineConfig {
     pub max_inputs: usize,
     pub max_outputs: usize,
     pub ramp: Duration,
-    /// Safety margin for soft-slot rings, in frames (spec default 0.5 ms).
+    /// Safety margin for soft-slot rings, in frames (spec default 2 ms).
     pub margin_frames: usize,
 }
 
 impl EngineConfig {
-    /// Spec defaults: 1024 × 1024 channels, 10 ms ramps, 0.5 ms margin.
+    /// Spec defaults: 1024 × 1024 channels, 10 ms ramps, 2 ms margin.
     pub fn new(sample_rate: f64, block: usize) -> Self {
         Self {
             sample_rate,
@@ -36,7 +37,7 @@ impl EngineConfig {
             max_inputs: 1024,
             max_outputs: 1024,
             ramp: Duration::from_millis(10),
-            margin_frames: (sample_rate * 0.0005).round() as usize,
+            margin_frames: (sample_rate * 0.002).round() as usize,
         }
     }
 }
@@ -45,6 +46,8 @@ impl EngineConfig {
 pub enum EngineError {
     #[error("not enough free {0} channels")]
     ChannelsExhausted(&'static str),
+    #[error("{0} channels {1}..{2} are already in use")]
+    ChannelsTaken(&'static str, u32, u32),
     #[error("too many soft slots")]
     TooManySlots,
     #[error("no slot with id {0}")]
@@ -55,21 +58,70 @@ pub enum EngineError {
     Asrc(String),
     #[error("audio side is not accepting messages")]
     Busy,
+    #[error("the engine already has a master slot")]
+    MasterExists,
+    #[error("the master slot cannot be removed while the engine runs")]
+    MasterInUse,
+    #[error("slot {0} is not offline")]
+    NotOffline(u32),
 }
 
 /// Parameters of a soft-clocked device slot.
 #[derive(Clone, Debug)]
 pub struct SoftSlotSpec {
     pub name: String,
+    /// Device binding, e.g. `asio:GoXLR ASIO Driver`.
+    pub device: String,
     pub channels: usize,
     pub device_rate: f64,
     pub device_block: usize,
     pub quality: AsrcQuality,
+    /// Place the slot at this first channel (restoring a saved layout); `None` = first fit.
+    pub first_channel: Option<u32>,
+}
+
+/// Parameters of the master slot: the device whose callback drives the engine.
+#[derive(Clone, Debug)]
+pub struct MasterSlotSpec {
+    pub name: String,
+    pub device: String,
+    pub inputs: usize,
+    pub outputs: usize,
+    pub first_input: Option<u32>,
+    pub first_output: Option<u32>,
+}
+
+/// Where a master slot's channels live in the engine's channel space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MasterChannels {
+    pub first_input: usize,
+    pub inputs: usize,
+    pub first_output: usize,
+    pub outputs: usize,
+}
+
+/// A slot whose device is missing: its channels stay reserved so every other
+/// slot (and every route) keeps its channel numbers.
+#[derive(Clone, Debug)]
+pub struct OfflineSlotSpec {
+    pub name: String,
+    pub device: String,
+    pub role: ClockRole,
+    pub first_input: u32,
+    pub inputs: u32,
+    pub first_output: u32,
+    pub outputs: u32,
+}
+
+enum SlotStats {
+    None,
+    Bridge(Arc<BridgeStats>),
+    Master,
 }
 
 struct SlotRecord {
     state: SlotState,
-    stats: Arc<BridgeStats>,
+    stats: SlotStats,
 }
 
 pub struct Engine {
@@ -79,11 +131,12 @@ pub struct Engine {
     returns: Receiver<Returned>,
     slots: Vec<SlotRecord>,
     next_id: u32,
-    next_input: u32,
-    next_output: u32,
+    inputs: ChannelAllocator,
+    outputs: ChannelAllocator,
     soft_inputs: usize,
     soft_outputs: usize,
     blocks: Arc<AtomicU64>,
+    master_ppm: Arc<AtomicU64>,
 }
 
 impl Engine {
@@ -93,6 +146,7 @@ impl Engine {
         let (to_audio, inbox) = mailbox::channel(4 * MAX_SLOTS);
         let (returns_tx, returns) = mailbox::channel(4 * MAX_SLOTS);
         let blocks = Arc::new(AtomicU64::new(0));
+        let master_ppm = Arc::new(AtomicU64::new(0f64.to_bits()));
         let mut inputs = PlanarBuffer::new(cfg.max_inputs, cfg.block);
         let mut outputs = PlanarBuffer::new(cfg.max_outputs, cfg.block);
         inputs.set_frames(cfg.block);
@@ -106,6 +160,9 @@ impl Engine {
             inbox,
             returns: returns_tx,
             blocks: blocks.clone(),
+            sample_rate: cfg.sample_rate,
+            master_est: None,
+            master_ppm: master_ppm.clone(),
         };
         let engine = Engine {
             cfg,
@@ -114,11 +171,12 @@ impl Engine {
             returns,
             slots: Vec::new(),
             next_id: 1,
-            next_input: 0,
-            next_output: 0,
+            inputs: ChannelAllocator::new(cfg.max_inputs as u32),
+            outputs: ChannelAllocator::new(cfg.max_outputs as u32),
             soft_inputs: 0,
             soft_outputs: 0,
             blocks,
+            master_ppm,
         };
         (engine, audio)
     }
@@ -132,33 +190,36 @@ impl Engine {
         self.blocks.load(Ordering::Relaxed)
     }
 
+    /// The hardware master's measured deviation from nominal (0 on the internal clock).
+    pub fn master_ppm(&self) -> f64 {
+        f64::from_bits(self.master_ppm.load(Ordering::Relaxed))
+    }
+
     /// Adds a soft-clocked capture slot. The returned device side belongs in the
     /// device's callback; its channels appear as matrix inputs.
     pub fn add_soft_input(&mut self, spec: &SoftSlotSpec) -> Result<(u32, InputDeviceSide), EngineError> {
         if self.soft_inputs >= MAX_SLOTS {
             return Err(EngineError::TooManySlots);
         }
-        let first = self.alloc(spec.channels, true)?;
-        let (device, side, stats) =
-            soft_input(self.bridge_config(spec)).map_err(|e| EngineError::Asrc(e.to_string()))?;
+        let first = claim(&mut self.inputs, spec.first_channel, spec.channels as u32, "input")?;
+        let built = soft_input(self.bridge_config(spec));
+        let (device, side, stats) = match built {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.inputs.free(first, spec.channels as u32);
+                return Err(EngineError::Asrc(e.to_string()));
+            }
+        };
         let id = self.next_id;
         let entry = Box::new(InputEntry { id, first_channel: first as usize, channels: spec.channels, side });
-        self.to_audio.try_send(AudioMsg::AddInput(entry)).map_err(|_| EngineError::Busy)?;
+        if self.to_audio.try_send(AudioMsg::AddInput(entry)).is_err() {
+            self.inputs.free(first, spec.channels as u32);
+            return Err(EngineError::Busy);
+        }
         self.next_id += 1;
-        self.next_input += spec.channels as u32;
         self.soft_inputs += 1;
-        self.slots.push(SlotRecord {
-            state: SlotState {
-                id,
-                name: spec.name.clone(),
-                role: ClockRole::Soft,
-                first_input: first,
-                inputs: spec.channels as u32,
-                first_output: 0,
-                outputs: 0,
-            },
-            stats,
-        });
+        let state = self.state(id, &spec.name, &spec.device, ClockRole::Soft, (first, spec.channels as u32), (0, 0));
+        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats) });
         Ok((id, device))
     }
 
@@ -167,41 +228,127 @@ impl Engine {
         if self.soft_outputs >= MAX_SLOTS {
             return Err(EngineError::TooManySlots);
         }
-        let first = self.alloc(spec.channels, false)?;
-        let (side, device, stats) =
-            soft_output(self.bridge_config(spec)).map_err(|e| EngineError::Asrc(e.to_string()))?;
+        let first = claim(&mut self.outputs, spec.first_channel, spec.channels as u32, "output")?;
+        let built = soft_output(self.bridge_config(spec));
+        let (side, device, stats) = match built {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.outputs.free(first, spec.channels as u32);
+                return Err(EngineError::Asrc(e.to_string()));
+            }
+        };
         let id = self.next_id;
         let entry = Box::new(OutputEntry { id, first_channel: first as usize, side });
-        self.to_audio.try_send(AudioMsg::AddOutput(entry)).map_err(|_| EngineError::Busy)?;
+        if self.to_audio.try_send(AudioMsg::AddOutput(entry)).is_err() {
+            self.outputs.free(first, spec.channels as u32);
+            return Err(EngineError::Busy);
+        }
         self.next_id += 1;
-        self.next_output += spec.channels as u32;
         self.soft_outputs += 1;
-        self.slots.push(SlotRecord {
-            state: SlotState {
-                id,
-                name: spec.name.clone(),
-                role: ClockRole::Soft,
-                first_input: 0,
-                inputs: 0,
-                first_output: first,
-                outputs: spec.channels as u32,
-            },
-            stats,
-        });
+        let state = self.state(id, &spec.name, &spec.device, ClockRole::Soft, (0, 0), (first, spec.channels as u32));
+        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats) });
         Ok((id, device))
     }
 
-    /// Detaches a slot. Its channels go silent; its matrix points are kept.
+    /// Registers the master slot: the device whose callback will copy its inputs
+    /// into, and its outputs out of, the returned channel ranges around
+    /// `AudioEngine::process_master_block`.
+    pub fn add_master_slot(&mut self, spec: &MasterSlotSpec) -> Result<(u32, MasterChannels), EngineError> {
+        if self.slots.iter().any(|s| s.state.role == ClockRole::Master) {
+            return Err(EngineError::MasterExists);
+        }
+        let first_input = claim_maybe(&mut self.inputs, spec.first_input, spec.inputs as u32, "input")?;
+        let first_output = match claim_maybe(&mut self.outputs, spec.first_output, spec.outputs as u32, "output") {
+            Ok(f) => f,
+            Err(e) => {
+                self.inputs.free(first_input, spec.inputs as u32);
+                return Err(e);
+            }
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let state = self.state(
+            id,
+            &spec.name,
+            &spec.device,
+            ClockRole::Master,
+            (first_input, spec.inputs as u32),
+            (first_output, spec.outputs as u32),
+        );
+        self.slots.push(SlotRecord { state, stats: SlotStats::Master });
+        let ch = MasterChannels {
+            first_input: first_input as usize,
+            inputs: spec.inputs,
+            first_output: first_output as usize,
+            outputs: spec.outputs,
+        };
+        Ok((id, ch))
+    }
+
+    /// Reserves the channels of a slot whose device is currently missing.
+    pub fn add_offline_slot(&mut self, spec: &OfflineSlotSpec) -> Result<u32, EngineError> {
+        let first_input = claim_maybe(&mut self.inputs, Some(spec.first_input), spec.inputs, "input")?;
+        if let Err(e) = claim_maybe(&mut self.outputs, Some(spec.first_output), spec.outputs, "output") {
+            self.inputs.free(first_input, spec.inputs);
+            return Err(e);
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut state = self.state(
+            id,
+            &spec.name,
+            &spec.device,
+            spec.role,
+            (spec.first_input, spec.inputs),
+            (spec.first_output, spec.outputs),
+        );
+        state.online = false;
+        self.slots.push(SlotRecord { state, stats: SlotStats::None });
+        Ok(id)
+    }
+
+    /// Frees an offline slot's channels without touching the routes on them,
+    /// so the device can come back online on the same channels (routes intact).
+    pub fn release_offline_slot(&mut self, id: u32) -> Result<(), EngineError> {
+        let idx = self.slots.iter().position(|s| s.state.id == id).ok_or(EngineError::NoSuchSlot(id))?;
+        if self.slots[idx].state.online {
+            return Err(EngineError::NotOffline(id));
+        }
+        let s = self.slots.remove(idx).state;
+        self.inputs.free(s.first_input, s.inputs);
+        self.outputs.free(s.first_output, s.outputs);
+        Ok(())
+    }
+
+    /// Detaches a slot: its channels go silent, routes touching them fade out
+    /// and are removed, and the channels become free for reuse.
     pub fn remove_slot(&mut self, id: u32) -> Result<(), EngineError> {
         let idx = self.slots.iter().position(|s| s.state.id == id).ok_or(EngineError::NoSuchSlot(id))?;
-        self.to_audio.try_send(AudioMsg::Remove(id)).map_err(|_| EngineError::Busy)?;
+        let rec = &self.slots[idx];
+        if rec.state.role == ClockRole::Master && rec.state.online {
+            return Err(EngineError::MasterInUse);
+        }
+        if matches!(rec.stats, SlotStats::Bridge(_)) {
+            self.to_audio.try_send(AudioMsg::Remove(id)).map_err(|_| EngineError::Busy)?;
+            if rec.state.inputs > 0 {
+                self.soft_inputs -= 1;
+            }
+            if rec.state.outputs > 0 {
+                self.soft_outputs -= 1;
+            }
+        }
         let rec = self.slots.remove(idx);
-        if rec.state.inputs > 0 {
-            self.soft_inputs -= 1;
+        let s = &rec.state;
+        let ins = s.first_input..s.first_input + s.inputs;
+        let outs = s.first_output..s.first_output + s.outputs;
+        for (input, output, _) in self.matrix.points() {
+            if ins.contains(&input) || outs.contains(&output) {
+                // In range by construction; removal cannot fail.
+                let _ = self.matrix.remove_point(input, output);
+            }
         }
-        if rec.state.outputs > 0 {
-            self.soft_outputs -= 1;
-        }
+        self.inputs.free(s.first_input, s.inputs);
+        self.outputs.free(s.first_output, s.outputs);
         Ok(())
     }
 
@@ -216,7 +363,14 @@ impl Engine {
         }
     }
 
-    /// Executes one Control API command.
+    /// Current slot list (same data as `Command::ListSlots`).
+    pub fn slots(&self) -> Vec<SlotState> {
+        self.slots.iter().map(|s| s.state.clone()).collect()
+    }
+
+    /// Executes one Control API command. Device commands (`ListDevices`,
+    /// `AddDevice`, `RemoveSlot` of a device) are handled by the process that
+    /// owns the device providers; here `RemoveSlot` only detaches the slot.
     pub fn handle(&mut self, cmd: &Command) -> Response {
         match *cmd {
             Command::SetPoint { input, output, gain_db, mute, invert } => {
@@ -242,27 +396,75 @@ impl Engine {
                     })
                     .collect(),
             ),
-            Command::ListSlots => Response::Slots(self.slots.iter().map(|s| s.state.clone()).collect()),
+            Command::ListSlots => Response::Slots(self.slots()),
             Command::Health => Response::Health {
                 blocks: self.blocks(),
-                slots: self
-                    .slots
-                    .iter()
-                    .map(|s| {
-                        let h = s.stats.snapshot();
-                        SlotHealth {
-                            id: s.state.id,
-                            underruns: h.underruns,
-                            overruns: h.overruns,
-                            fill_frames: h.fill_frames,
-                            target_frames: h.target_frames,
-                            device_ppm: h.device_ppm,
-                            correction_ppm: h.correction_ppm,
-                        }
-                    })
-                    .collect(),
+                slots: self.slots.iter().filter_map(|s| self.health(s)).collect(),
             },
+            Command::RemoveSlot { id } => match self.remove_slot(id) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e.to_string()),
+            },
+            Command::ListDevices | Command::AddDevice { .. } => {
+                Response::Error("device commands are handled by the engine process".into())
+            }
             Command::Shutdown => Response::Ok,
+        }
+    }
+
+    fn health(&self, s: &SlotRecord) -> Option<SlotHealth> {
+        let id = s.state.id;
+        match &s.stats {
+            SlotStats::Bridge(stats) => {
+                let h = stats.snapshot();
+                Some(SlotHealth {
+                    id,
+                    underruns: h.underruns,
+                    overruns: h.overruns,
+                    fill_frames: h.fill_frames,
+                    target_frames: h.target_frames,
+                    device_ppm: h.device_ppm,
+                    correction_ppm: h.correction_ppm,
+                    device_lost: false,
+                    device_faults: 0,
+                    driver_requests: 0,
+                })
+            }
+            SlotStats::Master => Some(SlotHealth {
+                id,
+                underruns: 0,
+                overruns: 0,
+                fill_frames: 0.0,
+                target_frames: 0.0,
+                device_ppm: self.master_ppm(),
+                correction_ppm: 0.0,
+                device_lost: false,
+                device_faults: 0,
+                driver_requests: 0,
+            }),
+            SlotStats::None => None,
+        }
+    }
+
+    fn state(
+        &self,
+        id: u32,
+        name: &str,
+        device: &str,
+        role: ClockRole,
+        (first_input, inputs): (u32, u32),
+        (first_output, outputs): (u32, u32),
+    ) -> SlotState {
+        SlotState {
+            id,
+            name: name.to_string(),
+            device: device.to_string(),
+            role,
+            online: true,
+            first_input,
+            inputs,
+            first_output,
+            outputs,
         }
     }
 
@@ -277,17 +479,26 @@ impl Engine {
             margin_frames: self.cfg.margin_frames,
         }
     }
+}
 
-    fn alloc(&self, channels: usize, input: bool) -> Result<u32, EngineError> {
-        let (next, max, what) = if input {
-            (self.next_input, self.cfg.max_inputs, "input")
-        } else {
-            (self.next_output, self.cfg.max_outputs, "output")
-        };
-        if channels == 0 || next as usize + channels > max {
-            return Err(EngineError::ChannelsExhausted(what));
-        }
-        Ok(next)
+/// Claims `len > 0` channels, at `at` if given, else first fit.
+fn claim(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'static str) -> Result<u32, EngineError> {
+    if len == 0 {
+        return Err(EngineError::ChannelsExhausted(what));
+    }
+    match at {
+        Some(start) if a.reserve(start, len) => Ok(start),
+        Some(start) => Err(EngineError::ChannelsTaken(what, start, start + len)),
+        None => a.alloc(len).ok_or(EngineError::ChannelsExhausted(what)),
+    }
+}
+
+/// As [`claim`], but a zero-length request succeeds and reserves nothing.
+fn claim_maybe(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'static str) -> Result<u32, EngineError> {
+    if len == 0 {
+        Ok(at.unwrap_or(0))
+    } else {
+        claim(a, at, len, what)
     }
 }
 
@@ -298,10 +509,23 @@ mod tests {
     fn spec(name: &str, channels: usize) -> SoftSlotSpec {
         SoftSlotSpec {
             name: name.into(),
+            device: String::new(),
             channels,
             device_rate: 48_000.0,
             device_block: 128,
             quality: AsrcQuality::Sinc64,
+            first_channel: None,
+        }
+    }
+
+    fn master(inputs: usize, outputs: usize) -> MasterSlotSpec {
+        MasterSlotSpec {
+            name: "master".into(),
+            device: "asio:test".into(),
+            inputs,
+            outputs,
+            first_input: None,
+            first_output: None,
         }
     }
 
@@ -369,5 +593,68 @@ mod tests {
         }
         assert!(audio.inputs.channel(2).iter().chain(audio.inputs.channel(3)).all(|&s| s == 0.0));
         assert!(audio.outputs.channel(0).iter().all(|&s| s == 0.0), "no stale audio reaches outputs");
+    }
+
+    #[test]
+    fn removing_a_slot_frees_its_channels_and_its_routes() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let (a, _) = e.add_soft_input(&spec("a", 2)).unwrap();
+        let (_b, _) = e.add_soft_input(&spec("b", 2)).unwrap();
+        e.handle(&Command::SetPoint { input: 1, output: 0, gain_db: 0.0, mute: false, invert: false });
+        e.handle(&Command::SetPoint { input: 2, output: 0, gain_db: 0.0, mute: false, invert: false });
+        e.remove_slot(a).unwrap();
+        let Response::Points(p) = e.handle(&Command::ListPoints) else { panic!() };
+        assert_eq!(p.len(), 1, "only the route on the removed slot's channels is gone: {p:?}");
+        assert_eq!(p[0].input, 2);
+        let (c, _) = e.add_soft_input(&spec("c", 2)).unwrap();
+        let slot = e.slots().into_iter().find(|s| s.id == c).unwrap();
+        assert_eq!(slot.first_input, 0, "freed channels are reused");
+    }
+
+    #[test]
+    fn fixed_placement_restores_a_layout_and_rejects_clashes() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let mut s = spec("late", 2);
+        s.first_channel = Some(10);
+        let (id, _) = e.add_soft_input(&s).unwrap();
+        assert_eq!(e.slots().into_iter().find(|x| x.id == id).unwrap().first_input, 10);
+        let mut clash = spec("clash", 4);
+        clash.first_channel = Some(8);
+        assert_eq!(e.add_soft_input(&clash).err(), Some(EngineError::ChannelsTaken("input", 8, 12)));
+        assert_eq!(e.slots().len(), 1, "a failed add leaves nothing behind");
+    }
+
+    #[test]
+    fn offline_slots_hold_their_channels_and_report_offline() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let off = OfflineSlotSpec {
+            name: "unplugged".into(),
+            device: "asio:gone".into(),
+            role: ClockRole::Soft,
+            first_input: 0,
+            inputs: 4,
+            first_output: 0,
+            outputs: 0,
+        };
+        let id = e.add_offline_slot(&off).unwrap();
+        let (b, _) = e.add_soft_input(&spec("b", 2)).unwrap();
+        let slots = e.slots();
+        assert!(!slots.iter().find(|s| s.id == id).unwrap().online);
+        assert_eq!(slots.iter().find(|s| s.id == b).unwrap().first_input, 4, "reserved range skipped");
+        let Response::Health { slots: health, .. } = e.handle(&Command::Health) else { panic!() };
+        assert!(health.iter().all(|h| h.id != id), "offline slots have no stream health");
+        assert_eq!(e.handle(&Command::RemoveSlot { id }), Response::Ok);
+    }
+
+    #[test]
+    fn one_master_slot_whose_channels_come_from_the_shared_space() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let (_, _) = e.add_soft_input(&spec("a", 2)).unwrap();
+        let (m, ch) = e.add_master_slot(&master(8, 6)).unwrap();
+        assert_eq!(ch, MasterChannels { first_input: 2, inputs: 8, first_output: 0, outputs: 6 });
+        assert_eq!(e.add_master_slot(&master(2, 2)).err(), Some(EngineError::MasterExists));
+        assert_eq!(e.remove_slot(m), Err(EngineError::MasterInUse));
+        let slot = e.slots().into_iter().find(|s| s.id == m).unwrap();
+        assert_eq!(slot.role, ClockRole::Master);
     }
 }

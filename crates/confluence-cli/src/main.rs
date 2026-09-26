@@ -2,8 +2,8 @@
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use confluence_api::{Command, Response};
+use clap::{Parser, Subcommand, ValueEnum};
+use confluence_api::{Command, DeviceKind, Response};
 
 #[derive(Parser)]
 #[command(version, about = "Control a running Confluence engine")]
@@ -39,6 +39,31 @@ enum Cmd {
     Health,
     /// Stop the engine.
     Shutdown,
+    /// List audio devices the engine can open.
+    Devices,
+    /// Open a device as slot(s): `add-device asio "MOTU Gen 5"`.
+    AddDevice { kind: Kind, name: String },
+    /// Close a slot and remove the routes on its channels.
+    RemoveSlot { id: u32 },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Kind {
+    Asio,
+    WasapiOut,
+    WasapiIn,
+    App,
+}
+
+impl From<Kind> for DeviceKind {
+    fn from(k: Kind) -> Self {
+        match k {
+            Kind::Asio => DeviceKind::Asio,
+            Kind::WasapiOut => DeviceKind::WasapiRender,
+            Kind::WasapiIn => DeviceKind::WasapiCapture,
+            Kind::App => DeviceKind::AppCapture,
+        }
+    }
 }
 
 impl Cmd {
@@ -52,6 +77,9 @@ impl Cmd {
             Cmd::Slots => Command::ListSlots,
             Cmd::Health => Command::Health,
             Cmd::Shutdown => Command::Shutdown,
+            Cmd::Devices => Command::ListDevices,
+            Cmd::AddDevice { kind, ref name } => Command::AddDevice { kind: kind.into(), name: name.clone() },
+            Cmd::RemoveSlot { id } => Command::RemoveSlot { id },
         }
     }
 }
@@ -74,8 +102,9 @@ fn render(resp: &Response) -> String {
         Response::Slots(slots) => slots
             .iter()
             .map(|s| {
+                let status = if s.online { "" } else { "  OFFLINE" };
                 format!(
-                    "#{:<3} {:<24} {:?}  in {}+{}  out {}+{}",
+                    "#{:<3} {:<24} {:?}  in {}+{}  out {}+{}{status}",
                     s.id, s.name, s.role, s.first_input, s.inputs, s.first_output, s.outputs
                 )
             })
@@ -84,12 +113,31 @@ fn render(resp: &Response) -> String {
         Response::Health { blocks, slots } => {
             let mut lines = vec![format!("engine blocks: {blocks}")];
             lines.extend(slots.iter().map(|h| {
-                format!(
+                let mut line = format!(
                     "#{:<3} xruns {}/{}  fill {:.0}/{:.0}  drift {:+.1} ppm  correction {:+.1} ppm",
                     h.id, h.underruns, h.overruns, h.fill_frames, h.target_frames, h.device_ppm, h.correction_ppm
-                )
+                );
+                if h.device_lost {
+                    line.push_str("  DEVICE LOST");
+                }
+                if h.device_faults > 0 {
+                    line.push_str(&format!("  {} faults", h.device_faults));
+                }
+                if h.driver_requests > 0 {
+                    line.push_str(&format!("  {} driver requests (re-add the device)", h.driver_requests));
+                }
+                line
             }));
             lines.join("\n")
+        }
+        Response::Devices(devices) if devices.is_empty() => "no devices".into(),
+        Response::Devices(devices) => devices
+            .iter()
+            .map(|d| format!("{:<10} {:<40} in {:>3}  out {:>3}", d.kind.prefix(), d.name, d.inputs, d.outputs))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Response::SlotsAdded(ids) => {
+            format!("added slot(s) {}", ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", "))
         }
     }
 }
@@ -134,7 +182,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use confluence_api::PointState;
+    use confluence_api::{PointState, SlotHealth};
 
     #[test]
     fn negative_gain_parses() {
@@ -146,11 +194,48 @@ mod tests {
     }
 
     #[test]
+    fn device_commands_parse() {
+        let cli = Cli::try_parse_from(["confluence-cli", "add-device", "asio", "MOTU Gen 5"]).unwrap();
+        assert_eq!(cli.command.to_command(), Command::AddDevice { kind: DeviceKind::Asio, name: "MOTU Gen 5".into() });
+        let cli = Cli::try_parse_from(["confluence-cli", "add-device", "app", "Discord.exe"]).unwrap();
+        assert_eq!(
+            cli.command.to_command(),
+            Command::AddDevice { kind: DeviceKind::AppCapture, name: "Discord.exe".into() }
+        );
+        let cli = Cli::try_parse_from(["confluence-cli", "remove-slot", "3"]).unwrap();
+        assert_eq!(cli.command.to_command(), Command::RemoveSlot { id: 3 });
+    }
+
+    #[test]
     fn routes_render_one_per_line() {
         let r = Response::Points(vec![
             PointState { input: 0, output: 1, gain_db: -6.0, mute: false, invert: true },
             PointState { input: 3, output: 1, gain_db: 0.0, mute: true, invert: false },
         ]);
         assert_eq!(render(&r), "in    0 -> out    1    -6.0 dB inverted\nin    3 -> out    1    +0.0 dB muted");
+    }
+
+    #[test]
+    fn health_flags_device_problems() {
+        let h = |id, device_lost, device_faults, driver_requests| SlotHealth {
+            id,
+            underruns: 0,
+            overruns: 0,
+            fill_frames: 600.0,
+            target_frames: 600.0,
+            device_ppm: 1.0,
+            correction_ppm: 0.0,
+            device_lost,
+            device_faults,
+            driver_requests,
+        };
+        let text = render(&Response::Health {
+            blocks: 9,
+            slots: vec![h(1, false, 0, 0), h(2, true, 0, 0), h(3, false, 4, 2)],
+        });
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!lines[1].contains("DEVICE"), "{text}");
+        assert!(lines[2].contains("DEVICE LOST"), "{text}");
+        assert!(lines[3].contains("4 faults") && lines[3].contains("2 driver requests"), "{text}");
     }
 }

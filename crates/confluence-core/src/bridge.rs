@@ -6,7 +6,7 @@
 //! ring and feed a [`RateEstimator`]. A [`FillController`] trims the resampling
 //! ratio so the ring stays near its target fill.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -16,10 +16,24 @@ use crate::buffer::PlanarBuffer;
 use crate::clock::{FillController, RateEstimator, DEFAULT_RATE_BANDWIDTH_HZ};
 
 /// Minimum running time after (re)start before the fill controller's slew
-/// limit may engage. It also needs a settled rate estimate and a small fill error.
+/// limit may engage. It also needs a settled rate estimate, a small fill error
+/// and a steady correction.
 const LOCK_AFTER_S: f64 = 5.0;
-/// Clean running time after which an enlarged target shrinks one step.
-const DECAY_EVERY_S: f64 = 10.0;
+/// Time constant of the slow average the correction is compared against to
+/// decide whether it is steady.
+const STEADY_FILTER_S: f64 = 2.0;
+/// A correction within this of its slow average (≈ changing by less than
+/// 10 ppm/s) is steady. A loop still sweeping through its target is not.
+const STEADY_PPM: f64 = 20.0;
+/// Headroom (spare frames in the ring when audio is consumed) is evaluated
+/// over windows of this length.
+const HEADROOM_WINDOW_S: f64 = 5.0;
+/// If a window's minimum headroom falls below this, the target grows by a
+/// quarter device block before any underrun happens.
+const HEADROOM_SAFETY_S: f64 = 0.001;
+/// Consecutive windows with generous headroom required before the target
+/// shrinks by an eighth of a device block (never below the base target).
+const QUIET_WINDOWS_TO_SHRINK: u32 = 3;
 /// Upper bound on adaptive target growth, in device blocks above the base target.
 const MAX_EXTRA_BLOCKS: f64 = 8.0;
 const STAMP_QUEUE: usize = 256;
@@ -38,7 +52,7 @@ pub struct BridgeConfig {
     pub master_rate: f64,
     pub master_block: usize,
     pub quality: AsrcQuality,
-    /// Safety margin added to the base target fill (spec default 0.5 ms).
+    /// Safety margin added to the base target fill (spec default 2 ms).
     pub margin_frames: usize,
 }
 
@@ -56,7 +70,6 @@ impl BridgeConfig {
 }
 
 /// Health counters shared between both sides and the control thread.
-#[derive(Default)]
 pub struct BridgeStats {
     underruns: AtomicU64,
     overruns: AtomicU64,
@@ -64,6 +77,23 @@ pub struct BridgeStats {
     target_bits: AtomicU64,
     device_ppm_bits: AtomicU64,
     correction_ppm_bits: AtomicU64,
+    /// Output bridges: smallest headroom the device side saw since the engine
+    /// side last looked (`i64::MAX` = no reading).
+    device_min_headroom: AtomicI64,
+}
+
+impl Default for BridgeStats {
+    fn default() -> Self {
+        Self {
+            underruns: AtomicU64::new(0),
+            overruns: AtomicU64::new(0),
+            fill_bits: AtomicU64::new(0),
+            target_bits: AtomicU64::new(0),
+            device_ppm_bits: AtomicU64::new(0),
+            correction_ppm_bits: AtomicU64::new(0),
+            device_min_headroom: AtomicI64::new(i64::MAX),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -107,11 +137,16 @@ struct Tracker {
     fixed_target: Option<f64>,
     running: bool,
     run_time: f64,
-    clean_time: f64,
+    /// Smallest headroom seen in the current window, in device frames.
+    window_min_headroom: f64,
+    window_time: f64,
+    quiet_windows: u32,
     /// Time of the newest device timestamp, if any.
     last_stamp: Option<f64>,
     /// Low-pass filtered fill; `None` until the first measurement after (re)start.
     fill_filtered: Option<f64>,
+    /// Slow average of the correction, for judging whether the loop is steady.
+    corr_average: Option<f64>,
     stats: Arc<BridgeStats>,
 }
 
@@ -126,9 +161,12 @@ impl Tracker {
             fixed_target: None,
             running: false,
             run_time: 0.0,
-            clean_time: 0.0,
+            window_min_headroom: f64::INFINITY,
+            window_time: 0.0,
+            quiet_windows: 0,
             last_stamp: None,
             fill_filtered: None,
+            corr_average: None,
             stats,
         }
     }
@@ -171,37 +209,81 @@ impl Tracker {
         let fill = filtered;
         let err = fill - self.target();
         // Slew-limit only a converged loop; release it on a large disturbance.
+        // Converged means a small error *and* a steady, unsaturated correction:
+        // a loop sweeping through its target with a large correction must not
+        // lock, or the slew limit stops it unwinding and it overshoots.
         let block = self.cfg.device_block as f64;
+        let out = self.ctl.output();
+        let average = self.corr_average.map_or(out, |a| a + (dt / STEADY_FILTER_S).min(1.0) * (out - a));
+        self.corr_average = Some(average);
+        let steady = (out - average).abs() < STEADY_PPM && !self.ctl.is_saturated();
         if self.ctl.is_locked() && err.abs() > block {
             self.ctl.unlock();
         } else if !self.ctl.is_locked()
             && self.run_time >= LOCK_AFTER_S
             && self.device_est.is_settled()
             && err.abs() < block / 4.0
+            && steady
         {
             self.ctl.lock();
         }
         let corr = self.ctl.update(err, dt);
         self.run_time += dt;
-        self.clean_time += dt;
-        if self.clean_time >= DECAY_EVERY_S {
-            self.clean_time = 0.0;
-            let base = self.cfg.base_target();
-            self.target = (self.target - self.cfg.device_block as f64 / 4.0).max(base);
+        self.window_time += dt;
+        if self.window_time >= HEADROOM_WINDOW_S {
+            self.evaluate_headroom();
         }
         self.stats.publish(fill, self.target(), self.device_est.ppm(), corr);
         corr
+    }
+
+    /// Records the spare frames in the ring at the moment audio is consumed.
+    fn headroom(&mut self, frames: f64) {
+        self.window_min_headroom = self.window_min_headroom.min(frames);
+    }
+
+    /// Adaptive latency from measured headroom (spec §6.3): grow before an
+    /// underrun when headroom gets thin; shrink only after sustained slack.
+    /// Only a converged (locked) loop is judged: while acquiring, headroom
+    /// reflects the transient, and moving the target would fight the controller.
+    fn evaluate_headroom(&mut self) {
+        let block = self.cfg.device_block as f64;
+        let safety = HEADROOM_SAFETY_S * self.cfg.device_rate;
+        let min = self.window_min_headroom;
+        (self.window_min_headroom, self.window_time) = (f64::INFINITY, 0.0);
+        let settled = self.fill_filtered.is_some_and(|f| (f - self.target()).abs() < block / 4.0);
+        if !min.is_finite() || !self.ctl.is_locked() || !settled {
+            self.quiet_windows = 0;
+            return;
+        }
+        if min < safety {
+            self.quiet_windows = 0;
+            self.grow(block / 4.0);
+        } else if min > block / 2.0 + safety {
+            self.quiet_windows += 1;
+            if self.quiet_windows >= QUIET_WINDOWS_TO_SHRINK {
+                self.quiet_windows = 0;
+                self.target = (self.target - block / 8.0).max(self.cfg.base_target());
+            }
+        } else {
+            self.quiet_windows = 0;
+        }
+    }
+
+    fn grow(&mut self, frames: f64) {
+        let max = self.cfg.base_target() + MAX_EXTRA_BLOCKS * self.cfg.device_block as f64;
+        self.target = (self.target + frames).min(max);
     }
 
     /// Records an xrun: stop, raise the target by one device block, restart the controller.
     fn xrun(&mut self) {
         self.running = false;
         self.run_time = 0.0;
-        self.clean_time = 0.0;
+        (self.window_min_headroom, self.window_time, self.quiet_windows) = (f64::INFINITY, 0.0, 0);
         self.fill_filtered = None;
+        self.corr_average = None;
         self.ctl.reset();
-        let max = self.cfg.base_target() + MAX_EXTRA_BLOCKS * self.cfg.device_block as f64;
-        self.target = (self.target + self.cfg.device_block as f64).min(max);
+        self.grow(self.cfg.device_block as f64);
     }
 }
 
@@ -297,6 +379,7 @@ impl InputEngineSide {
         self.asrc.set_relative_ratio(rel);
 
         let need = self.asrc.input_frames_next();
+        t.headroom(avail as f64 - need as f64);
         if avail < need {
             t.stats.underruns.fetch_add(1, Ordering::Relaxed);
             t.xrun();
@@ -389,6 +472,10 @@ impl OutputEngineSide {
         t.drain_stamps();
         // A device-side underrun is this bridge's xrun too: the engine side
         // raises its target and restarts its loop, like the input side does.
+        let seen = t.stats.device_min_headroom.swap(i64::MAX, Ordering::Relaxed);
+        if seen != i64::MAX {
+            t.headroom(seen as f64);
+        }
         let underruns = t.stats.underruns.load(Ordering::Relaxed);
         if underruns != self.seen_underruns {
             self.seen_underruns = underruns;
@@ -396,19 +483,30 @@ impl OutputEngineSide {
         }
         let ring = ((self.ring_slots - self.samples.slots()) / ch) as f64;
         let fill = ring - t.frames_since_stamp(now);
-        if !t.running {
-            // After an xrun, wait until the device has drained the ring to the
-            // target (re-centring latency). Blocks produced meanwhile are
-            // dropped: queuing them would only add delay, and it avoids
-            // counting one stall as an overrun on every block.
-            if fill > t.target() {
+        if t.last_stamp.is_none() {
+            // The device has not consumed anything yet (driver start-up): fill
+            // the ring to the target at the nominal ratio and drop the rest.
+            // Running the controller now would only integrate the start-up
+            // wait into a large, slowly unwinding correction.
+            if fill >= t.target() {
                 return;
             }
-            t.running = true;
+            self.asrc.set_relative_ratio(1.0 / (1.0 + master_ppm * 1e-6));
+        } else {
+            if !t.running {
+                // After an xrun, wait until the device has drained the ring to the
+                // target (re-centring latency). Blocks produced meanwhile are
+                // dropped: queuing them would only add delay, and it avoids
+                // counting one stall as an overrun on every block.
+                if fill > t.target() {
+                    return;
+                }
+                t.running = true;
+            }
+            let corr = t.correction(fill);
+            let rel = (1.0 + t.device_est.ppm() * 1e-6) / (1.0 + master_ppm * 1e-6) * (1.0 - corr * 1e-6);
+            self.asrc.set_relative_ratio(rel);
         }
-        let corr = t.correction(fill);
-        let rel = (1.0 + t.device_est.ppm() * 1e-6) / (1.0 + master_ppm * 1e-6) * (1.0 - corr * 1e-6);
-        self.asrc.set_relative_ratio(rel);
 
         let frames = block.frames().min(self.asrc.input_frames_next());
         for c in 0..ch {
@@ -443,6 +541,7 @@ impl OutputDeviceSide {
             }
             self.primed = true;
         }
+        self.stats.device_min_headroom.fetch_min(avail as i64 - frames as i64, Ordering::Relaxed);
         if self.samples.pop_entire_slice(&mut data[..frames * self.channels]).is_err() {
             self.stats.underruns.fetch_add(1, Ordering::Relaxed);
             self.primed = false;

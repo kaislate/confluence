@@ -1,16 +1,20 @@
 //! The Confluence engine: real-time audio side, control side, simulation,
 //! journal, and (on Windows) the internal clock and named-pipe server.
 
+pub mod alloc;
 pub mod audio;
 #[cfg(windows)]
 pub mod clock;
+#[cfg(windows)]
+pub mod devices;
 pub mod engine;
 #[cfg(windows)]
 pub mod ipc;
 pub mod journal;
-#[cfg(windows)]
-pub mod rt;
 pub mod sim;
 
+#[cfg(windows)]
+pub use confluence_rt as rt;
+
 pub use audio::AudioEngine;
-pub use engine::{Engine, EngineConfig, EngineError, SoftSlotSpec};
+pub use engine::{Engine, EngineConfig, EngineError, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec};

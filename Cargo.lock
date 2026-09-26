@@ -296,8 +296,41 @@ dependencies = [
  "clap",
  "confluence-api",
  "confluence-core",
+ "confluence-provider-asio",
+ "confluence-provider-wasapi",
+ "confluence-rt",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "confluence-provider-asio"
+version = "0.1.0"
+dependencies = [
+ "confluence-core",
+ "confluence-rt",
+ "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "confluence-provider-wasapi"
+version = "0.1.0"
+dependencies = [
+ "confluence-core",
+ "confluence-rt",
+ "thiserror",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "confluence-rt"
+version = "0.1.0"
+dependencies = [
  "windows",
 ]
 

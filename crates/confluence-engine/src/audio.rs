@@ -1,12 +1,15 @@
-//! The real-time half of the engine: one call to [`AudioEngine::process_block`]
-//! per master block. Slots are added and removed through a mailbox; removed
-//! slot state goes back to the control side to be dropped there.
+//! The real-time half of the engine: one call per master block, either
+//! [`AudioEngine::process_block`] (internal clock) or
+//! [`AudioEngine::process_master_block`] (hardware master). Slots are added and
+//! removed through a mailbox; removed slot state goes back to the control side
+//! to be dropped there.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use confluence_core::bridge::{InputEngineSide, OutputEngineSide};
 use confluence_core::buffer::PlanarBuffer;
+use confluence_core::clock::{RateEstimator, DEFAULT_RATE_BANDWIDTH_HZ};
 use confluence_core::mailbox::{Receiver, Sender};
 use confluence_core::matrix::MatrixRouter;
 
@@ -51,19 +54,52 @@ pub struct AudioEngine {
     pub(crate) inbox: Receiver<AudioMsg>,
     pub(crate) returns: Sender<Returned>,
     pub(crate) blocks: Arc<AtomicU64>,
+    pub(crate) sample_rate: f64,
+    /// Drift of a hardware master against the engine time base; `None` on the internal clock.
+    pub(crate) master_est: Option<RateEstimator>,
+    pub(crate) master_ppm: Arc<AtomicU64>,
 }
 
 impl AudioEngine {
     /// Runs one master block. `now` is the block time in seconds on the clock
     /// shared with device timestamps. Never allocates, locks or frees.
     pub fn process_block(&mut self, now: f64) {
+        self.run(now, 0.0);
+    }
+
+    /// Runs one block clocked by a hardware master whose callback delivered
+    /// `frames` frames since its previous callback, ending at `now` (engine time
+    /// base). The master's own drift is measured here and passed to every soft
+    /// slot's resampler. The caller copies the master's inputs into
+    /// [`inputs_mut`](Self::inputs_mut) before, and its outputs out of
+    /// [`outputs`](Self::outputs) after, this call.
+    pub fn process_master_block(&mut self, now: f64, frames: u32) {
+        let rate = self.sample_rate;
+        let est = self.master_est.get_or_insert_with(|| RateEstimator::new(rate, DEFAULT_RATE_BANDWIDTH_HZ));
+        est.update(frames, now);
+        let ppm = if est.updates() > 1 { est.ppm() } else { 0.0 };
+        self.master_ppm.store(ppm.to_bits(), Ordering::Relaxed);
+        self.run(now, ppm);
+    }
+
+    /// The engine's input channel space, for a master device to write into.
+    pub fn inputs_mut(&mut self) -> &mut PlanarBuffer {
+        &mut self.inputs
+    }
+
+    /// The engine's output channel space, for a master device to read from.
+    pub fn outputs(&self) -> &PlanarBuffer {
+        &self.outputs
+    }
+
+    fn run(&mut self, now: f64, master_ppm: f64) {
         self.apply_messages();
         for e in self.soft_inputs.iter_mut() {
-            e.side.read(&mut self.inputs, e.first_channel, now, 0.0);
+            e.side.read(&mut self.inputs, e.first_channel, now, master_ppm);
         }
         self.router.process(&self.inputs, &mut self.outputs);
         for e in self.soft_outputs.iter_mut() {
-            e.side.write(&self.outputs, e.first_channel, now, 0.0);
+            e.side.write(&self.outputs, e.first_channel, now, master_ppm);
         }
         self.blocks.fetch_add(1, Ordering::Relaxed);
     }
