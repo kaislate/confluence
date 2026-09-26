@@ -2,14 +2,20 @@
 /target/
 **/*.rs.bk
 
-# Brainstorming companion scratch
+# Local tooling scratch
 /.superpowers/
 
 # Vendor reference material (not redistributable / kept local)
 /Docs and Resources/
+
+# Internal design notes (kept local)
+/docs/
 
 # Editor / OS
 .vs/
 .vscode/
 *.user
 Thumbs.db
+
+# Claude Code worktrees
+/.claude/

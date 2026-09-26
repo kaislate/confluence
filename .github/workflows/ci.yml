@@ -1,0 +1,15 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo test -p confluence-core --test bridge_sim --release
+      - name: loom
+        shell: bash
+        run: RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test -p confluence-core --test loom_mailbox --release
