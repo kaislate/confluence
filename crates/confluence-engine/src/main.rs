@@ -126,6 +126,7 @@ mod app {
             DeviceManager::open_file(args.devices.unwrap_or_else(|| data_dir().join("devices.json")));
         let master = match asio_master {
             Some((name, mut dev)) => {
+                devices.claim_master(&name);
                 // A master with a saved placement goes first so it gets its old
                 // channels; a new master takes whatever the restored devices leave.
                 let placement = devices.saved_master(&name);
@@ -158,13 +159,21 @@ mod app {
                     return Response::Ok;
                 }
                 let mut s = lock(&state);
-                let State { engine, devices, .. } = &mut *s;
-                if let Some(resp) = devices.handle(engine, cmd) {
-                    return resp;
-                }
-                let resp = s.engine.handle(cmd);
-                if resp == Response::Ok && cmd.is_mutation() {
-                    if let Err(e) = s.journal.append(cmd) {
+                let State { engine, devices, journal } = &mut *s;
+                let mut resp = match devices.handle(engine, cmd) {
+                    Some(resp) => resp,
+                    None => engine.handle(cmd),
+                };
+                devices.annotate(&mut resp);
+                if resp == Response::Ok {
+                    // Removing a slot also removes its routes: rewrite the journal
+                    // so they do not come back, on other devices, after a restart.
+                    let saved = match cmd {
+                        Command::RemoveSlot { .. } => journal.compact(&state_commands(engine)),
+                        _ if cmd.is_mutation() => journal.append(cmd),
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = saved {
                         return Response::Error(format!("applied but not saved: {e}"));
                     }
                 }

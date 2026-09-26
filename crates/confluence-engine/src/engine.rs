@@ -62,6 +62,8 @@ pub enum EngineError {
     MasterExists,
     #[error("the master slot cannot be removed while the engine runs")]
     MasterInUse,
+    #[error("slot {0} is not offline")]
+    NotOffline(u32),
 }
 
 /// Parameters of a soft-clocked device slot.
@@ -305,6 +307,19 @@ impl Engine {
         Ok(id)
     }
 
+    /// Frees an offline slot's channels without touching the routes on them,
+    /// so the device can come back online on the same channels (routes intact).
+    pub fn release_offline_slot(&mut self, id: u32) -> Result<(), EngineError> {
+        let idx = self.slots.iter().position(|s| s.state.id == id).ok_or(EngineError::NoSuchSlot(id))?;
+        if self.slots[idx].state.online {
+            return Err(EngineError::NotOffline(id));
+        }
+        let s = self.slots.remove(idx).state;
+        self.inputs.free(s.first_input, s.inputs);
+        self.outputs.free(s.first_output, s.outputs);
+        Ok(())
+    }
+
     /// Detaches a slot: its channels go silent, routes touching them fade out
     /// and are removed, and the channels become free for reuse.
     pub fn remove_slot(&mut self, id: u32) -> Result<(), EngineError> {
@@ -410,6 +425,9 @@ impl Engine {
                     target_frames: h.target_frames,
                     device_ppm: h.device_ppm,
                     correction_ppm: h.correction_ppm,
+                    device_lost: false,
+                    device_faults: 0,
+                    driver_requests: 0,
                 })
             }
             SlotStats::Master => Some(SlotHealth {
@@ -420,6 +438,9 @@ impl Engine {
                 target_frames: 0.0,
                 device_ppm: self.master_ppm(),
                 correction_ppm: 0.0,
+                device_lost: false,
+                device_faults: 0,
+                driver_requests: 0,
             }),
             SlotStats::None => None,
         }

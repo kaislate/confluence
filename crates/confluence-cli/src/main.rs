@@ -113,10 +113,20 @@ fn render(resp: &Response) -> String {
         Response::Health { blocks, slots } => {
             let mut lines = vec![format!("engine blocks: {blocks}")];
             lines.extend(slots.iter().map(|h| {
-                format!(
+                let mut line = format!(
                     "#{:<3} xruns {}/{}  fill {:.0}/{:.0}  drift {:+.1} ppm  correction {:+.1} ppm",
                     h.id, h.underruns, h.overruns, h.fill_frames, h.target_frames, h.device_ppm, h.correction_ppm
-                )
+                );
+                if h.device_lost {
+                    line.push_str("  DEVICE LOST");
+                }
+                if h.device_faults > 0 {
+                    line.push_str(&format!("  {} faults", h.device_faults));
+                }
+                if h.driver_requests > 0 {
+                    line.push_str(&format!("  {} driver requests (re-add the device)", h.driver_requests));
+                }
+                line
             }));
             lines.join("\n")
         }
@@ -172,7 +182,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use confluence_api::PointState;
+    use confluence_api::{PointState, SlotHealth};
 
     #[test]
     fn negative_gain_parses() {
@@ -203,5 +213,29 @@ mod tests {
             PointState { input: 3, output: 1, gain_db: 0.0, mute: true, invert: false },
         ]);
         assert_eq!(render(&r), "in    0 -> out    1    -6.0 dB inverted\nin    3 -> out    1    +0.0 dB muted");
+    }
+
+    #[test]
+    fn health_flags_device_problems() {
+        let h = |id, device_lost, device_faults, driver_requests| SlotHealth {
+            id,
+            underruns: 0,
+            overruns: 0,
+            fill_frames: 600.0,
+            target_frames: 600.0,
+            device_ppm: 1.0,
+            correction_ppm: 0.0,
+            device_lost,
+            device_faults,
+            driver_requests,
+        };
+        let text = render(&Response::Health {
+            blocks: 9,
+            slots: vec![h(1, false, 0, 0), h(2, true, 0, 0), h(3, false, 4, 2)],
+        });
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!lines[1].contains("DEVICE"), "{text}");
+        assert!(lines[2].contains("DEVICE LOST"), "{text}");
+        assert!(lines[3].contains("4 faults") && lines[3].contains("2 driver requests"), "{text}");
     }
 }

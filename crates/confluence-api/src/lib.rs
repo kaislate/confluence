@@ -94,6 +94,13 @@ pub struct SlotHealth {
     pub target_frames: f64,
     pub device_ppm: f64,
     pub correction_ppm: f64,
+    /// The device disappeared (unplugged or disabled); the slot keeps its channels.
+    pub device_lost: bool,
+    /// Callbacks whose handler faulted (the outputs were silenced instead).
+    pub device_faults: u64,
+    /// Reset, resync and rate-change requests from the driver. The engine does
+    /// not re-open devices yet: re-add the device to apply them.
+    pub driver_requests: u64,
 }
 
 /// Kinds of device the engine can open.

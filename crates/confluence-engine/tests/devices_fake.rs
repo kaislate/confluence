@@ -4,7 +4,7 @@
 #![cfg(windows)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -219,11 +219,23 @@ fn adding_an_offline_device_brings_it_back_on_its_saved_channels() {
     let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
     let mut devices = DeviceManager::open_file(path.clone()).0.with_asio_opener(open());
     assert_eq!(devices.restore(&mut engine).len(), 1, "fake:a starts offline");
-    // Still unplugged: a clear error, and the offline slot keeps its channels.
+    // Routes to and from the offline device (replayed from the journal at start-up).
+    route(&mut engine, 0, 2); // fake:a input 1 -> fake:b output 1
+    route(&mut engine, 2, 1); // fake:b input 1 -> fake:a output 2
+    let points = |engine: &mut Engine| match engine.handle(&Command::ListPoints) {
+        Response::Points(p) => {
+            let mut v: Vec<_> = p.into_iter().map(|p| (p.input, p.output)).collect();
+            v.sort();
+            v
+        }
+        other => panic!("{other:?}"),
+    };
+    // Still unplugged: a clear error, and the offline slot keeps its channels and routes.
     let err = devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap_err();
     assert!(err.contains("not installed"), "{err}");
     let offline = engine.slots().into_iter().find(|s| !s.online).unwrap();
     assert_eq!((offline.first_input, offline.first_output), (0, 0));
+    assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)], "a failed re-add keeps the routes");
     // Plugged back in: it comes back online on the same channels.
     plugged.store(true, Ordering::Release);
     let ids = devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap();
@@ -233,5 +245,66 @@ fn adding_an_offline_device_brings_it_back_on_its_saved_channels() {
     let a_in = slots.iter().find(|s| s.name == "fake:a in").unwrap();
     let a_out = slots.iter().find(|s| s.name == "fake:a out").unwrap();
     assert_eq!((a_in.first_input, a_out.first_output), (0, 0), "routes to it keep working");
+    assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)], "coming back online keeps the routes");
     assert_eq!(devices.bindings().len(), 2);
+}
+
+#[test]
+fn a_soft_device_that_becomes_the_master_is_not_opened_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("devices.json");
+    let m = Arc::new(FakeProbe::default());
+    {
+        // First run on the internal clock: "fake:m" is added as an ordinary device.
+        let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let mut devices =
+            DeviceManager::open_file(path.clone()).0.with_asio_opener(opener(vec![("fake:m", m.clone())]));
+        devices.add(&mut engine, DeviceKind::Asio, "fake:m").unwrap();
+    }
+    // Next run uses it as the master: the saved soft binding must not open it a second time.
+    let opens = Arc::new(AtomicUsize::new(0));
+    let counting: AsioOpener = {
+        let (opens, m) = (opens.clone(), m.clone());
+        Box::new(move |name: &str| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            opener(vec![("fake:m", m.clone())])(name)
+        })
+    };
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::open_file(path.clone()).0.with_asio_opener(counting);
+    devices.claim_master("fake:m");
+    let warnings = devices.restore(&mut engine);
+    assert_eq!(opens.load(Ordering::SeqCst), 0, "the master's driver is not loaded again");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("master"), "{warnings:?}");
+    assert!(engine.slots().is_empty());
+    assert!(devices.bindings().is_empty(), "the stale soft binding is dropped");
+}
+
+#[test]
+fn driver_requests_show_in_health() {
+    let probe = Arc::new(FakeProbe::default());
+    let open: AsioOpener = Box::new(move |name: &str| {
+        let mut cfg = FakeConfig::new(name);
+        cfg.probe = probe.clone();
+        cfg.reset_after = Some(20); // e.g. the user changed the buffer size in the driver panel
+        AsioDevice::open(DriverSource::Fake(cfg))
+    });
+    let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_asio_opener(open);
+    let ids = devices.add(&mut engine, DeviceKind::Asio, "fake:r").unwrap();
+    let clock = InternalClock::start(audio, 48_000.0).unwrap();
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(10));
+        engine.tick();
+    }
+    let mut resp = engine.handle(&Command::Health);
+    devices.annotate(&mut resp);
+    let Response::Health { slots, .. } = resp else { panic!() };
+    for id in ids {
+        let h = slots.iter().find(|h| h.id == id).unwrap();
+        assert!(h.driver_requests >= 1, "{h:?}");
+        assert!(!h.device_lost);
+    }
+    clock.stop();
 }

@@ -4,6 +4,7 @@
 //! shift (spec §5.2, §16), and runs an ASIO device as the hardware master.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use confluence_api::{ClockRole, Command, DeviceInfo, DeviceKind, Response};
 use confluence_core::asrc::AsrcQuality;
@@ -33,8 +34,7 @@ impl Binding {
     }
 }
 
-/// An open device. Held only for its `Drop`, which stops the stream.
-#[allow(dead_code)]
+/// An open device: its `Drop` stops the stream; its health feeds `annotate`.
 enum Handle {
     Asio(AsioDevice),
     Wasapi(WasapiStream),
@@ -62,6 +62,8 @@ pub type AsioOpener = Box<dyn Fn(&str) -> Result<AsioDevice, AsioHostError> + Se
 pub struct DeviceManager {
     bound: Vec<Bound>,
     master: Option<Binding>,
+    /// Name of the ASIO driver running as the master, known before restore.
+    master_name: Option<String>,
     /// Bindings read at startup, not yet restored.
     saved: Saved,
     path: Option<PathBuf>,
@@ -75,6 +77,7 @@ impl DeviceManager {
         Self {
             bound: Vec::new(),
             master: None,
+            master_name: None,
             saved: Saved::default(),
             path,
             asio_open: Box::new(AsioDevice::open_installed),
@@ -113,8 +116,16 @@ impl DeviceManager {
         self.saved.master.as_ref().filter(|b| b.name == name).map(|b| (b.first_input, b.first_output))
     }
 
+    /// Declares which ASIO driver is the master, before [`restore`](Self::restore):
+    /// a saved soft-slot binding of the same driver is then dropped instead of
+    /// loading the driver a second time.
+    pub fn claim_master(&mut self, name: &str) {
+        self.master_name = Some(name.to_string());
+    }
+
     /// Records the running master's placement so it is reused next time.
     pub fn set_master(&mut self, name: &str, ch: MasterChannels) -> Result<(), String> {
+        self.master_name = Some(name.to_string());
         self.master = Some(Binding {
             kind: DeviceKind::Asio,
             name: name.to_string(),
@@ -156,7 +167,7 @@ impl DeviceManager {
     /// loaded twice. An offline device comes back on its saved channels.
     pub fn add(&mut self, engine: &mut Engine, kind: DeviceKind, name: &str) -> Result<Vec<u32>, String> {
         let device = format!("{}:{}", kind.prefix(), name);
-        if kind == DeviceKind::Asio && self.master.as_ref().is_some_and(|m| m.name == name) {
+        if kind == DeviceKind::Asio && self.master_name.as_deref() == Some(name) {
             return Err(format!("{device} is the master clock device"));
         }
         let existing = self.bound.iter().position(|b| b.binding.kind == kind && b.binding.name == name);
@@ -165,9 +176,10 @@ impl DeviceManager {
                 return Err(format!("{device} is already open as slot(s) {:?}", self.bound[i].slots));
             }
             Some(i) => {
+                // Offline: hand its channels back to the device, routes and all.
                 let b = self.bound.remove(i);
                 for id in &b.slots {
-                    engine.remove_slot(*id).map_err(|e| e.to_string())?;
+                    engine.release_offline_slot(*id).map_err(|e| e.to_string())?;
                 }
                 Some(b.binding)
             }
@@ -210,6 +222,10 @@ impl DeviceManager {
         let bindings = std::mem::take(&mut self.saved.devices);
         let mut warnings = Vec::new();
         for b in bindings {
+            if b.kind == DeviceKind::Asio && self.master_name.as_deref() == Some(b.name.as_str()) {
+                warnings.push(format!("{} is now the master clock device; its device binding was dropped", b.device()));
+                continue;
+            }
             match self.open(engine, b.kind, &b.name, Some(&b)) {
                 Ok(bound) => self.bound.push(bound),
                 Err(e) => {
@@ -259,6 +275,30 @@ impl DeviceManager {
             },
             _ => return None,
         })
+    }
+
+    /// Adds each open device's own health (loss, faults, driver requests) to
+    /// the engine's `Health` response for that device's slots.
+    pub fn annotate(&self, resp: &mut Response) {
+        let Response::Health { slots, .. } = resp else { return };
+        for b in &self.bound {
+            let (mut lost, mut faults, mut requests) = (false, 0, 0);
+            for h in &b.handles {
+                match h {
+                    Handle::Asio(dev) => {
+                        let hl = dev.health();
+                        faults += hl.faults.load(Ordering::Relaxed);
+                        requests += hl.reset_requests.load(Ordering::Relaxed)
+                            + hl.resync_requests.load(Ordering::Relaxed)
+                            + hl.rate_changes.load(Ordering::Relaxed);
+                    }
+                    Handle::Wasapi(stream) => lost |= stream.health().lost.load(Ordering::Relaxed),
+                }
+            }
+            for h in slots.iter_mut().filter(|h| b.slots.contains(&h.id)) {
+                (h.device_lost, h.device_faults, h.driver_requests) = (lost, faults, requests);
+            }
+        }
     }
 
     /// Current bindings (for tests and diagnostics).
