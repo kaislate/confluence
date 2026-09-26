@@ -23,12 +23,12 @@ pub struct EngineConfig {
     pub max_inputs: usize,
     pub max_outputs: usize,
     pub ramp: Duration,
-    /// Safety margin for soft-slot rings, in frames (spec default 0.5 ms).
+    /// Safety margin for soft-slot rings, in frames (spec default 2 ms).
     pub margin_frames: usize,
 }
 
 impl EngineConfig {
-    /// Spec defaults: 1024 × 1024 channels, 10 ms ramps, 0.5 ms margin.
+    /// Spec defaults: 1024 × 1024 channels, 10 ms ramps, 2 ms margin.
     pub fn new(sample_rate: f64, block: usize) -> Self {
         Self {
             sample_rate,
@@ -36,7 +36,7 @@ impl EngineConfig {
             max_inputs: 1024,
             max_outputs: 1024,
             ramp: Duration::from_millis(10),
-            margin_frames: (sample_rate * 0.0005).round() as usize,
+            margin_frames: (sample_rate * 0.002).round() as usize,
         }
     }
 }

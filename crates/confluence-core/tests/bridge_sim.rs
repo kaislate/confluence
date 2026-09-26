@@ -308,6 +308,18 @@ fn output_recovers_after_device_stall() {
     assert!(disc < MAX_SECOND_DIFF, "discontinuity {disc} after recovery");
 }
 
+/// The playback device starts consuming 2 s after the engine starts writing
+/// (driver start-up): the controller must not wind up while it waits, so the
+/// stream starts without xruns and settles near its target with a small correction.
+#[test]
+fn output_device_starting_late_does_not_wind_up_the_controller() {
+    let (_, mid, end, disc) = run_output_with_gaps(0.0..2.0, 0.0..0.0);
+    assert_eq!(end.underruns + end.overruns, 0, "{end:?}");
+    assert!((mid.fill_frames - mid.target_frames).abs() < 128.0, "settled near target: {mid:?}");
+    assert!(mid.correction_ppm.abs() < 100.0, "no wound-up correction: {mid:?}");
+    assert!(disc < MAX_SECOND_DIFF, "discontinuity {disc}");
+}
+
 /// The engine stops writing for 100 ms (master hiccup): the device underruns,
 /// and the engine side must learn of it (raise the target once, restart the
 /// loop) and then run clean.
