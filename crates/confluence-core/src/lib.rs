@@ -1,6 +1,7 @@
 //! OS-independent DSP core of Confluence: gain, buffers, lock-free mailbox,
 //! matrix routing, clock estimation and asynchronous resampling.
 
+pub mod asrc;
 pub mod buffer;
 pub mod clock;
 pub mod gain;
