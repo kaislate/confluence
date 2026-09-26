@@ -2,8 +2,12 @@
 //! journal, and (on Windows) the internal clock and named-pipe server.
 
 pub mod audio;
+#[cfg(windows)]
+pub mod clock;
 pub mod engine;
 pub mod journal;
+#[cfg(windows)]
+pub mod rt;
 pub mod sim;
 
 pub use audio::AudioEngine;
