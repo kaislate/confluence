@@ -5,6 +5,8 @@ pub mod alloc;
 pub mod audio;
 #[cfg(windows)]
 pub mod clock;
+#[cfg(windows)]
+pub mod devices;
 pub mod engine;
 #[cfg(windows)]
 pub mod ipc;
