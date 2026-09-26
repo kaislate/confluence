@@ -3,6 +3,7 @@
 
 pub mod audio;
 pub mod engine;
+pub mod sim;
 
 pub use audio::AudioEngine;
 pub use engine::{Engine, EngineConfig, EngineError, SoftSlotSpec};
