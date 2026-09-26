@@ -2,6 +2,7 @@
 //! matrix routing, clock estimation and asynchronous resampling.
 
 pub mod asrc;
+pub mod bridge;
 pub mod buffer;
 pub mod clock;
 pub mod gain;
