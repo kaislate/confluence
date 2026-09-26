@@ -13,3 +13,6 @@
 .vscode/
 *.user
 Thumbs.db
+
+# Claude Code worktrees
+/.claude/
