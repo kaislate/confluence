@@ -3,6 +3,7 @@
 
 pub mod audio;
 pub mod engine;
+pub mod journal;
 pub mod sim;
 
 pub use audio::AudioEngine;
