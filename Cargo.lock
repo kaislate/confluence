@@ -313,6 +313,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "confluence-provider-wasapi"
+version = "0.1.0"
+dependencies = [
+ "confluence-core",
+ "confluence-rt",
+ "thiserror",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "confluence-rt"
 version = "0.1.0"
 dependencies = [
