@@ -303,6 +303,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "confluence-provider-asio"
+version = "0.1.0"
+dependencies = [
+ "confluence-core",
+ "confluence-rt",
+ "thiserror",
+ "windows",
+]
+
+[[package]]
 name = "confluence-rt"
 version = "0.1.0"
 dependencies = [
