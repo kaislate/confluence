@@ -8,9 +8,10 @@ pub mod engine;
 #[cfg(windows)]
 pub mod ipc;
 pub mod journal;
-#[cfg(windows)]
-pub mod rt;
 pub mod sim;
+
+#[cfg(windows)]
+pub use confluence_rt as rt;
 
 pub use audio::AudioEngine;
 pub use engine::{Engine, EngineConfig, EngineError, SoftSlotSpec};

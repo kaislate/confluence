@@ -296,8 +296,16 @@ dependencies = [
  "clap",
  "confluence-api",
  "confluence-core",
+ "confluence-rt",
  "tempfile",
  "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "confluence-rt"
+version = "0.1.0"
+dependencies = [
  "windows",
 ]
 

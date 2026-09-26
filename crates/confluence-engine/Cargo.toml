@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 confluence-core = { path = "../confluence-core" }
 confluence-api = { path = "../confluence-api" }
+confluence-rt = { path = "../confluence-rt" }
 thiserror.workspace = true
 clap = { version = "4", features = ["derive"] }
 
