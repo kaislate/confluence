@@ -1,0 +1,15 @@
+# Build output
+/target/
+**/*.rs.bk
+
+# Brainstorming companion scratch
+/.superpowers/
+
+# Vendor reference material (not redistributable / kept local)
+/Docs and Resources/
+
+# Editor / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
