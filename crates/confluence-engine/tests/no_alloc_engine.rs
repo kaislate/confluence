@@ -23,6 +23,8 @@ fn process_block_does_not_allocate() {
         device_rate: 44_100.0,
         device_block: 441,
         quality: AsrcQuality::Sinc64,
+        device: String::new(),
+        first_channel: None,
     };
     let (_, mut dev_in) = engine.add_soft_input(&spec("in")).unwrap();
     let (_, mut dev_out) = engine.add_soft_output(&spec("out")).unwrap();

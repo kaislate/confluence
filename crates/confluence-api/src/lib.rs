@@ -31,6 +31,18 @@ pub enum Command {
     Health,
     /// Asks the engine process to exit cleanly.
     Shutdown,
+    /// Lists audio devices the engine can open.
+    ListDevices,
+    /// Opens a device as one or more slots (an ASIO device becomes an input
+    /// slot and an output slot). Replies `SlotsAdded`.
+    AddDevice {
+        kind: DeviceKind,
+        name: String,
+    },
+    /// Closes a slot, removes the routes on its channels and frees them.
+    RemoveSlot {
+        id: u32,
+    },
 }
 
 impl Command {
@@ -60,7 +72,11 @@ pub enum ClockRole {
 pub struct SlotState {
     pub id: u32,
     pub name: String,
+    /// Device binding, e.g. `asio:MOTU Gen 5` (empty for none).
+    pub device: String,
     pub role: ClockRole,
+    /// False while the bound device is missing; its channels stay reserved.
+    pub online: bool,
     /// First global input channel and count (0 if the slot has no inputs).
     pub first_input: u32,
     pub inputs: u32,
@@ -80,6 +96,43 @@ pub struct SlotHealth {
     pub correction_ppm: f64,
 }
 
+/// Kinds of device the engine can open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeviceKind {
+    Asio,
+    WasapiRender,
+    WasapiCapture,
+    /// Per-application capture (process loopback); `name` is the process name or PID.
+    AppCapture,
+}
+
+impl DeviceKind {
+    /// Prefix used in device bindings (`asio:<name>`).
+    pub fn prefix(self) -> &'static str {
+        match self {
+            DeviceKind::Asio => "asio",
+            DeviceKind::WasapiRender => "wasapi-out",
+            DeviceKind::WasapiCapture => "wasapi-in",
+            DeviceKind::AppCapture => "app",
+        }
+    }
+
+    /// Parses a prefix produced by [`DeviceKind::prefix`].
+    pub fn from_prefix(p: &str) -> Option<Self> {
+        [DeviceKind::Asio, DeviceKind::WasapiRender, DeviceKind::WasapiCapture, DeviceKind::AppCapture]
+            .into_iter()
+            .find(|k| k.prefix() == p)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub kind: DeviceKind,
+    pub name: String,
+    pub inputs: u32,
+    pub outputs: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     Ok,
@@ -87,6 +140,8 @@ pub enum Response {
     Slots(Vec<SlotState>),
     Health { blocks: u64, slots: Vec<SlotHealth> },
     Error(String),
+    Devices(Vec<DeviceInfo>),
+    SlotsAdded(Vec<u32>),
 }
 
 /// Every message on the wire carries the protocol version and a request id.
@@ -167,6 +222,18 @@ mod tests {
         assert_eq!(read_envelope::<_, Command>(&mut r).unwrap(), Some(cmd));
         assert_eq!(read_envelope::<_, Command>(&mut r).unwrap().map(|e| e.id), Some(8));
         assert_eq!(read_envelope::<_, Command>(&mut r).unwrap(), None);
+    }
+
+    #[test]
+    fn device_commands_round_trip() {
+        let cmd = Envelope::new(3, Command::AddDevice { kind: DeviceKind::Asio, name: "MOTU Gen 5".into() });
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &cmd).unwrap();
+        assert_eq!(read_envelope::<_, Command>(&mut &wire[..]).unwrap(), Some(cmd));
+        for k in [DeviceKind::Asio, DeviceKind::WasapiRender, DeviceKind::WasapiCapture, DeviceKind::AppCapture] {
+            assert_eq!(DeviceKind::from_prefix(k.prefix()), Some(k));
+        }
+        assert_eq!(DeviceKind::from_prefix("nope"), None);
     }
 
     #[test]

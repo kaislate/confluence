@@ -2,8 +2,8 @@
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use confluence_api::{Command, Response};
+use clap::{Parser, Subcommand, ValueEnum};
+use confluence_api::{Command, DeviceKind, Response};
 
 #[derive(Parser)]
 #[command(version, about = "Control a running Confluence engine")]
@@ -39,6 +39,31 @@ enum Cmd {
     Health,
     /// Stop the engine.
     Shutdown,
+    /// List audio devices the engine can open.
+    Devices,
+    /// Open a device as slot(s): `add-device asio "MOTU Gen 5"`.
+    AddDevice { kind: Kind, name: String },
+    /// Close a slot and remove the routes on its channels.
+    RemoveSlot { id: u32 },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Kind {
+    Asio,
+    WasapiOut,
+    WasapiIn,
+    App,
+}
+
+impl From<Kind> for DeviceKind {
+    fn from(k: Kind) -> Self {
+        match k {
+            Kind::Asio => DeviceKind::Asio,
+            Kind::WasapiOut => DeviceKind::WasapiRender,
+            Kind::WasapiIn => DeviceKind::WasapiCapture,
+            Kind::App => DeviceKind::AppCapture,
+        }
+    }
 }
 
 impl Cmd {
@@ -52,6 +77,9 @@ impl Cmd {
             Cmd::Slots => Command::ListSlots,
             Cmd::Health => Command::Health,
             Cmd::Shutdown => Command::Shutdown,
+            Cmd::Devices => Command::ListDevices,
+            Cmd::AddDevice { kind, ref name } => Command::AddDevice { kind: kind.into(), name: name.clone() },
+            Cmd::RemoveSlot { id } => Command::RemoveSlot { id },
         }
     }
 }
@@ -74,8 +102,9 @@ fn render(resp: &Response) -> String {
         Response::Slots(slots) => slots
             .iter()
             .map(|s| {
+                let status = if s.online { "" } else { "  OFFLINE" };
                 format!(
-                    "#{:<3} {:<24} {:?}  in {}+{}  out {}+{}",
+                    "#{:<3} {:<24} {:?}  in {}+{}  out {}+{}{status}",
                     s.id, s.name, s.role, s.first_input, s.inputs, s.first_output, s.outputs
                 )
             })
@@ -90,6 +119,15 @@ fn render(resp: &Response) -> String {
                 )
             }));
             lines.join("\n")
+        }
+        Response::Devices(devices) if devices.is_empty() => "no devices".into(),
+        Response::Devices(devices) => devices
+            .iter()
+            .map(|d| format!("{:<10} {:<40} in {:>3}  out {:>3}", d.kind.prefix(), d.name, d.inputs, d.outputs))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Response::SlotsAdded(ids) => {
+            format!("added slot(s) {}", ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", "))
         }
     }
 }
@@ -143,6 +181,19 @@ mod tests {
             cli.command.to_command(),
             Command::SetPoint { input: 1, output: 2, gain_db: -6.5, mute: false, invert: true }
         );
+    }
+
+    #[test]
+    fn device_commands_parse() {
+        let cli = Cli::try_parse_from(["confluence-cli", "add-device", "asio", "MOTU Gen 5"]).unwrap();
+        assert_eq!(cli.command.to_command(), Command::AddDevice { kind: DeviceKind::Asio, name: "MOTU Gen 5".into() });
+        let cli = Cli::try_parse_from(["confluence-cli", "add-device", "app", "Discord.exe"]).unwrap();
+        assert_eq!(
+            cli.command.to_command(),
+            Command::AddDevice { kind: DeviceKind::AppCapture, name: "Discord.exe".into() }
+        );
+        let cli = Cli::try_parse_from(["confluence-cli", "remove-slot", "3"]).unwrap();
+        assert_eq!(cli.command.to_command(), Command::RemoveSlot { id: 3 });
     }
 
     #[test]

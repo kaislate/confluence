@@ -6,6 +6,7 @@ use std::f64::consts::TAU;
 use confluence_core::bridge::{InputDeviceSide, OutputDeviceSide};
 
 use crate::audio::AudioEngine;
+use crate::engine::MasterChannels;
 
 /// A capture device with its own (drifting) clock producing a sine on channel 0
 /// and its negation on channel 1 (other channels silent).
@@ -101,23 +102,60 @@ impl SimOutput {
     }
 }
 
-/// Drives an [`AudioEngine`] as master at exactly `rate` together with any
-/// number of simulated devices, in simulated time.
+/// A simulated hardware master: its own drifting clock drives the engine, and
+/// it plays a sine into its first input channel.
+pub struct SimMaster {
+    /// The device's actual rate (nominal × (1 + ppm·1e-6)).
+    pub true_rate: f64,
+    pub channels: MasterChannels,
+    pub tone_hz: f64,
+    pub amplitude: f64,
+}
+
+/// Drives an [`AudioEngine`] in simulated time, clocked either exactly at
+/// `rate` (internal clock) or by a drifting [`SimMaster`], together with any
+/// number of simulated soft devices.
 pub struct Simulation {
     pub audio: AudioEngine,
     rate: f64,
     blocks: u64,
+    master: Option<SimMaster>,
     pub inputs: Vec<SimInput>,
     pub outputs: Vec<SimOutput>,
 }
 
 impl Simulation {
     pub fn new(audio: AudioEngine, rate: f64) -> Self {
-        Self { audio, rate, blocks: 0, inputs: Vec::new(), outputs: Vec::new() }
+        Self { audio, rate, blocks: 0, master: None, inputs: Vec::new(), outputs: Vec::new() }
+    }
+
+    /// As [`new`](Self::new), but a hardware master's callback drives the engine.
+    pub fn with_master(audio: AudioEngine, master: SimMaster) -> Self {
+        let rate = master.true_rate;
+        Self { audio, rate, blocks: 0, master: Some(master), inputs: Vec::new(), outputs: Vec::new() }
     }
 
     fn next_master_time(&self) -> f64 {
         (self.blocks + 1) as f64 * self.audio.block() as f64 / self.rate
+    }
+
+    fn run_master(&mut self, t: f64) {
+        let block = self.audio.block();
+        match &self.master {
+            None => self.audio.process_block(t),
+            Some(m) => {
+                let start = self.blocks * block as u64;
+                if m.channels.inputs > 0 {
+                    let ch = self.audio.inputs_mut().channel_mut(m.channels.first_input);
+                    for (n, s) in ch.iter_mut().enumerate() {
+                        let k = (start + n as u64) as f64;
+                        *s = (m.amplitude * (TAU * m.tone_hz * k / m.true_rate).sin()) as f32;
+                    }
+                }
+                self.audio.process_master_block(t, block as u32);
+            }
+        }
+        self.blocks += 1;
     }
 
     /// Advances simulated time to `until` seconds, running every due callback
@@ -145,10 +183,7 @@ impl Simulation {
                 return;
             }
             match which {
-                Next::Master => {
-                    self.audio.process_block(t);
-                    self.blocks += 1;
-                }
+                Next::Master => self.run_master(t),
                 Next::Input(i) => self.inputs[i].run(t),
                 Next::Output(i) => self.outputs[i].run(t),
                 Next::Control => {

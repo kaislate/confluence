@@ -15,4 +15,4 @@ pub mod sim;
 pub use confluence_rt as rt;
 
 pub use audio::AudioEngine;
-pub use engine::{Engine, EngineConfig, EngineError, SoftSlotSpec};
+pub use engine::{Engine, EngineConfig, EngineError, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec};
