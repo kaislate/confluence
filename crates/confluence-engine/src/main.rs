@@ -28,10 +28,12 @@ mod app {
 
     use confluence_api::{Command, Response};
     use confluence_engine::clock::InternalClock;
+    use confluence_engine::devices::{start_asio_master, DeviceManager};
     use confluence_engine::ipc::{default_pipe_name, pipe_path, Handler, PipeServer};
     use confluence_engine::journal::Journal;
     use confluence_engine::rt::disable_power_throttling;
     use confluence_engine::{Engine, EngineConfig};
+    use confluence_provider_asio::AsioDevice;
 
     #[derive(clap::Parser)]
     #[command(version, about = "Confluence audio engine")]
@@ -42,10 +44,16 @@ mod app {
         /// Journal file (default: %LOCALAPPDATA%\Confluence\journal.bin).
         #[arg(long)]
         journal: Option<PathBuf>,
-        /// Engine sample rate in Hz.
+        /// Device bindings file (default: %LOCALAPPDATA%\Confluence\devices.json).
+        #[arg(long)]
+        devices: Option<PathBuf>,
+        /// Master clock: `internal`, or `asio:<driver name>` (e.g. `asio:MOTU Gen 5`).
+        #[arg(long, default_value = "internal")]
+        master: String,
+        /// Engine sample rate in Hz (internal clock; an ASIO master uses its own).
         #[arg(long, default_value_t = 48_000.0)]
         rate: f64,
-        /// Engine block size in frames.
+        /// Engine block size in frames (internal clock; an ASIO master uses its preferred size).
         #[arg(long, default_value_t = 256)]
         block: usize,
     }
@@ -53,15 +61,22 @@ mod app {
     struct State {
         engine: Engine,
         journal: Journal,
+        devices: DeviceManager,
+    }
+
+    /// Whatever drives the engine; dropping it stops the audio.
+    enum Master {
+        Internal(InternalClock),
+        Asio(AsioDevice),
     }
 
     fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
         state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn default_journal() -> PathBuf {
+    fn data_dir() -> PathBuf {
         let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        base.join("Confluence").join("journal.bin")
+        base.join("Confluence")
     }
 
     /// The minimal commands that recreate the engine's current matrix.
@@ -89,15 +104,51 @@ mod app {
         // Claim the pipe name before touching any state: a second engine must
         // fail here, not after it has replayed and compacted the journal.
         let listener = PipeServer::bind(&pipe)?;
-        let (mut journal, replay) = Journal::open(&args.journal.unwrap_or_else(default_journal))?;
-        let (mut engine, audio) = Engine::new(EngineConfig::new(args.rate, args.block));
+        let (mut journal, replay) = Journal::open(&args.journal.unwrap_or_else(|| data_dir().join("journal.bin")))?;
+
+        // An ASIO master fixes the engine's rate and block: open it first.
+        let asio_master = match args.master.strip_prefix("asio:") {
+            Some(name) => Some((name.to_string(), AsioDevice::open_installed(name)?)),
+            None if args.master == "internal" => None,
+            None => return Err(format!("unknown master '{}': use internal or asio:<name>", args.master).into()),
+        };
+        let (rate, block) = match &asio_master {
+            Some((_, dev)) => (dev.info().sample_rate, dev.info().preferred_block.max(1) as usize),
+            None => (args.rate, args.block),
+        };
+        let (mut engine, audio) = Engine::new(EngineConfig::new(rate, block));
         for cmd in &replay {
             engine.handle(cmd);
         }
         journal.compact(&state_commands(&mut engine))?;
 
-        let clock = InternalClock::start(audio, args.rate)?;
-        let state = Arc::new(Mutex::new(State { engine, journal }));
+        let (mut devices, mut warnings) =
+            DeviceManager::open_file(args.devices.unwrap_or_else(|| data_dir().join("devices.json")));
+        let master = match asio_master {
+            Some((name, mut dev)) => {
+                // A master with a saved placement goes first so it gets its old
+                // channels; a new master takes whatever the restored devices leave.
+                let placement = devices.saved_master(&name);
+                if placement.is_none() {
+                    warnings.extend(devices.restore(&mut engine));
+                }
+                let (_, _, ch) = start_asio_master(&mut dev, &mut engine, audio, &name, placement)?;
+                if placement.is_some() {
+                    warnings.extend(devices.restore(&mut engine));
+                }
+                devices.set_master(&name, ch)?;
+                eprintln!("confluence-engine: master asio:{name} at {rate} Hz, {block} frames");
+                Master::Asio(dev)
+            }
+            None => {
+                warnings.extend(devices.restore(&mut engine));
+                Master::Internal(InternalClock::start(audio, rate)?)
+            }
+        };
+        for w in warnings {
+            eprintln!("confluence-engine: warning: {w}");
+        }
+        let state = Arc::new(Mutex::new(State { engine, journal, devices }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let handler: Handler = {
             let (state, shutdown) = (state.clone(), shutdown.clone());
@@ -107,6 +158,10 @@ mod app {
                     return Response::Ok;
                 }
                 let mut s = lock(&state);
+                let State { engine, devices, .. } = &mut *s;
+                if let Some(resp) = devices.handle(engine, cmd) {
+                    return resp;
+                }
                 let resp = s.engine.handle(cmd);
                 if resp == Response::Ok && cmd.is_mutation() {
                     if let Err(e) = s.journal.append(cmd) {
@@ -124,7 +179,21 @@ mod app {
             lock(&state).engine.tick();
         }
         server.stop();
-        clock.stop();
+        // Soft devices first (their bridges feed the engine), then the master.
+        let state = match Arc::try_unwrap(state) {
+            Ok(m) => m.into_inner().unwrap_or_else(|p| p.into_inner()),
+            Err(shared) => {
+                drop(shared);
+                return Ok(());
+            }
+        };
+        drop(state.devices);
+        match master {
+            Master::Internal(clock) => {
+                clock.stop();
+            }
+            Master::Asio(mut dev) => dev.stop(),
+        }
         Ok(())
     }
 }
