@@ -4,12 +4,21 @@
 //! set of four C functions, monomorphised per slot index `N` (spec §7.1: a fixed
 //! table of 16 trampoline sets). A slot's state is published through an
 //! `AtomicPtr` before `createBuffers` and withdrawn after `stop`.
+//!
+//! Teardown protocol: every entry point first increments its slot's `active`
+//! counter, *then* loads the state pointer, and holds a guard while it uses
+//! the state. Teardown nulls the pointer, then waits for `active` to reach 0.
+//! Both sides use SeqCst, so either the callback's increment is seen by the
+//! teardown (which waits for it) or the callback sees the null pointer. A
+//! callback that never returns makes teardown fail, and the state is leaked
+//! rather than freed.
 
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::io::{AsioIo, Channel};
 use crate::sys::*;
@@ -42,7 +51,6 @@ pub(crate) struct SlotState {
     pub post_output: AtomicBool,
     /// Set after buffers are recorded, cleared before they are disposed.
     pub ready: AtomicBool,
-    pub in_flight: AtomicU32,
     pub last_position: AtomicI64,
     pub clock: fn() -> f64,
     pub health: Arc<AsioHealth>,
@@ -50,18 +58,21 @@ pub(crate) struct SlotState {
 
 // SAFETY: the raw driver pointer and UnsafeCells are only used under the
 // protocol documented on each access: the control thread writes before `ready`
-// is set (and after it is cleared and in-flight callbacks drained); the
+// is set (and after it is cleared and active callbacks drained); the
 // driver's single callback thread reads/uses them while `ready` is set.
 unsafe impl Send for SlotState {}
 unsafe impl Sync for SlotState {}
 
 pub(crate) struct Slot {
     busy: AtomicBool,
-    pub state: AtomicPtr<SlotState>,
+    state: AtomicPtr<SlotState>,
+    /// Entry points currently inside this slot (see the module docs).
+    active: AtomicU32,
 }
 
 #[allow(clippy::declare_interior_mutable_const)]
-const EMPTY: Slot = Slot { busy: AtomicBool::new(false), state: AtomicPtr::new(std::ptr::null_mut()) };
+const EMPTY: Slot =
+    Slot { busy: AtomicBool::new(false), state: AtomicPtr::new(std::ptr::null_mut()), active: AtomicU32::new(0) };
 pub(crate) static SLOTS: [Slot; MAX_DRIVERS] = [EMPTY; MAX_DRIVERS];
 
 /// Claims a free slot index.
@@ -69,10 +80,55 @@ pub(crate) fn claim() -> Option<usize> {
     SLOTS.iter().position(|s| s.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok())
 }
 
-/// Releases a slot claimed with [`claim`]. Its state must already be withdrawn.
+/// Releases a slot claimed with [`claim`]. Its state must already be
+/// withdrawn and drained ([`withdraw`] returned true).
 pub(crate) fn release(index: usize) {
-    SLOTS[index].state.store(std::ptr::null_mut(), Ordering::Release);
+    SLOTS[index].state.store(std::ptr::null_mut(), Ordering::SeqCst);
     SLOTS[index].busy.store(false, Ordering::Release);
+}
+
+/// Makes `state` visible to the slot's entry points.
+pub(crate) fn publish(index: usize, state: *mut SlotState) {
+    SLOTS[index].state.store(state, Ordering::SeqCst);
+}
+
+/// Waits until no entry point is inside the slot. False on timeout.
+pub(crate) fn wait_idle(index: usize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while SLOTS[index].active.load(Ordering::SeqCst) != 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
+/// Hides the slot's state from entry points and waits for those still inside
+/// to leave. True when the state may be freed; false means a callback is
+/// stuck inside it, and the caller must leak the state and keep the slot.
+pub(crate) fn withdraw(index: usize, timeout: Duration) -> bool {
+    SLOTS[index].state.store(std::ptr::null_mut(), Ordering::SeqCst);
+    wait_idle(index, timeout)
+}
+
+/// Proof that an entry point is inside a slot; the state stays alive while it exists.
+pub(crate) struct Entered(usize);
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        SLOTS[self.0].active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Enters slot `n`: counts in first, then loads the state (never the other way round).
+pub(crate) fn enter(n: usize) -> Option<(Entered, &'static SlotState)> {
+    SLOTS[n].active.fetch_add(1, Ordering::SeqCst);
+    let guard = Entered(n);
+    let p = SLOTS[n].state.load(Ordering::SeqCst);
+    // SAFETY: a published state is freed only after `withdraw` saw `active`
+    // reach 0, which cannot happen while `guard` is alive.
+    (!p.is_null()).then(|| (guard, unsafe { &*p }))
 }
 
 extern "C" fn buffer_switch<const N: usize>(index: i32, _direct: AsioBool) {
@@ -89,14 +145,14 @@ extern "C" fn buffer_switch_time_info<const N: usize>(
 }
 
 extern "C" fn sample_rate_did_change<const N: usize>(_rate: f64) {
-    if let Some(st) = state(N) {
+    if let Some((_inside, st)) = enter(N) {
         st.health.rate_changes.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 extern "C" fn asio_message<const N: usize>(selector: i32, value: i32, _message: *mut c_void, _opt: *mut f64) -> i32 {
     let count = |f: fn(&AsioHealth) -> &AtomicU64| {
-        if let Some(st) = state(N) {
+        if let Some((_inside, st)) = enter(N) {
             f(&st.health).fetch_add(1, Ordering::Relaxed);
         }
     };
@@ -156,24 +212,16 @@ pub(crate) static CALLBACKS: [AsioCallbacks; MAX_DRIVERS] = [
     callbacks::<15>(),
 ];
 
-fn state(n: usize) -> Option<&'static SlotState> {
-    let p = SLOTS[n].state.load(Ordering::Acquire);
-    // SAFETY: a published state stays alive until withdrawn, and the control
-    // thread waits for `in_flight` to drain before freeing it.
-    (!p.is_null()).then(|| unsafe { &*p })
-}
-
 fn dispatch(n: usize, half: i32, time: Option<*mut AsioTime>) {
-    let Some(st) = state(n) else { return };
-    st.in_flight.fetch_add(1, Ordering::AcqRel);
-    if st.ready.load(Ordering::Acquire) {
+    let Some((_inside, st)) = enter(n) else { return };
+    // SeqCst pairs with the control thread's `ready.store(false)` + `wait_idle`.
+    if st.ready.load(Ordering::SeqCst) {
         // A panic must never unwind into the driver (that aborts the process):
         // count it as a fault instead.
         if catch_unwind(AssertUnwindSafe(|| run(st, (half & 1) as usize, time))).is_err() {
             st.health.faults.fetch_add(1, Ordering::Relaxed);
         }
     }
-    st.in_flight.fetch_sub(1, Ordering::Release);
 }
 
 fn run(st: &SlotState, half: usize, time: Option<*mut AsioTime>) {
@@ -250,5 +298,51 @@ mod tests {
         assert_eq!(msg(K_ENGINE_VERSION, 0, std::ptr::null_mut(), std::ptr::null_mut()), 2);
         assert_eq!(msg(K_SUPPORTS_TIME_INFO, 0, std::ptr::null_mut(), std::ptr::null_mut()), 1);
         assert_eq!(msg(999, 0, std::ptr::null_mut(), std::ptr::null_mut()), 0);
+    }
+
+    fn dummy_state() -> *mut SlotState {
+        Box::into_raw(Box::new(SlotState {
+            driver: std::ptr::null_mut(),
+            block: 64,
+            inputs: UnsafeCell::new(Vec::new()),
+            outputs: UnsafeCell::new(Vec::new()),
+            callback: UnsafeCell::new(Box::new(|_: &mut AsioIo<'_>| {})),
+            post_output: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            last_position: AtomicI64::new(i64::MIN),
+            clock: || 0.0,
+            health: Arc::default(),
+        }))
+    }
+
+    #[test]
+    fn teardown_waits_for_a_callback_that_is_inside_the_slot() {
+        use std::time::Duration;
+        let n = claim().unwrap();
+        let st = dummy_state();
+        publish(n, st);
+        let guard = enter(n).expect("a published slot can be entered");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || tx.send(withdraw(n, Duration::from_secs(5))).unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rx.try_recv().is_err(), "teardown must wait while a callback holds the state");
+        assert!(enter(n).is_none(), "callbacks arriving after withdrawal see nothing");
+        drop(guard);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "drained once the callback left");
+        t.join().unwrap();
+        release(n);
+        // SAFETY: withdrawn and drained, so nothing else can reach it.
+        drop(unsafe { Box::from_raw(st) });
+    }
+
+    #[test]
+    fn a_callback_that_never_returns_makes_teardown_report_failure() {
+        use std::time::Duration;
+        let n = claim().unwrap();
+        publish(n, dummy_state());
+        let stuck = enter(n).unwrap();
+        assert!(!withdraw(n, Duration::from_millis(50)), "the caller must leak, not free, the state");
+        // The stuck callback never leaves; the slot (and its state) stay leaked.
+        std::mem::forget(stuck);
     }
 }

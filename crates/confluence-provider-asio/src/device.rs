@@ -4,11 +4,11 @@
 
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use confluence_rt::ComApartment;
 use windows::core::{GUID, HRESULT};
@@ -17,7 +17,7 @@ use crate::convert::SampleFormat;
 use crate::io::Channel;
 use crate::registry::{find_driver, DriverEntry};
 use crate::sys::*;
-use crate::trampolines::{self, AsioHealth, SlotState, CALLBACKS, MAX_DRIVERS, SLOTS};
+use crate::trampolines::{self, AsioHealth, SlotState, CALLBACKS, MAX_DRIVERS};
 use crate::AsioCallback;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -394,18 +394,13 @@ fn start_stream(
         callback: UnsafeCell::new(callback),
         post_output: AtomicBool::new(false),
         ready: AtomicBool::new(false),
-        in_flight: AtomicU32::new(0),
         last_position: AtomicI64::new(i64::MIN),
         clock,
         health: health.clone(),
     }));
     // Published before createBuffers: drivers may send asioMessage from inside it.
-    SLOTS[slot].state.store(state, Ordering::Release);
-    let abandon = |state: *mut SlotState| {
-        trampolines::release(slot);
-        // SAFETY: never became ready, so no callback can be using it.
-        drop(unsafe { Box::from_raw(state) });
-    };
+    trampolines::publish(slot, state);
+    let abandon = |state: *mut SlotState| retire(slot, state);
 
     let mut infos: Vec<AsioBufferInfo> = (0..in_formats.len())
         .map(|ch| AsioBufferInfo {
@@ -445,8 +440,8 @@ fn start_stream(
     // SAFETY: live driver.
     if let Err(e) = check("start", unsafe { (vt.start)(d.0) }) {
         // SAFETY: as in stop_stream.
-        unsafe { (*state).ready.store(false, Ordering::Release) };
-        drain(state);
+        unsafe { (*state).ready.store(false, Ordering::SeqCst) };
+        trampolines::wait_idle(slot, DRAIN_TIMEOUT);
         // SAFETY: live driver.
         unsafe { (vt.dispose_buffers)(d.0) };
         abandon(state);
@@ -460,27 +455,32 @@ fn start_stream(
     Ok((Stream { slot, state }, info))
 }
 
-/// Waits (bounded) until no callback is executing with `state`.
-fn drain(state: *mut SlotState) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    // SAFETY: `state` stays allocated until the caller frees it after this returns.
-    while unsafe { (*state).in_flight.load(Ordering::Acquire) } != 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(1));
+/// How long teardown waits for callbacks still inside a slot.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Withdraws a slot's state and frees it once no callback can reach it. If a
+/// callback is stuck inside, the state and the slot are leaked instead: a
+/// bounded leak beats a use-after-free on the driver's thread.
+fn retire(slot: usize, state: *mut SlotState) {
+    if trampolines::withdraw(slot, DRAIN_TIMEOUT) {
+        trampolines::release(slot);
+        // SAFETY: withdrawn and drained, so no entry point can reach it.
+        drop(unsafe { Box::from_raw(state) });
     }
 }
 
 fn stop_stream(d: &Driver, s: Stream) {
     let vt = d.vt();
-    // SAFETY: live driver; the state is freed only after callbacks drained.
+    // SAFETY: live driver. Callbacks entering after `ready` is cleared (SeqCst,
+    // paired with `dispatch`) skip the buffers, so they may be disposed once
+    // those already inside have left.
     unsafe {
         (vt.stop)(d.0);
-        (*s.state).ready.store(false, Ordering::Release);
-        drain(s.state);
+        (*s.state).ready.store(false, Ordering::SeqCst);
+        trampolines::wait_idle(s.slot, DRAIN_TIMEOUT);
         (vt.dispose_buffers)(d.0);
-        trampolines::release(s.slot);
-        drain(s.state);
-        drop(Box::from_raw(s.state));
     }
+    retire(s.slot, s.state);
 }
 
 fn control(
