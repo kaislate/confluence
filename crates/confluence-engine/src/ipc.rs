@@ -51,6 +51,22 @@ struct OwnedPipe(HANDLE);
 // SAFETY: kernel handles may be used from any thread; ownership is unique.
 unsafe impl Send for OwnedPipe {}
 
+impl OwnedPipe {
+    /// Releases ownership of the handle to the caller.
+    fn into_handle(self) -> HANDLE {
+        let h = self.0;
+        std::mem::forget(self);
+        h
+    }
+}
+
+impl Drop for OwnedPipe {
+    fn drop(&mut self) {
+        // SAFETY: we own the handle and nothing else closes it.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
 impl UserOnlySecurity {
     fn new() -> io::Result<Self> {
         let sid = current_user_sid()?;
@@ -104,14 +120,18 @@ pub struct PipeServer {
     thread: Option<JoinHandle<()>>,
 }
 
-impl PipeServer {
-    /// Starts accepting connections on `\\.\pipe\<name>`. Fails if another
-    /// process already owns that pipe name.
-    pub fn start(name: &str, handler: Handler) -> io::Result<Self> {
-        let path = pipe_path(name);
-        let security = UserOnlySecurity::new()?;
-        // Create the first instance here so a name clash is reported to the caller.
-        let first = OwnedPipe(create_instance(&path, &security, true)?);
+/// A pipe name claimed by this process but not yet serving. Claiming first lets
+/// the engine prove it is the only instance before it touches any state.
+pub struct PipeListener {
+    path: String,
+    first: OwnedPipe,
+    security: UserOnlySecurity,
+}
+
+impl PipeListener {
+    /// Starts accepting connections with `handler`.
+    pub fn serve(self, handler: Handler) -> io::Result<PipeServer> {
+        let Self { path, first, security } = self;
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (path, stop) = (path.clone(), stop.clone());
@@ -119,7 +139,29 @@ impl PipeServer {
                 .name("confluence-pipe".into())
                 .spawn(move || accept_loop(&path, first, security, &stop, handler))?
         };
-        Ok(Self { path, stop, thread: Some(thread) })
+        Ok(PipeServer { path, stop, thread: Some(thread) })
+    }
+}
+
+impl PipeServer {
+    /// Claims `\\.\pipe\<name>` for this process. Fails with
+    /// `ErrorKind::AlreadyExists` if another engine already owns the name.
+    pub fn bind(name: &str) -> io::Result<PipeListener> {
+        let path = pipe_path(name);
+        let security = UserOnlySecurity::new()?;
+        let first = create_instance(&path, &security, true).map_err(|e| match e.raw_os_error() {
+            // FILE_FLAG_FIRST_PIPE_INSTANCE reports an existing owner as access denied (or busy).
+            Some(5) | Some(231) => {
+                io::Error::new(io::ErrorKind::AlreadyExists, format!("another engine is already running on {path}"))
+            }
+            _ => e,
+        })?;
+        Ok(PipeListener { path, first: OwnedPipe(first), security })
+    }
+
+    /// Claims the name and starts serving in one step.
+    pub fn start(name: &str, handler: Handler) -> io::Result<Self> {
+        Self::bind(name)?.serve(handler)
     }
 
     pub fn stop(mut self) {
@@ -168,7 +210,7 @@ fn create_instance(path: &str, security: &UserOnlySecurity, first: bool) -> io::
 }
 
 fn accept_loop(path: &str, first: OwnedPipe, security: UserOnlySecurity, stop: &AtomicBool, handler: Handler) {
-    let mut next = Some(first.0);
+    let mut next = Some(first.into_handle());
     while !stop.load(Ordering::SeqCst) {
         let h = match next.take() {
             Some(h) => h,
@@ -285,7 +327,19 @@ mod tests {
         let name = unique_name("clash");
         let handler: Handler = Arc::new(|_: &Command| Response::Ok);
         let _server = PipeServer::start(&name, handler.clone()).unwrap();
-        assert!(PipeServer::start(&name, handler).is_err());
+        let err = PipeServer::start(&name, handler).err().expect("name is taken");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(err.to_string().contains("already running"), "{err}");
+    }
+
+    #[test]
+    fn a_bound_listener_holds_the_name_until_dropped() {
+        let name = unique_name("bind");
+        let listener = PipeServer::bind(&name).unwrap();
+        assert!(PipeServer::bind(&name).is_err(), "claimed before serving");
+        drop(listener);
+        let handler: Handler = Arc::new(|_: &Command| Response::Ok);
+        let _server = PipeServer::start(&name, handler).unwrap();
     }
 
     #[test]

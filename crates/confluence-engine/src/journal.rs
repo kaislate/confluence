@@ -3,6 +3,8 @@
 //! The journal is a file of framed `Envelope<Command>`s. On open it is replayed;
 //! a torn final frame (crash mid-write) is cut off. `compact` rewrites it
 //! atomically (temp file + rename) as the minimal commands for the current state.
+//! A journal has exactly one writer: `open` takes an exclusive lock file first
+//! and holds it until the `Journal` is dropped.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Seek, SeekFrom, Write};
@@ -14,6 +16,29 @@ pub struct Journal {
     path: PathBuf,
     file: File,
     next_id: u32,
+    /// Held open without sharing for the journal's lifetime (single writer).
+    _lock: File,
+}
+
+/// Windows ERROR_SHARING_VIOLATION: another process holds the lock file.
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+fn lock(path: &Path) -> io::Result<File> {
+    let lock_path = path.with_extension("lock");
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
+    opts.open(&lock_path).map_err(|e| {
+        if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+            io::Error::new(io::ErrorKind::WouldBlock, format!("journal {} is in use by another engine", path.display()))
+        } else {
+            e
+        }
+    })
 }
 
 impl Journal {
@@ -23,6 +48,7 @@ impl Journal {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
+        let lock = lock(path)?;
         let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         let mut commands = Vec::new();
         let mut good_len = 0u64;
@@ -44,7 +70,7 @@ impl Journal {
         file.set_len(good_len)?;
         file.seek(SeekFrom::End(0))?;
         let next_id = commands.len() as u32;
-        Ok((Journal { path: path.to_path_buf(), file, next_id }, commands))
+        Ok((Journal { path: path.to_path_buf(), file, next_id, _lock: lock }, commands))
     }
 
     /// Appends a mutating command and flushes it to the OS.
@@ -127,5 +153,19 @@ mod tests {
         drop(j);
         let (_, replay) = Journal::open(&path).unwrap();
         assert_eq!(replay, vec![set(9), set(10)]);
+    }
+
+    #[test]
+    fn a_journal_has_a_single_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.bin");
+        let (mut first, _) = Journal::open(&path).unwrap();
+        let err = Journal::open(&path).err().expect("second open must fail while the first is alive");
+        assert!(err.to_string().contains("in use"), "{err}");
+        first.append(&set(1)).unwrap();
+        first.compact(&[set(1)]).unwrap();
+        drop(first);
+        let (_, replay) = Journal::open(&path).unwrap();
+        assert_eq!(replay, vec![set(1)], "released on drop, and compaction still works under the lock");
     }
 }

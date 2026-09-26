@@ -86,6 +86,9 @@ mod app {
             eprintln!("confluence-engine: warning: could not disable power throttling: {e}");
         }
         let pipe = args.pipe.unwrap_or_else(default_pipe_name);
+        // Claim the pipe name before touching any state: a second engine must
+        // fail here, not after it has replayed and compacted the journal.
+        let listener = PipeServer::bind(&pipe)?;
         let (mut journal, replay) = Journal::open(&args.journal.unwrap_or_else(default_journal))?;
         let (mut engine, audio) = Engine::new(EngineConfig::new(args.rate, args.block));
         for cmd in &replay {
@@ -113,7 +116,7 @@ mod app {
                 resp
             })
         };
-        let server = PipeServer::start(&pipe, handler)?;
+        let server = listener.serve(handler)?;
         eprintln!("confluence-engine: listening on {}", pipe_path(&pipe));
 
         while !shutdown.load(Ordering::SeqCst) {
