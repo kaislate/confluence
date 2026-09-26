@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.94"
+
+[workspace.dependencies]
+rubato = "=5.0.0"
+rtrb = "0.3"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+thiserror = "2"
+proptest = "1"
+assert_no_alloc = "1.1"
+loom = "0.7"
+criterion = "0.7"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.test]
+opt-level = 1
