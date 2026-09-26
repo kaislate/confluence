@@ -339,6 +339,8 @@ pub struct OutputEngineSide {
     scratch_in: Vec<Vec<f32>>,
     scratch_out: Vec<Vec<f32>>,
     tracker: Tracker,
+    /// Device-side underruns already handled by the tracker.
+    seen_underruns: u64,
 }
 
 pub struct OutputDeviceSide {
@@ -365,6 +367,7 @@ pub fn soft_output(cfg: BridgeConfig) -> Result<(OutputEngineSide, OutputDeviceS
         scratch_in,
         scratch_out,
         tracker: Tracker::new(cfg, r.stamps_rx, stats.clone()),
+        seen_underruns: 0,
     };
     let device = OutputDeviceSide {
         samples: r.samples_rx,
@@ -384,9 +387,25 @@ impl OutputEngineSide {
         let ch = self.asrc.channels();
         let t = &mut self.tracker;
         t.drain_stamps();
+        // A device-side underrun is this bridge's xrun too: the engine side
+        // raises its target and restarts its loop, like the input side does.
+        let underruns = t.stats.underruns.load(Ordering::Relaxed);
+        if underruns != self.seen_underruns {
+            self.seen_underruns = underruns;
+            t.xrun();
+        }
         let ring = ((self.ring_slots - self.samples.slots()) / ch) as f64;
-        t.running = true;
         let fill = ring - t.frames_since_stamp(now);
+        if !t.running {
+            // After an xrun, wait until the device has drained the ring to the
+            // target (re-centring latency). Blocks produced meanwhile are
+            // dropped: queuing them would only add delay, and it avoids
+            // counting one stall as an overrun on every block.
+            if fill > t.target() {
+                return;
+            }
+            t.running = true;
+        }
         let corr = t.correction(fill);
         let rel = (1.0 + t.device_est.ppm() * 1e-6) / (1.0 + master_ppm * 1e-6) * (1.0 - corr * 1e-6);
         self.asrc.set_relative_ratio(rel);
@@ -416,7 +435,9 @@ impl OutputDeviceSide {
         let _ = self.stamps.push((frames as u32, time));
         let avail = self.samples.slots() / self.channels;
         if !self.primed {
-            if avail < self.prime_frames {
+            // Prime to the engine side's current (possibly raised) target.
+            let target = f64::from_bits(self.stats.target_bits.load(Ordering::Relaxed));
+            if (avail as f64) < target.max(self.prime_frames as f64) {
                 data.fill(0.0);
                 return;
             }

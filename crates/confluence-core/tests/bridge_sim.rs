@@ -7,7 +7,7 @@
 use std::f64::consts::TAU;
 
 use confluence_core::asrc::AsrcQuality;
-use confluence_core::bridge::{soft_input, soft_output, BridgeConfig};
+use confluence_core::bridge::{soft_input, soft_output, BridgeConfig, BridgeHealth};
 use confluence_core::buffer::PlanarBuffer;
 
 const MASTER_RATE: f64 = 48_000.0;
@@ -235,4 +235,89 @@ fn input_recovers_after_device_stall() {
     assert!(silent_during_stall, "outputs silence, not garbage, while the device is gone");
     assert!(cont.max < MAX_SECOND_DIFF, "discontinuity {} after recovery", cont.max);
     assert!((h.device_ppm - 100.0).abs() < 5.0, "rate estimate recovered: {h:?}");
+}
+
+/// Drives an output bridge; the device stops reading during `device_gap` and
+/// the engine stops writing during `engine_gap` (seconds of their own time).
+/// Returns (health at t=39, health at t=60, final health, continuity after t=70).
+fn run_output_with_gaps(
+    device_gap: std::ops::Range<f64>,
+    engine_gap: std::ops::Range<f64>,
+) -> (BridgeHealth, BridgeHealth, BridgeHealth, f32) {
+    let (master_block, device_block) = (256usize, 128usize);
+    let cfg = config(48_000.0, device_block, master_block);
+    let (mut eng, mut dev, stats) = soft_output(cfg).unwrap();
+    let dev_rate = 48_000.0 * (1.0 + 100e-6);
+    let mut block = PlanarBuffer::new(2, master_block);
+    let mut dev_buf = vec![0.0f32; device_block * 2];
+    let (mut dev_frames, mut master_blocks) = (0u64, 0u64);
+    let mut cont = Continuity::default();
+    let (mut before, mut mid) = (None, None);
+    loop {
+        let t_dev = (dev_frames + device_block as u64) as f64 / dev_rate;
+        let t_master = (master_blocks + 1) as f64 * master_block as f64 / MASTER_RATE;
+        if t_master > 120.0 {
+            break;
+        }
+        if t_master <= t_dev {
+            let base = master_blocks * master_block as u64;
+            for n in 0..master_block {
+                let s = (0.5 * (TAU * TONE_HZ * (base + n as u64) as f64 / MASTER_RATE).sin()) as f32;
+                block.channel_mut(0)[n] = s;
+                block.channel_mut(1)[n] = -s;
+            }
+            if !engine_gap.contains(&t_master) {
+                eng.write(&block, 0, t_master, 0.0);
+            }
+            master_blocks += 1;
+        } else {
+            if !device_gap.contains(&t_dev) {
+                dev.read_interleaved(&mut dev_buf, t_dev);
+                for n in 0..device_block {
+                    cont.push(dev_buf[2 * n]);
+                }
+            }
+            dev_frames += device_block as u64;
+            if t_dev >= 39.0 && before.is_none() {
+                before = Some(stats.snapshot());
+            }
+            if t_dev >= 60.0 && mid.is_none() {
+                mid = Some(stats.snapshot());
+            }
+            if t_dev >= 70.0 && !cont.armed {
+                cont.armed = true;
+            }
+        }
+    }
+    (before.unwrap(), mid.unwrap(), stats.snapshot(), cont.max)
+}
+
+/// The playback device stops pulling for 1 s: one xrun event (not a storm),
+/// the target grows by at most a couple of blocks, and the ring is re-centred
+/// on the target within seconds instead of carrying extra latency for minutes.
+#[test]
+fn output_recovers_after_device_stall() {
+    let base = config(48_000.0, 128, 256).base_target();
+    let (before, mid, end, disc) = run_output_with_gaps(40.0..41.0, 0.0..0.0);
+    assert_eq!(before.underruns + before.overruns, 0, "{before:?}");
+    let events = mid.underruns + mid.overruns;
+    assert!((1..=3).contains(&events), "one stall is one or two xrun events, got {events}: {mid:?}");
+    assert!(mid.target_frames <= base + 2.0 * 128.0, "target inflated: {mid:?}");
+    assert!((mid.fill_frames - mid.target_frames).abs() < 128.0 + 256.0, "latency not re-centred: {mid:?}");
+    assert_eq!(end.underruns + end.overruns, events, "clean after recovery: {end:?}");
+    assert!(disc < MAX_SECOND_DIFF, "discontinuity {disc} after recovery");
+}
+
+/// The engine stops writing for 100 ms (master hiccup): the device underruns,
+/// and the engine side must learn of it (raise the target once, restart the
+/// loop) and then run clean.
+#[test]
+fn output_device_underrun_reaches_the_engine_side() {
+    let base = config(48_000.0, 128, 256).base_target();
+    let (before, mid, end, disc) = run_output_with_gaps(0.0..0.0, 40.0..40.1);
+    assert_eq!(before.underruns + before.overruns, 0, "{before:?}");
+    assert!(mid.underruns >= 1, "{mid:?}");
+    assert!(mid.target_frames > base, "the engine side raised its target after the underrun: {mid:?}");
+    assert_eq!(end.underruns + end.overruns, mid.underruns + mid.overruns, "clean after recovery: {end:?}");
+    assert!(disc < MAX_SECOND_DIFF, "discontinuity {disc} after recovery");
 }
