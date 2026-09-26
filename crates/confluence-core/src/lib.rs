@@ -3,3 +3,5 @@
 
 pub mod buffer;
 pub mod gain;
+pub mod mailbox;
+mod sync;
