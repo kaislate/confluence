@@ -16,5 +16,8 @@ pub mod sim;
 #[cfg(windows)]
 pub use confluence_rt as rt;
 
-pub use audio::AudioEngine;
-pub use engine::{Engine, EngineConfig, EngineError, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec};
+pub use audio::{AudioEngine, StrictSide};
+pub use engine::{
+    Engine, EngineConfig, EngineError, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec, StrictSlotSpec,
+    StrictStats,
+};

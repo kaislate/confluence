@@ -15,7 +15,7 @@ use confluence_core::mailbox::{self, Receiver, Sender};
 use confluence_core::matrix::{matrix, MatrixController};
 
 use crate::alloc::ChannelAllocator;
-use crate::audio::{AudioEngine, AudioMsg, InputEntry, OutputEntry, Returned, MAX_SLOTS};
+use crate::audio::{AudioEngine, AudioMsg, InputEntry, OutputEntry, Returned, StrictEntry, StrictSide, MAX_SLOTS};
 
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
@@ -64,6 +64,8 @@ pub enum EngineError {
     MasterInUse,
     #[error("slot {0} is not offline")]
     NotOffline(u32),
+    #[error("{0}")]
+    Device(String),
 }
 
 /// Parameters of a soft-clocked device slot.
@@ -113,10 +115,28 @@ pub struct OfflineSlotSpec {
     pub outputs: u32,
 }
 
+/// Counters a strict slot's device exposes to the control side.
+pub trait StrictStats: Send + Sync {
+    /// (blocks the device delivered late, blocks it did not take).
+    fn xruns(&self) -> (u64, u64);
+}
+
+/// Parameters of a strict slot (a device on the engine's own clock).
+#[derive(Clone, Debug)]
+pub struct StrictSlotSpec {
+    pub name: String,
+    pub device: String,
+    pub inputs: usize,
+    pub outputs: usize,
+    pub first_input: Option<u32>,
+    pub first_output: Option<u32>,
+}
+
 enum SlotStats {
     None,
     Bridge(Arc<BridgeStats>),
     Master,
+    Strict(Arc<dyn StrictStats>),
 }
 
 struct SlotRecord {
@@ -135,6 +155,7 @@ pub struct Engine {
     outputs: ChannelAllocator,
     soft_inputs: usize,
     soft_outputs: usize,
+    strict: usize,
     blocks: Arc<AtomicU64>,
     master_ppm: Arc<AtomicU64>,
 }
@@ -157,6 +178,7 @@ impl Engine {
             outputs,
             soft_inputs: Vec::with_capacity(MAX_SLOTS),
             soft_outputs: Vec::with_capacity(MAX_SLOTS),
+            strict: Vec::with_capacity(MAX_SLOTS),
             inbox,
             returns: returns_tx,
             blocks: blocks.clone(),
@@ -175,6 +197,7 @@ impl Engine {
             outputs: ChannelAllocator::new(cfg.max_outputs as u32),
             soft_inputs: 0,
             soft_outputs: 0,
+            strict: 0,
             blocks,
             master_ppm,
         };
@@ -285,6 +308,60 @@ impl Engine {
         Ok((id, ch))
     }
 
+    /// Adds a strict slot. `make` receives the channels it was given and
+    /// builds the audio-thread side for them.
+    pub fn add_strict_slot<F>(&mut self, spec: &StrictSlotSpec, make: F) -> Result<(u32, MasterChannels), EngineError>
+    where
+        F: FnOnce(MasterChannels) -> Result<(Box<dyn StrictSide>, Arc<dyn StrictStats>), String>,
+    {
+        if self.strict >= MAX_SLOTS {
+            return Err(EngineError::TooManySlots);
+        }
+        let first_input = claim_maybe(&mut self.inputs, spec.first_input, spec.inputs as u32, "input")?;
+        let first_output = match claim_maybe(&mut self.outputs, spec.first_output, spec.outputs as u32, "output") {
+            Ok(f) => f,
+            Err(e) => {
+                self.inputs.free(first_input, spec.inputs as u32);
+                return Err(e);
+            }
+        };
+        let release = |e: &mut Engine| {
+            e.inputs.free(first_input, spec.inputs as u32);
+            e.outputs.free(first_output, spec.outputs as u32);
+        };
+        let ch = MasterChannels {
+            first_input: first_input as usize,
+            inputs: spec.inputs,
+            first_output: first_output as usize,
+            outputs: spec.outputs,
+        };
+        let (side, stats) = match make(ch) {
+            Ok(parts) => parts,
+            Err(e) => {
+                release(self);
+                return Err(EngineError::Device(e));
+            }
+        };
+        let id = self.next_id;
+        let entry = Box::new(StrictEntry { id, first_input: ch.first_input, inputs: ch.inputs, side });
+        if self.to_audio.try_send(AudioMsg::AddStrict(entry)).is_err() {
+            release(self);
+            return Err(EngineError::Busy);
+        }
+        self.next_id += 1;
+        self.strict += 1;
+        let state = self.state(
+            id,
+            &spec.name,
+            &spec.device,
+            ClockRole::Strict,
+            (first_input, spec.inputs as u32),
+            (first_output, spec.outputs as u32),
+        );
+        self.slots.push(SlotRecord { state, stats: SlotStats::Strict(stats) });
+        Ok((id, ch))
+    }
+
     /// Reserves the channels of a slot whose device is currently missing.
     pub fn add_offline_slot(&mut self, spec: &OfflineSlotSpec) -> Result<u32, EngineError> {
         let first_input = claim_maybe(&mut self.inputs, Some(spec.first_input), spec.inputs, "input")?;
@@ -337,6 +414,10 @@ impl Engine {
                 self.soft_outputs -= 1;
             }
         }
+        if matches!(rec.stats, SlotStats::Strict(_)) {
+            self.to_audio.try_send(AudioMsg::Remove(id)).map_err(|_| EngineError::Busy)?;
+            self.strict -= 1;
+        }
         let rec = self.slots.remove(idx);
         let s = &rec.state;
         let ins = s.first_input..s.first_input + s.inputs;
@@ -359,6 +440,7 @@ impl Engine {
             match r {
                 Returned::Input(entry) => drop(entry),
                 Returned::Output(entry) => drop(entry),
+                Returned::Strict(entry) => drop(entry),
             }
         }
     }
@@ -442,6 +524,21 @@ impl Engine {
                 device_faults: 0,
                 driver_requests: 0,
             }),
+            SlotStats::Strict(stats) => {
+                let (underruns, overruns) = stats.xruns();
+                Some(SlotHealth {
+                    id,
+                    underruns,
+                    overruns,
+                    fill_frames: 0.0,
+                    target_frames: 0.0,
+                    device_ppm: 0.0,
+                    correction_ppm: 0.0,
+                    device_lost: false,
+                    device_faults: 0,
+                    driver_requests: 0,
+                })
+            }
             SlotStats::None => None,
         }
     }
@@ -593,6 +690,82 @@ mod tests {
         }
         assert!(audio.inputs.channel(2).iter().chain(audio.inputs.channel(3)).all(|&s| s == 0.0));
         assert!(audio.outputs.channel(0).iter().all(|&s| s == 0.0), "no stale audio reaches outputs");
+    }
+
+    /// A strict device that plays `level` into the engine and records the last
+    /// sample the engine sent it; `dropped` flips when the engine lets go of it.
+    struct Probe {
+        ch: MasterChannels,
+        level: f32,
+        heard: Arc<std::sync::Mutex<f32>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl StrictSide for Probe {
+        fn receive(&mut self, inputs: &mut PlanarBuffer) {
+            for c in 0..self.ch.inputs {
+                inputs.channel_mut(self.ch.first_input + c).fill(self.level);
+            }
+        }
+        fn send(&mut self, outputs: &PlanarBuffer) {
+            *self.heard.lock().unwrap() = outputs.channel(self.ch.first_output)[0];
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    struct NoXruns;
+    impl StrictStats for NoXruns {
+        fn xruns(&self) -> (u64, u64) {
+            (0, 0)
+        }
+    }
+
+    #[test]
+    fn a_strict_slot_exchanges_a_block_each_way_and_is_released_on_removal() {
+        let (mut e, mut audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let (_, _dev) = e.add_soft_input(&spec("a", 2)).unwrap();
+        let heard = Arc::new(std::sync::Mutex::new(0.0));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spec = StrictSlotSpec {
+            name: "VASIO 1".into(),
+            device: "vasio:1".into(),
+            inputs: 2,
+            outputs: 2,
+            first_input: None,
+            first_output: None,
+        };
+        let (h, d) = (heard.clone(), dropped.clone());
+        let (id, ch) = e
+            .add_strict_slot(&spec, move |ch| {
+                let side = Probe { ch, level: 0.5, heard: h, dropped: d };
+                Ok((Box::new(side) as Box<dyn StrictSide>, Arc::new(NoXruns) as Arc<dyn StrictStats>))
+            })
+            .unwrap();
+        assert_eq!((ch.first_input, ch.first_output), (2, 0), "strict slots share the channel space");
+        let slot = e.slots().into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(slot.role, ClockRole::Strict);
+        // Its own input 1 routed to its own output 1: a loop through the matrix.
+        e.handle(&Command::SetPoint { input: 2, output: 0, gain_db: 0.0, mute: false, invert: false });
+        e.tick();
+        for n in 0..10 {
+            audio.process_block(n as f64 * 0.005);
+        }
+        assert_eq!(*heard.lock().unwrap(), 0.5, "what it played came back through the matrix");
+        let Response::Health { slots, .. } = e.handle(&Command::Health) else { panic!() };
+        assert!(slots.iter().any(|h| h.id == id));
+        e.remove_slot(id).unwrap();
+        audio.process_block(1.0);
+        assert!(audio.inputs.channel(2).iter().all(|&s| s == 0.0), "its inputs go silent");
+        e.tick();
+        assert!(dropped.load(Ordering::Acquire), "released on the control side");
+        let err = e.add_strict_slot(&StrictSlotSpec { name: "bad".into(), ..spec.clone() }, |_| Err("no".into()));
+        assert_eq!(err.err(), Some(EngineError::Device("no".into())));
+        assert_eq!(e.slots().len(), 1, "a failed strict slot leaves nothing behind");
     }
 
     #[test]
