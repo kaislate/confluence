@@ -8,6 +8,8 @@ jobs:
       - run: rustup show
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Builds the VASIO cdylib too: one test loads the built DLL like a DAW does.
+      - run: cargo build --workspace
       - run: cargo test --workspace
       - run: cargo test -p confluence-core --test bridge_sim --release
       - name: loom

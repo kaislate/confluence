@@ -56,6 +56,10 @@ fn each_listed_driver_streams_silence_on_time() {
             info.input_formats.first(),
             info.output_formats.first()
         );
+        for (dir, names) in [("in", &info.input_names), ("out", &info.output_names)] {
+            let list: Vec<String> = names.iter().enumerate().map(|(i, n)| format!("{i}={n}")).collect();
+            println!("  {dir}: {}", list.join(", "));
+        }
         let (handler, est) = measuring(info.sample_rate);
         let stream = dev.start(StreamConfig::default(), Box::new(handler)).unwrap_or_else(|e| panic!("{name}: {e}"));
         println!("  stream: {stream:?}");
