@@ -230,15 +230,15 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
 
 /// Process-loopback activation (asynchronous by API design; we wait for it).
 ///
-/// The activation parameters (the `PROPVARIANT` and the blob it points to) are
-/// deliberately leaked, 36 bytes per app capture opened. Measured on Windows 11
-/// with the opt-in loopback tests: freeing them right after activation, or
-/// only after the stream thread and its COM apartment are gone, corrupts the
-/// heap (STATUS_HEAP_CORRUPTION, 5 runs out of 5 each), while leaking them is
-/// clean (5 of 5). Windows evidently keeps or frees that memory itself; which,
-/// is undocumented, so we never free or reuse it.
+/// The parameters live on this stack frame until activation has completed,
+/// as in Microsoft's ApplicationLoopback sample; Windows neither keeps nor
+/// frees them (checked: parameters in static memory are untouched and never
+/// freed). The `PROPVARIANT` is `ManuallyDrop` on purpose: the windows crate's
+/// `Drop` for it calls `PropVariantClear`, which would `CoTaskMemFree` a blob
+/// this frame owns. That double free was the heap corruption once blamed on
+/// Windows, and the reason these parameters used to be leaked.
 fn activate_app(pid: u32) -> Result<IAudioClient, WasapiError> {
-    let params: &'static mut AUDIOCLIENT_ACTIVATION_PARAMS = Box::leak(Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
+    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -246,15 +246,16 @@ fn activate_app(pid: u32) -> Result<IAudioClient, WasapiError> {
                 ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
             },
         },
-    }));
-    let pv: &'static mut PROPVARIANT = Box::leak(Box::new(PROPVARIANT::default()));
-    // SAFETY: the blob points at the leaked (never freed) params.
+    };
+    let mut pv = std::mem::ManuallyDrop::new(PROPVARIANT::default());
+    // SAFETY: the blob points at `params`, which outlives every use of `pv`
+    // below; `pv` is never dropped, so nothing tries to free the blob.
     unsafe {
         let inner = &mut *pv.Anonymous.Anonymous;
         inner.vt = VT_BLOB;
         inner.Anonymous.blob = BLOB {
             cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-            pBlobData: (params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
+            pBlobData: (&mut params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
         };
     }
     // SAFETY: plain event creation, closed below.
