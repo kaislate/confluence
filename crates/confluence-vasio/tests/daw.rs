@@ -296,3 +296,19 @@ fn an_engine_with_a_different_block_makes_the_daw_reset() {
     assert_eq!(*seen.last_input.lock().unwrap(), 0.0, "never linked to a stream of the wrong shape");
     dev.stop();
 }
+
+#[test]
+fn stopping_the_daw_is_prompt_even_while_looking_for_the_engine() {
+    confluence_provider_vasio::isolate_for_tests();
+    let mut worst = Duration::ZERO;
+    for _ in 0..5 {
+        // Instance 6's engine is not running in this test: the driver is looking for it.
+        let mut dev = open(6);
+        dev.start(StreamConfig::default(), loopback_daw(Arc::new(Seen::default()))).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        let t = Instant::now();
+        dev.stop();
+        worst = worst.max(t.elapsed());
+    }
+    assert!(worst < Duration::from_millis(40), "a DAW pressing stop waited {worst:?}");
+}
