@@ -38,9 +38,13 @@ pub fn stream_name(instance: u32) -> String {
     }
 }
 
-/// Puts this process's VASIO streams in a private namespace (for tests).
+/// Puts this process's VASIO streams, and its saved VASIO shapes, in a
+/// private namespace (for tests): they never meet a real engine or DAW, nor
+/// the machine's real settings.
 pub fn isolate_for_tests() {
-    std::env::set_var(NAMESPACE_VAR, format!("test-{}", std::process::id()));
+    let pid = std::process::id();
+    std::env::set_var(NAMESPACE_VAR, format!("test-{pid}"));
+    std::env::set_var(config::ROOT_VAR, format!(r"Software\ConfluenceTest\VASIO.{pid}"));
 }
 
 /// Counters readable from the control side.

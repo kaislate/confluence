@@ -122,10 +122,16 @@ fn wait_until(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
 
 #[test]
 fn without_the_engine_the_daw_keeps_running_on_silence() {
+    use confluence_provider_vasio::config::{self, InstanceConfig};
     confluence_provider_vasio::isolate_for_tests();
+    // The shape the engine last served, saved under this test's private root
+    // (never the machine's real settings).
+    let saved = InstanceConfig { daw_inputs: 4, daw_outputs: 3, sample_rate: 48_000, block: 192 };
+    config::save(5, &saved).unwrap();
     let mut dev = open(5);
+    config::delete_root(&config::root());
     assert_eq!(dev.info().name, "Confluence VASIO 5");
-    assert!(dev.info().inputs() >= 2 && dev.info().outputs() >= 2);
+    assert_eq!((dev.info().inputs(), dev.info().outputs(), dev.info().preferred_block), (4, 3, 192));
     let seen = Arc::new(Seen::default());
     let stream = dev.start(StreamConfig::default(), loopback_daw(seen.clone())).unwrap();
     std::thread::sleep(Duration::from_millis(1000));

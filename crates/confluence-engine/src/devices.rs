@@ -177,7 +177,7 @@ impl DeviceManager {
             asio_open: Arc::new(Box::new(AsioDevice::open_installed)),
             loading: Vec::new(),
             quality: AsrcQuality::Sinc64,
-            vasio_config_root: Some(confluence_provider_vasio::config::ROOT.to_string()),
+            vasio_config_root: Some(confluence_provider_vasio::config::root()),
             unplaced: Vec::new(),
             save_blocked: false,
         }

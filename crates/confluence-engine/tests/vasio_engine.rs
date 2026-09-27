@@ -50,6 +50,14 @@ fn route(engine: &mut Engine, input: u32, output: u32) {
 fn hardware_to_a_daw_and_back_through_vasio() {
     confluence_provider_vasio::isolate_for_tests();
     let root = format!("Software\\ConfluenceTest\\VASIO.engine.{}", std::process::id());
+    // Removes the scratch key even if an assertion below fails.
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            confluence_provider_vasio::config::delete_root(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
     let probe = Arc::new(FakeProbe::default());
     let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 256));
     let mut devices = DeviceManager::new(None)
@@ -107,5 +115,4 @@ fn hardware_to_a_daw_and_back_through_vasio() {
     assert!(daw.is_running());
     daw.stop();
     clock.stop();
-    confluence_provider_vasio::config::delete_root(&root);
 }
