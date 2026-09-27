@@ -32,6 +32,17 @@ impl RingMemory {
         unsafe { &*self.counters }
     }
 
+    /// Frames written and unread, given the two counters. A reader ahead of
+    /// the writer (only possible if two readers raced) reads as empty.
+    fn used(&self, write: u64, read: u64) -> u64 {
+        let used = write.wrapping_sub(read);
+        if used > self.capacity {
+            0
+        } else {
+            used
+        }
+    }
+
     fn slot(&self, position: u64, channel: usize) -> *mut f32 {
         let frame = (position % self.capacity) as usize;
         // SAFETY: frame < capacity and channel < channels, so the offset is
@@ -64,7 +75,7 @@ impl RingWriter {
         let c = self.0.counters();
         let w = c.write.load(Ordering::Relaxed);
         let r = c.read.load(Ordering::Acquire);
-        self.0.capacity.saturating_sub(w.wrapping_sub(r))
+        self.0.capacity - self.0.used(w, r)
     }
 
     /// True when the reader has consumed everything written.
@@ -102,17 +113,29 @@ impl RingReader {
     /// Frames written and not yet read.
     pub fn available(&self) -> u64 {
         let c = self.0.counters();
-        c.write.load(Ordering::Acquire).wrapping_sub(c.read.load(Ordering::Relaxed)).min(self.0.capacity)
+        self.0.used(c.write.load(Ordering::Acquire), c.read.load(Ordering::Relaxed))
+    }
+
+    /// Loads both counters once. If the reader is somehow ahead of the writer
+    /// (two readers raced), it resyncs to the writer instead of wedging.
+    fn counters_checked(&mut self) -> (u64, u64) {
+        let c = self.0.counters();
+        let (w, r) = (c.write.load(Ordering::Acquire), c.read.load(Ordering::Relaxed));
+        if w.wrapping_sub(r) > self.0.capacity {
+            c.read.store(w, Ordering::Release);
+            return (w, w);
+        }
+        (w, r)
     }
 
     /// Reads `frames` frames into `sink(channel, frame, sample)`. Reads nothing
     /// and returns false if fewer are available.
     pub fn read_frames(&mut self, frames: usize, mut sink: impl FnMut(usize, usize, f32)) -> bool {
-        if (frames as u64) > self.available() {
+        let (w, r) = self.counters_checked();
+        if (frames as u64) > w - r {
             return false;
         }
         let c = self.0.counters();
-        let r = c.read.load(Ordering::Relaxed);
         for f in 0..frames {
             for ch in 0..self.0.channels {
                 // SAFETY: the frame was published by the writer (checked above).
@@ -125,9 +148,9 @@ impl RingReader {
 
     /// Drops up to `frames` unread frames (the oldest first).
     pub fn skip(&mut self, frames: u64) {
-        let c = self.0.counters();
-        let n = frames.min(self.available());
-        c.read.store(c.read.load(Ordering::Relaxed) + n, Ordering::Release);
+        let (w, r) = self.counters_checked();
+        let n = frames.min(w - r);
+        self.0.counters().read.store(r + n, Ordering::Release);
     }
 
     /// Drops everything unread, so the next read gets only new frames.
@@ -188,6 +211,25 @@ mod tests {
         assert!(!w.write_frames(1, |_, _| 9.0), "must not overwrite unread frames");
         assert!(r.read_frames(4, |_, f, s| assert_eq!(s, f as f32)));
         assert_eq!(r.available(), 0);
+    }
+
+    #[test]
+    fn a_reader_ahead_of_the_writer_resyncs_instead_of_wedging_the_ring() {
+        let (keep, mem) = HeapRing::new(8, 1);
+        // SAFETY: `keep` outlives both ends.
+        let (mut w, mut r) = unsafe { ring(mem) };
+        assert!(w.write_frames(4, |_, f| f as f32));
+        // A racing second reader (e.g. during a takeover) left `read` past `write`.
+        keep.counters.read.store(7, std::sync::atomic::Ordering::Release);
+        assert_eq!(r.available(), 0, "no phantom frames");
+        assert_eq!(w.free_frames(), 8, "the writer is not blocked forever");
+        assert!(w.is_empty());
+        assert!(!r.read_frames(1, |_, _, _| {}));
+        // After the resync, fresh frames flow normally.
+        assert!(w.write_frames(2, |_, f| 10.0 + f as f32));
+        let mut got = Vec::new();
+        assert!(r.read_frames(2, |_, _, s| got.push(s)));
+        assert_eq!(got, [10.0, 11.0]);
     }
 
     #[test]

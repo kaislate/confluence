@@ -183,7 +183,9 @@ impl Link {
             return None;
         }
         *watch = None;
-        let (mut from_engine, to_engine) = client.ends();
+        // SAFETY: the ends live in the same `Link` as `client` and are only used
+        // through it while it is alive (dropping an end touches no memory).
+        let (mut from_engine, to_engine) = unsafe { client.ends() };
         from_engine.skip_all();
         let last_heartbeat = h.server_heartbeat.load(Ordering::Acquire);
         Some(Link {

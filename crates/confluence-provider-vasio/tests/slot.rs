@@ -22,7 +22,8 @@ struct Daw {
 impl Daw {
     fn connect(instance: u32, offset: f32) -> Daw {
         let client = Client::connect(&confluence_provider_vasio::stream_name(instance)).unwrap().unwrap();
-        let (mut reader, writer) = client.ends();
+        // SAFETY: the ends are stored with the client and dropped with it; taken once.
+        let (mut reader, writer) = unsafe { client.ends() };
         reader.skip_all();
         client.header().client_active.store(1, Ordering::Release);
         Daw { client, reader, writer, offset }

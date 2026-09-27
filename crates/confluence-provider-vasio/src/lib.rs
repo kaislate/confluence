@@ -108,7 +108,9 @@ impl VasioSlot {
             capacity_frames: block as u32 * RING_BLOCKS,
         };
         let server = Server::create(&stream_name(instance), layout)?;
-        let (to_daw, from_daw) = server.ends();
+        // SAFETY: the ends are stored next to `server` in `VasioSlot` and
+        // declared before it, so they are dropped first; taken once.
+        let (to_daw, from_daw) = unsafe { server.ends() };
         let timeout_blocks = ((CLIENT_TIMEOUT_S * sample_rate / block as f64).ceil() as u32).max(2);
         Ok(VasioSlot {
             to_daw,
