@@ -225,8 +225,9 @@ pub struct DeviceManager {
     /// Saved bindings whose channels could not be reserved this run: kept so
     /// they are written back and tried again next time.
     unplaced: Vec<Binding>,
-    /// The file could not be read (or moved aside): never overwrite it.
-    save_blocked: bool,
+    /// Why the bindings file, which exists, is never overwritten this session
+    /// (so device changes are not saved); `None` when saving works.
+    save_blocked: Option<&'static str>,
     /// The ASIO master's slot and driver health, for `annotate`.
     master_health: Option<(u32, Arc<AsioHealth>)>,
 }
@@ -246,7 +247,7 @@ impl DeviceManager {
             quality: AsrcQuality::Sinc64,
             vasio_config_root: Some(confluence_provider_vasio::config::root()),
             unplaced: Vec::new(),
-            save_blocked: false,
+            save_blocked: None,
             master_health: None,
         }
     }
@@ -257,7 +258,7 @@ impl DeviceManager {
     /// session's device changes are then not saved.
     pub fn open_file(path: PathBuf) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
-        let mut save_blocked = false;
+        let mut save_blocked = None;
         let saved = match std::fs::read_to_string(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
             Err(e) => {
@@ -265,7 +266,7 @@ impl DeviceManager {
                     "could not read {}: {e}; it is left untouched and device changes will not be saved",
                     path.display()
                 ));
-                save_blocked = true;
+                save_blocked = Some("could not be read at start-up");
                 Saved::default()
             }
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
@@ -282,7 +283,7 @@ impl DeviceManager {
                              starting with no devices, and device changes will not be saved",
                             path.display()
                         ));
-                        save_blocked = true;
+                        save_blocked = Some("is not valid and could not be moved aside");
                     }
                 }
                 Saved::default()
@@ -582,9 +583,9 @@ impl DeviceManager {
     /// the engine's `Health` response for that device's slots.
     pub fn annotate(&self, resp: &mut Response) {
         let Response::Health { slots, notices, .. } = resp else { return };
-        if self.save_blocked {
+        if let Some(why) = self.save_blocked {
             notices.push(match &self.path {
-                Some(p) => format!("device changes are not being saved: {} could not be read at start-up", p.display()),
+                Some(p) => format!("device changes are not being saved: {} {why}", p.display()),
                 None => "device changes are not being saved".into(),
             });
         }
@@ -628,7 +629,7 @@ impl DeviceManager {
 
     fn save(&self) -> Result<(), String> {
         let Some(path) = &self.path else { return Ok(()) };
-        if self.save_blocked {
+        if self.save_blocked.is_some() {
             return Ok(());
         }
         let mut devices = self.bindings();

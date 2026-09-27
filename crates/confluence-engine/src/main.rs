@@ -24,7 +24,7 @@ mod app {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use confluence_api::{Command, Response};
     use confluence_engine::clock::InternalClock;
@@ -225,14 +225,26 @@ mod app {
         }
         server.stop();
         // Soft devices first (their bridges feed the engine), then the master.
-        let state = match Arc::try_unwrap(state) {
-            Ok(m) => m.into_inner().unwrap_or_else(|p| p.into_inner()),
-            Err(shared) => {
-                drop(shared);
-                return Ok(());
+        // A command may still be loading or starting a device without the
+        // lock: give it a moment to finish. The master is stopped either way.
+        let give_up = Instant::now() + Duration::from_secs(5);
+        let mut state = state;
+        let state = loop {
+            match Arc::try_unwrap(state) {
+                Ok(m) => break Some(m.into_inner().unwrap_or_else(|p| p.into_inner())),
+                Err(shared) if Instant::now() < give_up => {
+                    state = shared;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => {
+                    eprintln!("confluence-engine: a device was still being added; stopping anyway");
+                    break None;
+                }
             }
         };
-        drop(state.devices);
+        if let Some(state) = state {
+            drop(state.devices);
+        }
         match master {
             Master::Internal(clock) => {
                 clock.stop();

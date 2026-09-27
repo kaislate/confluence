@@ -377,7 +377,7 @@ fn an_unreadable_bindings_file_is_never_overwritten() {
     let mut resp = engine.handle(&Command::Health);
     devices.annotate(&mut resp);
     let Response::Health { notices, .. } = resp else { panic!() };
-    assert!(notices.iter().any(|n| n.contains("not being saved")), "{notices:?}");
+    assert!(notices.iter().any(|n| n.contains("not being saved") && n.contains("could not be read")), "{notices:?}");
     trigger_save(&mut devices);
     assert_eq!(std::fs::read(&path).unwrap(), original, "a file we could not read is left alone");
 }
@@ -393,6 +393,12 @@ fn a_corrupt_file_that_cannot_be_moved_aside_is_left_and_not_overwritten() {
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(!warnings[0].contains("kept as"), "must not claim a move that failed: {warnings:?}");
     assert!(warnings[0].contains("left in place"), "{warnings:?}");
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut resp = engine.handle(&Command::Health);
+    devices.annotate(&mut resp);
+    let Response::Health { notices, .. } = resp else { panic!() };
+    let why = "is not valid and could not be moved aside";
+    assert!(notices.iter().any(|n| n.contains("not being saved") && n.contains(why)), "{notices:?}");
     trigger_save(&mut devices);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ this is not json", "the damaged file survives");
 }

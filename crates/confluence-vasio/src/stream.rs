@@ -198,8 +198,9 @@ fn probe_once(name: &str, chooser: &mut Chooser, shared: &ProbeShared) -> Option
 
 /// Looks for the engine on a helper thread and hands over only streams it has
 /// already claimed, so the thread that drives the DAW's `bufferSwitch` never
-/// opens, maps or drops mappings to find it. It sleeps between attempts but
-/// is woken at once when asked to look again or to stop.
+/// opens or maps anything to find the engine, nor drops a stream it rejected.
+/// (It does unmap a link that has died.) It sleeps between attempts but is
+/// woken at once when asked to look again or to stop.
 struct Prober {
     shared: Arc<ProbeShared>,
     found: Receiver<Claim>,

@@ -230,15 +230,16 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
 
 /// Process-loopback activation (asynchronous by API design; we wait for it).
 ///
-/// The parameters live on this stack frame until activation has completed,
-/// as in Microsoft's ApplicationLoopback sample; Windows neither keeps nor
-/// frees them (checked: parameters in static memory are untouched and never
-/// freed). The `PROPVARIANT` is `ManuallyDrop` on purpose: the windows crate's
+/// The parameters are ours until activation has completed, as in Microsoft's
+/// ApplicationLoopback sample; Windows neither keeps nor frees them (checked:
+/// parameters in static memory are untouched and never freed). If the wait
+/// times out, activation may still be running and reading them, so on that
+/// path only they are leaked (a few dozen bytes). The `PROPVARIANT` is `ManuallyDrop` on purpose: the windows crate's
 /// `Drop` for it calls `PropVariantClear`, which would `CoTaskMemFree` a blob
 /// this frame owns. That double free was the heap corruption once blamed on
 /// Windows, and the reason these parameters used to be leaked.
 fn activate_app(pid: u32) -> Result<IAudioClient, WasapiError> {
-    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+    let mut params = Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -246,7 +247,7 @@ fn activate_app(pid: u32) -> Result<IAudioClient, WasapiError> {
                 ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
             },
         },
-    };
+    });
     let mut pv = std::mem::ManuallyDrop::new(PROPVARIANT::default());
     // SAFETY: the blob points at `params`, which outlives every use of `pv`
     // below; `pv` is never dropped, so nothing tries to free the blob.
@@ -255,13 +256,13 @@ fn activate_app(pid: u32) -> Result<IAudioClient, WasapiError> {
         inner.vt = VT_BLOB;
         inner.Anonymous.blob = BLOB {
             cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-            pBlobData: (&mut params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
+            pBlobData: (&mut *params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
         };
     }
     // SAFETY: plain event creation, closed below.
     let done = Arc::new(OwnedEvent(unsafe { CreateEventW(None, false, false, None) }.call("CreateEventW")?));
     let handler: IActivateAudioInterfaceCompletionHandler = Activated(done.clone()).into();
-    (|| {
+    let result = (|| {
         // SAFETY: all arguments stay valid for the duration of the call and beyond.
         let op = unsafe {
             ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&*pv), &handler)
@@ -277,7 +278,12 @@ fn activate_app(pid: u32) -> Result<IAudioClient, WasapiError> {
         unsafe { op.GetActivateResult(&mut hr, &mut unknown) }.call("GetActivateResult")?;
         hr.ok().call("process loopback activation")?;
         unknown.ok_or(WasapiError::Gone)?.cast::<IAudioClient>().call("IUnknown::cast<IAudioClient>")
-    })()
+    })();
+    if matches!(result, Err(WasapiError::Timeout)) {
+        // Still pending: Windows may yet read the parameters.
+        Box::leak(params);
+    }
+    result
 }
 
 fn open_client(target: &Target) -> Result<(IAudioClient, StreamFormat), WasapiError> {
