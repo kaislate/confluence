@@ -497,3 +497,117 @@ fn an_output_that_stalls_before_priming_is_not_flooded() {
     assert_eq!((h.overruns, h.underruns), (0, 0), "{h:?}");
     assert!(h.fill_frames < h.target_frames + 512.0, "{h:?}");
 }
+
+/// A WASAPI capture device delivers 10 ms packets whose arrival jitters by
+/// about a millisecond. The locked loop must still hold the fill on target:
+/// the margin above one device and one master block is only 2 ms, so a fill
+/// that wanders a few ms below target underruns (issue #15).
+#[test]
+fn a_locked_input_loop_holds_its_target_through_arrival_jitter() {
+    for (device_ppm, seed) in [(11.5, 0x2545_F491_4F6C_DD1Du64), (-10.0, 0x9E37_79B9_7F4A_7C15)] {
+        let cfg = BridgeConfig { margin_frames: 96, ..config(48_000.0, 480, 512) };
+        let (mut dev, mut eng, stats) = soft_input(cfg).unwrap();
+        let dev_rate = 48_000.0 * (1.0 + device_ppm * 1e-6);
+        let mut jitter = Jitter(seed, 0.001);
+        let mut out = PlanarBuffer::new(2, 512);
+        let packet = vec![0.1f32; 960];
+        let (mut packets, mut blocks) = (0u64, 0u64);
+        let mut arrival = 480.0 / dev_rate + jitter.next();
+        let mut worst = 0.0f64;
+        loop {
+            let t_master = (blocks + 1) as f64 * 512.0 / MASTER_RATE;
+            if t_master > 150.0 {
+                break;
+            }
+            if arrival <= t_master {
+                dev.write_interleaved(&packet, arrival);
+                packets += 1;
+                arrival = ((packets + 1) * 480) as f64 / dev_rate + jitter.next();
+            } else {
+                eng.read(&mut out, 0, t_master, 0.0);
+                blocks += 1;
+                if t_master > SETTLE_S {
+                    let h = stats.snapshot();
+                    worst = worst.max((h.fill_frames - h.target_frames).abs());
+                }
+            }
+        }
+        let h = stats.snapshot();
+        assert_eq!(h.underruns + h.overruns, 0, "{device_ppm} ppm: {h:?}");
+        assert!(worst < 12.0, "{device_ppm} ppm: the fill strayed {worst:.1} frames from its target ({h:?})");
+    }
+}
+
+/// When adaptive latency moves the target, the loop goes there promptly and
+/// settles; a slew-limited crawl there overshoots by tens of frames.
+#[test]
+fn a_target_step_settles_without_overshoot() {
+    let cfg = config(48_000.0, 128, 256);
+    let (mut dev, mut eng, stats) = soft_input(cfg).unwrap();
+    let dev_rate = 48_000.0 * (1.0 + 300e-6);
+    let mut jitter = Jitter(0x2545_F491_4F6C_DD1D, 0.0002);
+    let mut out = PlanarBuffer::new(2, 256);
+    let packet = vec![0.1f32; 256];
+    let (mut packets, mut blocks) = (0u64, 0u64);
+    let mut arrival = 128.0 / dev_rate + jitter.next();
+    let (mut target, mut moved_at, mut moves, mut worst) = (0.0f64, 0.0f64, 0, 0.0f64);
+    loop {
+        let t_master = (blocks + 1) as f64 * 256.0 / MASTER_RATE;
+        if t_master > 90.0 {
+            break;
+        }
+        if arrival <= t_master {
+            dev.write_interleaved(&packet, arrival);
+            packets += 1;
+            arrival = ((packets + 1) * 128) as f64 / dev_rate + jitter.next();
+        } else {
+            eng.read(&mut out, 0, t_master, 0.0);
+            blocks += 1;
+            let h = stats.snapshot();
+            if h.target_frames != target {
+                (target, moved_at) = (h.target_frames, t_master);
+                moves += 1;
+            }
+            if t_master > SETTLE_S && t_master - moved_at > 8.0 {
+                worst = worst.max((h.fill_frames - h.target_frames).abs());
+            }
+        }
+    }
+    let h = stats.snapshot();
+    assert!(moves > 1, "the scenario moves the target: {h:?}");
+    assert_eq!(h.underruns + h.overruns, 0, "{h:?}");
+    assert!(worst < 10.0, "8 s after a target move the fill was still {worst:.1} frames off ({h:?})");
+}
+
+/// Process-loopback capture starts irregularly: its first packets come in
+/// bursts with gaps of 20 ms and more. Starting the loop on the first burst
+/// underran on the next gap (issue #15).
+#[test]
+fn an_input_that_starts_in_bursts_does_not_underrun() {
+    let cfg = BridgeConfig { margin_frames: 96, ..config(48_000.0, 480, 512) };
+    let (mut dev, mut eng, stats) = soft_input(cfg).unwrap();
+    let mut out = PlanarBuffer::new(2, 512);
+    let packet = vec![0.1f32; 960];
+    // Three packets at once every 30 ms for 0.4 s, then one every 10 ms.
+    let arrivals = (0..600u64).map(|k| if k < 39 { 0.03 * (k / 3 + 1) as f64 } else { 0.01 * (k + 1) as f64 });
+    let mut arrivals = arrivals.peekable();
+    let mut blocks = 0u64;
+    loop {
+        let t_master = (blocks + 1) as f64 * 512.0 / MASTER_RATE;
+        if t_master > 5.5 {
+            break;
+        }
+        match arrivals.peek() {
+            Some(&a) if a <= t_master => {
+                dev.write_interleaved(&packet, a);
+                arrivals.next();
+            }
+            _ => {
+                eng.read(&mut out, 0, t_master, 0.0);
+                blocks += 1;
+            }
+        }
+    }
+    let h = stats.snapshot();
+    assert_eq!(h.underruns + h.overruns, 0, "{h:?}");
+}
