@@ -396,8 +396,22 @@ impl DeviceManager {
     /// starting it; follow with [`AttachedAdd::start`] (without the engine
     /// lock) and [`commit_add`](Self::commit_add).
     pub fn attach_add(&mut self, engine: &mut Engine, loaded: LoadedAdd) -> Result<AttachedAdd, String> {
+        let (kind, name) = (loaded.kind, loaded.name.clone());
+        let attached = self.attach_loaded(engine, loaded);
+        if attached.is_err() {
+            self.end_loading(kind, &name);
+        }
+        // Otherwise it stays reserved until commit_add: while it starts, it
+        // must not be loaded a second time.
+        attached
+    }
+
+    fn end_loading(&mut self, kind: DeviceKind, name: &str) {
+        self.loading.retain(|(k, n)| !(*k == kind && n == name));
+    }
+
+    fn attach_loaded(&mut self, engine: &mut Engine, loaded: LoadedAdd) -> Result<AttachedAdd, String> {
         let LoadedAdd { kind, name, loaded } = loaded;
-        self.loading.retain(|(k, n)| !(*k == kind && *n == name));
         let name = name.as_str();
         self.check_addable(kind, name)?;
         let existing = self.bound.iter().position(|b| same_device(&b.binding, kind, name));
@@ -435,9 +449,12 @@ impl DeviceManager {
     pub fn commit_add(&mut self, engine: &mut Engine, started: StartedAdd) -> Result<Vec<u32>, String> {
         let StartedAdd { kind, name, offline, bound, result } = started;
         self.attaching.retain(|id| !bound.slots.contains(id));
+        self.end_loading(kind, &name);
         if let Err(e) = result {
             for id in &bound.slots {
-                let _ = engine.detach_slot(*id);
+                // An offline device gets its routes back below; a new one
+                // leaves none on channels that are free again.
+                let _ = if offline.is_some() { engine.detach_slot(*id) } else { engine.remove_slot(*id) };
             }
             drop(bound);
             if let Some(b) = offline {

@@ -38,6 +38,8 @@ pub struct FakeConfig {
     pub posts_timer: bool,
     /// Take this long in `start` (a slow or stuck driver).
     pub start_delay: Option<Duration>,
+    /// `start` fails (after any `start_delay`).
+    pub fail_start: bool,
     pub probe: Arc<FakeProbe>,
 }
 
@@ -58,6 +60,7 @@ impl FakeConfig {
             reset_after: None,
             posts_timer: false,
             start_delay: None,
+            fail_start: false,
             probe: Arc::new(FakeProbe::default()),
         }
     }
@@ -191,6 +194,9 @@ unsafe extern "system" fn start(this: *mut IAsio) -> AsioError {
     let f = me(this);
     if let Some(d) = f.cfg.start_delay {
         std::thread::sleep(d);
+    }
+    if f.cfg.fail_start {
+        return ASE_HW_MALFUNCTION;
     }
     let mut st = state(this);
     let Some(cb) = st.callbacks else { return ASE_INVALID_MODE };

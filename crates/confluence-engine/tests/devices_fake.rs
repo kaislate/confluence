@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use confluence_api::{Command, DeviceKind, Response};
@@ -13,7 +13,7 @@ use confluence_engine::clock::InternalClock;
 use confluence_engine::devices::{start_asio_master, AsioOpener, DeviceManager};
 use confluence_engine::{Engine, EngineConfig, MasterChannels};
 use confluence_provider_asio::fake::{FakeConfig, FakeProbe};
-use confluence_provider_asio::{AsioDevice, AsioHostError, DriverSource};
+use confluence_provider_asio::{AsioDevice, AsioHostError, DriverSource, MAX_DRIVERS};
 
 /// Opens `fake:<name>` as a fake driver (2 in / 2 out, input 0.25) whose probe
 /// is shared with the test; anything else is "not installed".
@@ -26,6 +26,42 @@ fn opener(probes: Vec<(&'static str, Arc<FakeProbe>)>) -> AsioOpener {
     })
 }
 
+/// Tests running now. The process has room for only `MAX_DRIVERS` ASIO drivers
+/// and no test here holds more than three at once, so at most a third of that
+/// many run together; beyond it the harness's parallelism made opens fail at random.
+static RUNNING: Mutex<usize> = Mutex::new(0);
+static FINISHED: Condvar = Condvar::new();
+
+struct DriverBudget;
+
+impl Drop for DriverBudget {
+    fn drop(&mut self) {
+        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        FINISHED.notify_one();
+    }
+}
+
+/// Waits until this test's drivers are sure to fit; hold it for the whole test.
+fn driver_budget() -> DriverBudget {
+    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    while *running >= MAX_DRIVERS / 3 {
+        running = FINISHED.wait(running).unwrap_or_else(|e| e.into_inner());
+    }
+    *running += 1;
+    DriverBudget
+}
+
+fn points(engine: &mut Engine) -> Vec<(u32, u32)> {
+    match engine.handle(&Command::ListPoints) {
+        Response::Points(p) => {
+            let mut v: Vec<_> = p.into_iter().map(|p| (p.input, p.output)).collect();
+            v.sort();
+            v
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 fn route(engine: &mut Engine, input: u32, output: u32) {
     let cmd = Command::SetPoint { input, output, gain_db: 0.0, mute: false, invert: false };
     assert_eq!(engine.handle(&cmd), Response::Ok);
@@ -33,6 +69,7 @@ fn route(engine: &mut Engine, input: u32, output: u32) {
 
 #[test]
 fn an_asio_device_loops_audio_through_the_engine() {
+    let _budget = driver_budget();
     let probe = Arc::new(FakeProbe::default());
     let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 256));
     let mut devices = DeviceManager::new(None).with_asio_opener(opener(vec![("fake:loop", probe.clone())]));
@@ -55,6 +92,7 @@ fn an_asio_device_loops_audio_through_the_engine() {
 
 #[test]
 fn an_asio_master_drives_the_engine_and_a_second_device_hears_it() {
+    let _budget = driver_budget();
     let master_probe = Arc::new(FakeProbe::default());
     let soft_probe = Arc::new(FakeProbe::default());
     let open = opener(vec![("fake:master", master_probe.clone()), ("fake:soft", soft_probe.clone())]);
@@ -82,6 +120,7 @@ fn an_asio_master_drives_the_engine_and_a_second_device_hears_it() {
 
 #[test]
 fn bindings_persist_and_missing_devices_keep_their_channels() {
+    let _budget = driver_budget();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("devices.json");
     let (a, b) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
@@ -113,6 +152,7 @@ fn bindings_persist_and_missing_devices_keep_their_channels() {
 
 #[test]
 fn a_missing_device_is_a_clear_error_and_leaves_nothing_behind() {
+    let _budget = driver_budget();
     let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
     let mut devices = DeviceManager::new(None).with_asio_opener(opener(vec![]));
     let resp = devices.handle(&mut engine, &Command::AddDevice { kind: DeviceKind::Asio, name: "fake:nope".into() });
@@ -123,6 +163,7 @@ fn a_missing_device_is_a_clear_error_and_leaves_nothing_behind() {
 
 #[test]
 fn removing_a_device_stops_its_driver() {
+    let _budget = driver_budget();
     let probe = Arc::new(FakeProbe::default());
     let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
     let mut devices = DeviceManager::new(None).with_asio_opener(opener(vec![("fake:x", probe.clone())]));
@@ -134,6 +175,7 @@ fn removing_a_device_stops_its_driver() {
 
 #[test]
 fn the_master_gets_its_saved_channels_back() {
+    let _budget = driver_budget();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("devices.json");
     let (m, soft) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
@@ -168,6 +210,7 @@ fn the_master_gets_its_saved_channels_back() {
 
 #[test]
 fn a_corrupt_bindings_file_is_kept_and_reported_not_silently_dropped() {
+    let _budget = driver_budget();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("devices.json");
     std::fs::write(&path, "{ this is not json").unwrap();
@@ -181,6 +224,7 @@ fn a_corrupt_bindings_file_is_kept_and_reported_not_silently_dropped() {
 
 #[test]
 fn a_device_cannot_be_opened_twice_and_the_master_is_not_a_soft_slot() {
+    let _budget = driver_budget();
     let (a, m) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
     let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
     let mut devices = DeviceManager::new(None).with_asio_opener(opener(vec![("fake:a", a), ("fake:m", m)]));
@@ -196,6 +240,7 @@ fn a_device_cannot_be_opened_twice_and_the_master_is_not_a_soft_slot() {
 
 #[test]
 fn adding_an_offline_device_brings_it_back_on_its_saved_channels() {
+    let _budget = driver_budget();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("devices.json");
     let (a, b) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
@@ -222,15 +267,7 @@ fn adding_an_offline_device_brings_it_back_on_its_saved_channels() {
     // Routes to and from the offline device (replayed from the journal at start-up).
     route(&mut engine, 0, 2); // fake:a input 1 -> fake:b output 1
     route(&mut engine, 2, 1); // fake:b input 1 -> fake:a output 2
-    let points = |engine: &mut Engine| match engine.handle(&Command::ListPoints) {
-        Response::Points(p) => {
-            let mut v: Vec<_> = p.into_iter().map(|p| (p.input, p.output)).collect();
-            v.sort();
-            v
-        }
-        other => panic!("{other:?}"),
-    };
-    // Still unplugged: a clear error, and the offline slot keeps its channels and routes.
+                              // Still unplugged: a clear error, and the offline slot keeps its channels and routes.
     let err = devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap_err();
     assert!(err.contains("not installed"), "{err}");
     let offline = engine.slots().into_iter().find(|s| !s.online).unwrap();
@@ -251,6 +288,7 @@ fn adding_an_offline_device_brings_it_back_on_its_saved_channels() {
 
 #[test]
 fn a_soft_device_that_becomes_the_master_is_not_opened_twice() {
+    let _budget = driver_budget();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("devices.json");
     let m = Arc::new(FakeProbe::default());
@@ -283,6 +321,7 @@ fn a_soft_device_that_becomes_the_master_is_not_opened_twice() {
 
 #[test]
 fn driver_requests_show_in_health() {
+    let _budget = driver_budget();
     let probe = Arc::new(FakeProbe::default());
     let open: AsioOpener = Box::new(move |name: &str| {
         let mut cfg = FakeConfig::new(name);
@@ -321,6 +360,7 @@ fn trigger_save(devices: &mut DeviceManager) {
 
 #[test]
 fn an_unreadable_bindings_file_is_never_overwritten() {
+    let _budget = driver_budget();
     use std::os::windows::fs::OpenOptionsExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("devices.json");
@@ -344,6 +384,7 @@ fn an_unreadable_bindings_file_is_never_overwritten() {
 
 #[test]
 fn a_corrupt_file_that_cannot_be_moved_aside_is_left_and_not_overwritten() {
+    let _budget = driver_budget();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("devices.json");
     std::fs::write(&path, "{ this is not json").unwrap();
@@ -358,6 +399,7 @@ fn a_corrupt_file_that_cannot_be_moved_aside_is_left_and_not_overwritten() {
 
 #[test]
 fn a_binding_whose_channels_are_taken_stays_saved() {
+    let _budget = driver_budget();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("devices.json");
     let (a, m) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
@@ -389,6 +431,7 @@ fn a_binding_whose_channels_are_taken_stays_saved() {
 
 #[test]
 fn a_slow_driver_does_not_hold_up_the_manager_or_the_engine() {
+    let _budget = driver_budget();
     let (quick, slow) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
     let (release, gate) = std::sync::mpsc::channel::<()>();
     let gate = std::sync::Mutex::new(gate);
@@ -420,6 +463,7 @@ fn a_slow_driver_does_not_hold_up_the_manager_or_the_engine() {
 
 #[test]
 fn the_masters_driver_requests_show_in_health() {
+    let _budget = driver_budget();
     let mut cfg = FakeConfig::new("fake:m");
     cfg.reset_after = Some(10);
     let mut master = AsioDevice::open(DriverSource::Fake(cfg)).unwrap();
@@ -440,6 +484,7 @@ fn the_masters_driver_requests_show_in_health() {
 
 #[test]
 fn a_device_that_is_added_and_removed_is_not_brought_back_from_an_old_binding() {
+    let _budget = driver_budget();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("devices.json");
     let (a, m) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
@@ -469,6 +514,7 @@ fn a_device_that_is_added_and_removed_is_not_brought_back_from_an_old_binding() 
 
 #[test]
 fn a_device_whose_open_panics_can_be_tried_again() {
+    let _budget = driver_budget();
     let open: AsioOpener =
         Box::new(|name: &str| -> Result<AsioDevice, AsioHostError> { panic!("driver lookup bug for {name}") });
     let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
@@ -484,6 +530,7 @@ fn a_device_whose_open_panics_can_be_tried_again() {
 
 #[test]
 fn a_slow_driver_start_does_not_hold_up_the_manager() {
+    let _budget = driver_budget();
     let (slow, quick) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
     let open: AsioOpener = Box::new(move |name: &str| {
         let mut cfg = FakeConfig::new(name);
@@ -510,4 +557,87 @@ fn a_slow_driver_start_does_not_hold_up_the_manager() {
     let started = starting.join().unwrap();
     assert_eq!(devices.commit_add(&mut engine, started).unwrap(), slots);
     assert_eq!(devices.bindings().len(), 2);
+}
+
+/// Opens `fake:<name>` as a fake driver whose `start` takes `delay` and fails
+/// while `broken` is set.
+fn starting_opener(delay: Duration, broken: Arc<AtomicBool>) -> AsioOpener {
+    Box::new(move |name: &str| {
+        let mut cfg = FakeConfig::new(name);
+        cfg.start_delay = Some(delay);
+        cfg.fail_start = broken.load(Ordering::Acquire);
+        AsioDevice::open(DriverSource::Fake(cfg))
+    })
+}
+
+#[test]
+fn a_device_that_is_still_starting_cannot_be_added_again() {
+    let _budget = driver_budget();
+    let open = starting_opener(Duration::from_millis(200), Arc::new(AtomicBool::new(false)));
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_asio_opener(open);
+    let loaded = devices.begin_add(DeviceKind::Asio, "fake:slow").unwrap().load();
+    let attached = devices.attach_add(&mut engine, loaded).unwrap();
+    // Between attach and commit the driver starts without the engine lock:
+    // loading it a second time now is exactly what must not happen.
+    let err = devices.begin_add(DeviceKind::Asio, "fake:slow").err().expect("refused while it starts");
+    assert!(err.contains("being opened"), "{err}");
+    let started = attached.start();
+    devices.commit_add(&mut engine, started).unwrap();
+    let err = devices.begin_add(DeviceKind::Asio, "fake:slow").err().expect("refused once open");
+    assert!(err.contains("already open"), "{err}");
+    assert_eq!(devices.bindings().len(), 1);
+}
+
+#[test]
+fn a_device_that_fails_to_start_leaves_nothing_behind() {
+    let _budget = driver_budget();
+    let open = starting_opener(Duration::ZERO, Arc::new(AtomicBool::new(true)));
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_asio_opener(open);
+    let loaded = devices.begin_add(DeviceKind::Asio, "fake:broken").unwrap().load();
+    let attached = devices.attach_add(&mut engine, loaded).unwrap();
+    // A client routes the new channels while the driver starts.
+    let slots = engine.slots();
+    let inp = slots.iter().find(|s| s.name == "fake:broken in").unwrap().first_input;
+    let out = slots.iter().find(|s| s.name == "fake:broken out").unwrap().first_output;
+    route(&mut engine, inp, out);
+    let started = attached.start();
+    assert!(devices.commit_add(&mut engine, started).is_err());
+    assert!(engine.slots().is_empty(), "{:?}", engine.slots());
+    assert_eq!(points(&mut engine), vec![], "no routes left on channels that are free again");
+    assert!(devices.bindings().is_empty());
+    assert!(devices.begin_add(DeviceKind::Asio, "fake:broken").is_ok(), "not stuck as 'being opened'");
+}
+
+#[test]
+fn an_offline_device_that_fails_to_start_keeps_its_channels_and_routes() {
+    let _budget = driver_budget();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("devices.json");
+    let broken = Arc::new(AtomicBool::new(false));
+    {
+        let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let mut devices =
+            DeviceManager::open_file(path.clone()).0.with_asio_opener(starting_opener(Duration::ZERO, broken.clone()));
+        devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap();
+        devices.add(&mut engine, DeviceKind::Asio, "fake:b").unwrap();
+    }
+    broken.store(true, Ordering::Release);
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices =
+        DeviceManager::open_file(path.clone()).0.with_asio_opener(starting_opener(Duration::ZERO, broken.clone()));
+    assert_eq!(devices.restore(&mut engine).len(), 2, "both fail to start: both offline");
+    route(&mut engine, 0, 2); // fake:a input 1 -> fake:b output 1
+    route(&mut engine, 2, 1); // fake:b input 1 -> fake:a output 2
+                              // Loads, but fails to start: it stays offline on its channels, routes and all.
+    assert!(devices.add(&mut engine, DeviceKind::Asio, "fake:a").is_err());
+    let a = engine.slots().into_iter().find(|s| s.name.contains("fake:a")).unwrap();
+    assert!(!a.online);
+    assert_eq!((a.first_input, a.first_output), (0, 0));
+    assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)], "a failed start keeps the routes");
+    assert_eq!(devices.bindings().len(), 2, "and the binding");
+    broken.store(false, Ordering::Release);
+    devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap();
+    assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)]);
 }
