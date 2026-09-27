@@ -4,11 +4,13 @@
 use std::f64::consts::{PI, SQRT_2};
 
 /// Default rate-estimator loop bandwidth. Estimate noise scales with bandwidth:
-/// at 0.05 Hz, ±0.2 ms timestamp jitter gives under ±2 ppm error.
-pub const DEFAULT_RATE_BANDWIDTH_HZ: f64 = 0.05;
+/// real devices call back with a millisecond or two of jitter, which at
+/// 0.05 Hz swung the estimate by ±16 ppm (±1 ms) and at 0.01 Hz by about ±1.
+/// Real clock drift changes over minutes, so the slower loop loses nothing.
+pub const DEFAULT_RATE_BANDWIDTH_HZ: f64 = 0.01;
 /// Initial acquisition bandwidth of the rate estimator.
 const ACQUIRE_BANDWIDTH_HZ: f64 = 2.0;
-/// Stream time per halving of the acquisition bandwidth (2 Hz → 0.05 Hz in ~11 s).
+/// Stream time per halving of the acquisition bandwidth (2 Hz → 0.01 Hz in ~15 s).
 const GEAR_STEP_S: f64 = 2.0;
 /// Timestamp errors beyond this many update periods (and at least
 /// `GAP_MIN_S`) are treated as a discontinuity rather than jitter.
@@ -225,11 +227,36 @@ mod tests {
         }
         assert!((est.ppm() + 400.0).abs() < 20.0, "after 5 s: {} ppm", est.ppm());
         assert!(!est.is_settled());
-        while (frames as f64) < true_rate * 15.0 {
+        while (frames as f64) < true_rate * 17.0 {
             frames += 256;
             est.update(256, frames as f64 / true_rate);
         }
-        assert!(est.is_settled());
+        assert!(est.is_settled(), "settled by 17 s (2 Hz to 0.01 Hz, halving every 2 s)");
+    }
+
+    /// Real devices call back with a millisecond or two of timing jitter
+    /// (USB scheduling, system load). The fed-forward drift estimate must stay
+    /// steady through it: its noise moves every bridge's resampling ratio.
+    #[test]
+    fn the_rate_estimate_is_steady_under_callback_jitter() {
+        let mut est = RateEstimator::new(48_000.0, DEFAULT_RATE_BANDWIDTH_HZ);
+        let true_ppm = 20.0;
+        let period = 512.0 / (48_000.0 * (1.0 + true_ppm * 1e-6));
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for n in 1..(180.0 / period) as u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let jitter = ((seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) * 0.001; // ±1 ms
+            est.update(512, n as f64 * period + jitter);
+            if n as f64 * period > 90.0 {
+                lo = lo.min(est.ppm());
+                hi = hi.max(est.ppm());
+            }
+        }
+        assert!(hi - lo < 5.0, "estimate wanders {:.1} ppm (from {lo:+.1} to {hi:+.1})", hi - lo);
+        assert!((lo - true_ppm).abs() < 3.0 && (hi - true_ppm).abs() < 3.0, "[{lo:+.1}, {hi:+.1}] vs {true_ppm}");
     }
 
     #[test]

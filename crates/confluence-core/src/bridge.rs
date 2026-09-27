@@ -482,7 +482,7 @@ impl OutputEngineSide {
             t.xrun();
         }
         let ring = ((self.ring_slots - self.samples.slots()) / ch) as f64;
-        let fill = ring - t.frames_since_stamp(now);
+        let mut fill = ring - t.frames_since_stamp(now);
         if t.last_stamp.is_none() {
             // The device has not consumed anything yet (driver start-up): fill
             // the ring to the target at the nominal ratio and drop the rest.
@@ -502,6 +502,18 @@ impl OutputEngineSide {
                     return;
                 }
                 t.running = true;
+                // Start with zero error (spec §6.3): the device primed to the
+                // target and then took a block, so top the ring back up to the
+                // target with silence rather than make the loop pull a block's
+                // worth of fill back at a saturated correction.
+                let deficit = (t.target() - fill).floor();
+                if deficit >= 1.0 {
+                    let n = (deficit as usize).min(self.samples.slots() / ch);
+                    if let Ok(chunk) = self.samples.write_chunk_uninit(n * ch) {
+                        chunk.fill_from_iter(std::iter::repeat_n(0.0, n * ch));
+                        fill += n as f64;
+                    }
+                }
             }
             let corr = t.correction(fill);
             let rel = (1.0 + t.device_est.ppm() * 1e-6) / (1.0 + master_ppm * 1e-6) * (1.0 - corr * 1e-6);

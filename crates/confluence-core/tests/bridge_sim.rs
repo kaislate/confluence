@@ -401,3 +401,41 @@ fn output_starting_far_from_target_converges_without_a_limit_cycle() {
     assert!(worst_corr < 100.0, "correction still swinging after 40 s: {worst_corr:.0} ppm ({h:?})");
     assert!(worst_err < 256.0, "fill still swinging after 40 s: {worst_err:.0} frames ({h:?})");
 }
+
+/// A playback device that starts a little after the engine (as drivers do)
+/// must start near its target: the loop may not begin a block short and spend
+/// seconds at a saturated correction pulling it back (spec §6.3: priming
+/// starts the loop with zero error).
+#[test]
+fn output_starts_at_its_target_without_a_saturated_correction() {
+    let cfg = config(48_000.0, 512, 512);
+    let (mut eng, mut dev, stats) = soft_output(cfg).unwrap();
+    let dev_rate = 48_000.0 * (1.0 + 40e-6);
+    let (late, block) = (0.5, PlanarBuffer::new(2, 512));
+    let mut buf = vec![0.0f32; 1024];
+    let (mut dev_frames, mut master_blocks) = (0u64, 0u64);
+    let (mut worst_corr, mut worst_err) = (0.0f64, 0.0f64);
+    loop {
+        let t_dev = late + (dev_frames + 512) as f64 / dev_rate;
+        let t_master = (master_blocks + 1) as f64 * 512.0 / MASTER_RATE;
+        if t_master > 20.0 {
+            break;
+        }
+        if t_master <= t_dev {
+            eng.write(&block, 0, t_master, 0.0);
+            master_blocks += 1;
+        } else {
+            dev.read_interleaved(&mut buf, t_dev);
+            dev_frames += 512;
+            if dev_frames > 4 * 512 {
+                let h = stats.snapshot();
+                worst_corr = worst_corr.max(h.correction_ppm.abs());
+                worst_err = worst_err.max((h.fill_frames - h.target_frames).abs());
+            }
+        }
+    }
+    let h = stats.snapshot();
+    assert_eq!(h.underruns + h.overruns, 0, "{h:?}");
+    assert!(worst_err < 256.0, "starts {worst_err:.0} frames away from its target ({h:?})");
+    assert!(worst_corr < 500.0, "needed a {worst_corr:.0} ppm correction to recover from its start ({h:?})");
+}
