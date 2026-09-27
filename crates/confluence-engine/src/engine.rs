@@ -487,6 +487,7 @@ impl Engine {
             Command::Health => Response::Health {
                 blocks: self.blocks(),
                 slots: self.slots.iter().filter_map(|s| self.health(s)).collect(),
+                notices: Vec::new(),
             },
             Command::RemoveSlot { id } => match self.remove_slot(id) {
                 Ok(()) => Response::Ok,

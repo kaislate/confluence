@@ -112,8 +112,9 @@ fn render(resp: &Response) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        Response::Health { blocks, slots } => {
+        Response::Health { blocks, slots, notices } => {
             let mut lines = vec![format!("engine blocks: {blocks}")];
+            lines.extend(notices.iter().map(|n| format!("note: {n}")));
             lines.extend(slots.iter().map(|h| {
                 let mut line = format!(
                     "#{:<3} xruns {}/{}  fill {:.0}/{:.0}  drift {:+.1} ppm  correction {:+.1} ppm",
@@ -240,6 +241,7 @@ mod tests {
         let text = render(&Response::Health {
             blocks: 9,
             slots: vec![h(1, false, 0, 0), h(2, true, 0, 0), h(3, false, 4, 2)],
+            notices: Vec::new(),
         });
         let lines: Vec<&str> = text.lines().collect();
         assert!(!lines[1].contains("DEVICE"), "{text}");
@@ -247,7 +249,8 @@ mod tests {
         assert!(lines[3].contains("4 faults") && lines[3].contains("2 driver requests"), "{text}");
         let mut waiting = h(4, false, 0, 0);
         waiting.attached = Some(false);
-        let text = render(&Response::Health { blocks: 9, slots: vec![waiting] });
+        let text = render(&Response::Health { blocks: 9, slots: vec![waiting], notices: vec!["x is odd".into()] });
         assert!(text.contains("no DAW attached"), "{text}");
+        assert!(text.contains("note: x is odd"), "{text}");
     }
 }

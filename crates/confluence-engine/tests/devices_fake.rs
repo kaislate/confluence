@@ -332,6 +332,12 @@ fn an_unreadable_bindings_file_is_never_overwritten() {
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("will not be saved"), "{warnings:?}");
     drop(lock);
+    // The engine keeps saying so, not just once at start-up.
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut resp = engine.handle(&Command::Health);
+    devices.annotate(&mut resp);
+    let Response::Health { notices, .. } = resp else { panic!() };
+    assert!(notices.iter().any(|n| n.contains("not being saved")), "{notices:?}");
     trigger_save(&mut devices);
     assert_eq!(std::fs::read(&path).unwrap(), original, "a file we could not read is left alone");
 }

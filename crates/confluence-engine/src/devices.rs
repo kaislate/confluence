@@ -473,7 +473,13 @@ impl DeviceManager {
     /// Adds each open device's own health (loss, faults, driver requests) to
     /// the engine's `Health` response for that device's slots.
     pub fn annotate(&self, resp: &mut Response) {
-        let Response::Health { slots, .. } = resp else { return };
+        let Response::Health { slots, notices, .. } = resp else { return };
+        if self.save_blocked {
+            notices.push(match &self.path {
+                Some(p) => format!("device changes are not being saved: {} could not be read at start-up", p.display()),
+                None => "device changes are not being saved".into(),
+            });
+        }
         if let Some((id, hl)) = &self.master_health {
             for h in slots.iter_mut().filter(|h| h.id == *id) {
                 h.device_faults = hl.faults.load(Ordering::Relaxed);
