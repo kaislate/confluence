@@ -162,7 +162,9 @@ impl VasioSlot {
             for ch in 0..self.daw_outputs {
                 inputs.channel_mut(first_channel + ch)[..block].fill(0.0);
             }
-            if connected {
+            // One per quiet streak: a DAW that vanishes is one glitch, not one
+            // per block until it counts as gone.
+            if connected && self.quiet_blocks <= 1 {
                 self.stats.underruns.fetch_add(1, Ordering::Relaxed);
             }
         }

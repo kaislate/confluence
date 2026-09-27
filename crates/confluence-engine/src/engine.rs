@@ -119,6 +119,11 @@ pub struct OfflineSlotSpec {
 pub trait StrictStats: Send + Sync {
     /// (blocks the device delivered late, blocks it did not take).
     fn xruns(&self) -> (u64, u64);
+
+    /// Whether the program this slot serves (e.g. a DAW) is attached, if that applies.
+    fn attached(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// Parameters of a strict slot (a device on the engine's own clock).
@@ -510,6 +515,7 @@ impl Engine {
                     device_lost: false,
                     device_faults: 0,
                     driver_requests: 0,
+                    attached: None,
                 })
             }
             SlotStats::Master => Some(SlotHealth {
@@ -523,9 +529,11 @@ impl Engine {
                 device_lost: false,
                 device_faults: 0,
                 driver_requests: 0,
+                attached: None,
             }),
             SlotStats::Strict(stats) => {
                 let (underruns, overruns) = stats.xruns();
+                let attached = stats.attached();
                 Some(SlotHealth {
                     id,
                     underruns,
@@ -537,6 +545,7 @@ impl Engine {
                     device_lost: false,
                     device_faults: 0,
                     driver_requests: 0,
+                    attached,
                 })
             }
             SlotStats::None => None,

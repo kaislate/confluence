@@ -76,6 +76,15 @@ fn hardware_to_a_daw_and_back_through_vasio() {
     );
 
     let clock = InternalClock::start(audio, 48_000.0).unwrap();
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(10));
+        engine.tick();
+    }
+    let attached = |engine: &mut Engine| {
+        let Response::Health { slots, .. } = engine.handle(&Command::Health) else { panic!() };
+        slots.iter().find(|h| h.id == ids[0]).unwrap().attached
+    };
+    assert_eq!(attached(&mut engine), Some(false), "health says when no DAW is attached");
     let mut daw = daw(1);
     for _ in 0..300 {
         std::thread::sleep(Duration::from_millis(10));
@@ -87,6 +96,7 @@ fn hardware_to_a_daw_and_back_through_vasio() {
     let Response::Health { slots, .. } = engine.handle(&Command::Health) else { panic!() };
     let h = slots.iter().find(|h| h.id == ids[0]).unwrap();
     assert_eq!((h.underruns, h.overruns), (0, 0), "{h:?}");
+    assert_eq!(h.attached, Some(true));
 
     // Removing the slot releases the instance; the DAW keeps running on silence.
     assert_eq!(devices.handle(&mut engine, &Command::RemoveSlot { id: ids[0] }), Some(Response::Ok));

@@ -775,6 +775,10 @@ impl StrictStats for VasioStats {
     fn xruns(&self) -> (u64, u64) {
         (self.underruns.load(Ordering::Relaxed), self.overruns.load(Ordering::Relaxed))
     }
+
+    fn attached(&self) -> Option<bool> {
+        Some(self.connected.load(Ordering::Relaxed))
+    }
 }
 
 fn slot_stats(stats: Option<Arc<VasioStats>>) -> Arc<dyn StrictStats> {

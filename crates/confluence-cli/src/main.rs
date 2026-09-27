@@ -125,6 +125,9 @@ fn render(resp: &Response) -> String {
                 if h.device_faults > 0 {
                     line.push_str(&format!("  {} faults", h.device_faults));
                 }
+                if h.attached == Some(false) {
+                    line.push_str("  no DAW attached (a DAW open on another rate or block needs a reset)");
+                }
                 if h.driver_requests > 0 {
                     line.push_str(&format!("  {} driver requests (re-add the device)", h.driver_requests));
                 }
@@ -232,6 +235,7 @@ mod tests {
             device_lost,
             device_faults,
             driver_requests,
+            attached: None,
         };
         let text = render(&Response::Health {
             blocks: 9,
@@ -241,5 +245,9 @@ mod tests {
         assert!(!lines[1].contains("DEVICE"), "{text}");
         assert!(lines[2].contains("DEVICE LOST"), "{text}");
         assert!(lines[3].contains("4 faults") && lines[3].contains("2 driver requests"), "{text}");
+        let mut waiting = h(4, false, 0, 0);
+        waiting.attached = Some(false);
+        let text = render(&Response::Health { blocks: 9, slots: vec![waiting] });
+        assert!(text.contains("no DAW attached"), "{text}");
     }
 }
