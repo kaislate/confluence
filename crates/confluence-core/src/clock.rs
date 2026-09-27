@@ -161,18 +161,22 @@ impl FillController {
     /// `error_frames` = measured fill âˆ’ target fill; `dt` = seconds since last update.
     pub fn update(&mut self, error_frames: f64, dt: f64) -> f64 {
         let i_limit = self.limit_ppm / self.ki;
-        self.integral = (self.integral + error_frames * dt).clamp(-i_limit, i_limit);
-        let desired = (self.kp * error_frames + self.ki * self.integral).clamp(-self.limit_ppm, self.limit_ppm);
+        let integral = (self.integral + error_frames * dt).clamp(-i_limit, i_limit);
+        let desired = (self.kp * error_frames + self.ki * integral).clamp(-self.limit_ppm, self.limit_ppm);
         if self.slew_enabled {
             let max = self.slew_ppm_per_s * dt;
-            let limited = self.output + (desired - self.output).clamp(-max, max);
-            if limited != desired {
-                // Back-calculation anti-windup: make the integral consistent
-                // with the output actually applied.
-                self.integral = ((limited - self.kp * error_frames) / self.ki).clamp(-i_limit, i_limit);
+            let step = desired - self.output;
+            // Conditional integration: while the slew limit holds the output
+            // back in the direction the error pushes, the integral waits
+            // rather than wind up. It is never rewritten to match the limited
+            // output: with a noisy fill that discarded its progress on almost
+            // every block, and a locked loop stopped correcting its error.
+            if step.abs() <= max || step.signum() != error_frames.signum() {
+                self.integral = integral;
             }
-            self.output = limited;
+            self.output += step.clamp(-max, max);
         } else {
+            self.integral = integral;
             self.output = desired;
         }
         self.output

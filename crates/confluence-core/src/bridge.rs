@@ -37,6 +37,8 @@ const QUIET_WINDOWS_TO_SHRINK: u32 = 3;
 /// Upper bound on adaptive target growth, in device blocks above the base target.
 const MAX_EXTRA_BLOCKS: f64 = 8.0;
 const STAMP_QUEUE: usize = 256;
+/// An input's loop starts only after its device has delivered for this long.
+const INPUT_WARMUP_S: f64 = 0.5;
 /// Rate at which latency left over from a stream's start drains away, in
 /// frames per second (at 48 kHz, 2 frames/s needs a steady ~40 ppm correction).
 const START_EXCESS_DRAIN_PER_S: f64 = 2.0;
@@ -155,6 +157,8 @@ struct Tracker {
     quiet_windows: u32,
     /// Time of the newest device timestamp, if any.
     last_stamp: Option<f64>,
+    /// Time of the first device timestamp, if any.
+    first_stamp: Option<f64>,
     /// Low-pass filtered fill; `None` until the first measurement after (re)start.
     fill_filtered: Option<f64>,
     /// Slow average of the correction, for judging whether the loop is steady.
@@ -179,6 +183,7 @@ impl Tracker {
             window_time: 0.0,
             quiet_windows: 0,
             last_stamp: None,
+            first_stamp: None,
             fill_filtered: None,
             corr_average: None,
             stats,
@@ -195,6 +200,7 @@ impl Tracker {
 
     fn drain_stamps(&mut self) {
         while let Ok((frames, time)) = self.stamps.pop() {
+            self.first_stamp.get_or_insert(time);
             self.device_est.update(frames, time);
             self.last_stamp = Some(time);
         }
@@ -278,7 +284,7 @@ impl Tracker {
             self.quiet_windows += 1;
             if self.quiet_windows >= QUIET_WINDOWS_TO_SHRINK {
                 self.quiet_windows = 0;
-                self.target = (self.target - block / 8.0).max(self.cfg.base_target());
+                self.move_target((self.target - block / 8.0).max(self.cfg.base_target()));
             }
         } else {
             self.quiet_windows = 0;
@@ -287,7 +293,18 @@ impl Tracker {
 
     fn grow(&mut self, frames: f64) {
         let max = self.cfg.base_target() + MAX_EXTRA_BLOCKS * self.cfg.device_block as f64;
-        self.target = (self.target + frames).min(max);
+        self.move_target((self.target + frames).min(max));
+    }
+
+    /// A new target is a deliberate step, not drift to track: the slew limit
+    /// would make the loop crawl there and overshoot, so it is released, and
+    /// the loop must settle again before it locks.
+    fn move_target(&mut self, target: f64) {
+        if target != self.target {
+            self.target = target;
+            self.ctl.unlock();
+            self.run_time = 0.0;
+        }
     }
 
     /// Records an xrun: stop, raise the target by one device block, restart the controller.
@@ -374,17 +391,24 @@ impl InputEngineSide {
         t.drain_stamps();
         let mut avail = self.samples.slots() / ch;
         if !t.running {
+            // Keep the ring at the target, dropping the oldest audio (the
+            // output is silent until the loop runs), so the loop starts
+            // without error and the ring never overflows while waiting.
             let excess = avail as f64 + t.frames_since_stamp(now) - t.target();
-            if excess < 0.0 {
+            if excess > 0.0 {
+                let drop = (excess as usize).min(avail);
+                if let Ok(chunk) = self.samples.read_chunk(drop * ch) {
+                    chunk.commit_all();
+                    avail -= drop;
+                }
+            }
+            // Some devices start irregularly (process loopback delivers its
+            // first packets in bursts with 20 ms gaps): start only once the
+            // device has been delivering for a while.
+            let warming = t.first_stamp.is_none_or(|first| now - first < INPUT_WARMUP_S);
+            if excess < 0.0 || warming {
                 silence(out, first_channel, ch);
                 return;
-            }
-            // Start exactly at the target: drop what accumulated while priming
-            // (the output was silent anyway), so the loop starts without error.
-            let drop = (excess as usize).min(avail);
-            if let Ok(chunk) = self.samples.read_chunk(drop * ch) {
-                chunk.commit_all();
-                avail -= drop;
             }
             t.running = true;
         }
