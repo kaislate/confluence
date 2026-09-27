@@ -1,6 +1,7 @@
 //! Event-driven shared-mode streams: endpoint render/capture and per-app
 //! capture (process loopback). Samples are 32-bit float, interleaved.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
@@ -70,6 +71,24 @@ pub struct StreamHealth {
     pub frames: AtomicU64,
     /// Set when the device disappeared (unplugged, disabled, format change).
     pub lost: AtomicBool,
+    /// Callbacks whose handler panicked (a render buffer is then silent).
+    pub faults: AtomicU64,
+}
+
+/// Runs a render handler; a panic plays silence and counts a fault instead of
+/// ending the stream thread with the WASAPI buffer still held.
+fn render_guarded(handler: &mut RenderFn, buf: &mut [f32], now: f64, health: &StreamHealth) {
+    if catch_unwind(AssertUnwindSafe(|| handler(buf, now))).is_err() {
+        buf.fill(0.0);
+        health.faults.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Runs a capture handler; a panic counts a fault.
+fn capture_guarded(handler: &mut CaptureFn, buf: &[f32], now: f64, health: &StreamHealth) {
+    if catch_unwind(AssertUnwindSafe(|| handler(buf, now))).is_err() {
+        health.faults.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A WASAPI stream on its own thread. Dropping it stops the stream.
@@ -177,9 +196,25 @@ fn float_format(channels: u16, rate: u32, mask: u32) -> WAVEFORMATEXTENSIBLE {
     }
 }
 
-/// Completion handler for process-loopback activation. Must be agile.
+/// An event handle closed when the last owner drops it.
+struct OwnedEvent(HANDLE);
+
+// SAFETY: kernel event handles may be signalled and waited on from any thread.
+unsafe impl Send for OwnedEvent {}
+unsafe impl Sync for OwnedEvent {}
+
+impl Drop for OwnedEvent {
+    fn drop(&mut self) {
+        // SAFETY: created by us and closed exactly once, here.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Completion handler for process-loopback activation. Must be agile. It
+/// shares the event with the waiting thread, so a completion that arrives
+/// after the wait has timed out still signals a live handle.
 #[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
-struct Activated(Event);
+struct Activated(Arc<OwnedEvent>);
 
 impl IAgileObject_Impl for Activated_Impl {}
 
@@ -188,17 +223,20 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
         &self,
         _op: windows::core::Ref<IActivateAudioInterfaceAsyncOperation>,
     ) -> windows::core::Result<()> {
-        // SAFETY: valid event owned by the activating thread, which waits on it.
+        // SAFETY: the event lives as long as this handler holds it.
         unsafe { SetEvent(self.0 .0) }
     }
 }
 
 /// Process-loopback activation (asynchronous by API design; we wait for it).
 ///
-/// Windows keeps using the activation `PROPVARIANT` after activation completes,
-/// even after the audio client is released (observed: freeing it — on the stack
-/// or boxed — corrupts the heap during or after teardown). It is therefore
-/// deliberately leaked: 24 bytes plus a 12-byte blob per app capture opened.
+/// The activation parameters (the `PROPVARIANT` and the blob it points to) are
+/// deliberately leaked, 36 bytes per app capture opened. Measured on Windows 11
+/// with the opt-in loopback tests: freeing them right after activation, or
+/// only after the stream thread and its COM apartment are gone, corrupts the
+/// heap (STATUS_HEAP_CORRUPTION, 5 runs out of 5 each), while leaking them is
+/// clean (5 of 5). Windows evidently keeps or frees that memory itself; which,
+/// is undocumented, so we never free or reuse it.
 fn activate_app(pid: u32) -> Result<IAudioClient, WasapiError> {
     let params: &'static mut AUDIOCLIENT_ACTIVATION_PARAMS = Box::leak(Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
@@ -220,9 +258,9 @@ fn activate_app(pid: u32) -> Result<IAudioClient, WasapiError> {
         };
     }
     // SAFETY: plain event creation, closed below.
-    let done = Event(unsafe { CreateEventW(None, false, false, None) }.call("CreateEventW")?);
-    let handler: IActivateAudioInterfaceCompletionHandler = Activated(done).into();
-    let result = (|| {
+    let done = Arc::new(OwnedEvent(unsafe { CreateEventW(None, false, false, None) }.call("CreateEventW")?));
+    let handler: IActivateAudioInterfaceCompletionHandler = Activated(done.clone()).into();
+    (|| {
         // SAFETY: all arguments stay valid for the duration of the call and beyond.
         let op = unsafe {
             ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&*pv), &handler)
@@ -238,10 +276,7 @@ fn activate_app(pid: u32) -> Result<IAudioClient, WasapiError> {
         unsafe { op.GetActivateResult(&mut hr, &mut unknown) }.call("GetActivateResult")?;
         hr.ok().call("process loopback activation")?;
         unknown.ok_or(WasapiError::Gone)?.cast::<IAudioClient>().call("IUnknown::cast<IAudioClient>")
-    })();
-    // SAFETY: created above; the handler signalled it once, before the wait returned.
-    let _ = unsafe { CloseHandle(done.0) };
-    result
+    })()
 }
 
 fn open_client(target: &Target) -> Result<(IAudioClient, StreamFormat), WasapiError> {
@@ -374,7 +409,7 @@ fn run_render(
             }
             let p = render.GetBuffer(avail).map_err(|e| e.code())?;
             let buf = std::slice::from_raw_parts_mut(p.cast::<f32>(), avail as usize * ch);
-            handler(buf, now_seconds());
+            render_guarded(&mut handler, buf, now_seconds(), health);
             render.ReleaseBuffer(avail, 0).map_err(|e| e.code())?;
             health.callbacks.fetch_add(1, Ordering::Relaxed);
             health.frames.fetch_add(avail as u64, Ordering::Relaxed);
@@ -415,9 +450,9 @@ fn run_capture(
                 // model needs to know when frames became available to it.
                 let now = now_seconds();
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
-                    handler(&silence[..n.min(silence.len())], now);
+                    capture_guarded(&mut handler, &silence[..n.min(silence.len())], now, health);
                 } else {
-                    handler(std::slice::from_raw_parts(data.cast::<f32>(), n), now);
+                    capture_guarded(&mut handler, std::slice::from_raw_parts(data.cast::<f32>(), n), now, health);
                 }
                 capture.ReleaseBuffer(frames).map_err(|e| e.code())?;
                 health.callbacks.fetch_add(1, Ordering::Relaxed);
@@ -441,5 +476,25 @@ mod tests {
         assert_eq!(avg, 384_000);
         assert_eq!(extra, 22);
         assert_eq!(sub, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+    }
+
+    #[test]
+    fn a_panicking_handler_is_contained_silenced_and_counted() {
+        let health = StreamHealth::default();
+        let mut render: RenderFn = Box::new(|buf: &mut [f32], _| {
+            buf.fill(0.9);
+            panic!("handler bug");
+        });
+        let mut buf = vec![0.5f32; 8];
+        render_guarded(&mut render, &mut buf, 0.0, &health);
+        assert!(buf.iter().all(|&s| s == 0.0), "a faulting render plays silence, not half a block");
+        let mut capture: CaptureFn = Box::new(|_: &[f32], _| panic!("handler bug"));
+        capture_guarded(&mut capture, &buf, 0.0, &health);
+        assert_eq!(health.faults.load(Ordering::Relaxed), 2);
+        // A healthy handler is untouched.
+        let mut ok: RenderFn = Box::new(|buf: &mut [f32], _| buf.fill(0.25));
+        render_guarded(&mut ok, &mut buf, 0.0, &health);
+        assert!(buf.iter().all(|&s| s == 0.25));
+        assert_eq!(health.faults.load(Ordering::Relaxed), 2);
     }
 }

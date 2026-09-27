@@ -11,7 +11,9 @@ use confluence_core::asrc::AsrcQuality;
 use confluence_core::bridge::{InputDeviceSide, OutputDeviceSide};
 use confluence_provider_asio::registry::installed_drivers;
 use confluence_provider_asio::{AsioDevice, AsioHostError, AsioIo, StreamConfig, StreamInfo};
-use confluence_provider_wasapi::{endpoints, find_endpoint, find_process, Direction, Handler, Target, WasapiStream};
+use confluence_provider_wasapi::{
+    endpoints, find_endpoint, find_process, Direction, Endpoint, Handler, Target, WasapiStream,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::audio::AudioEngine;
@@ -33,6 +35,10 @@ pub struct Binding {
     pub inputs: u32,
     pub first_output: u32,
     pub outputs: u32,
+    /// A WASAPI endpoint's id: unlike its name, unique even for two identical
+    /// USB devices. Tried first when the binding is restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
 }
 
 impl Binding {
@@ -71,14 +77,23 @@ pub type AsioOpener = Box<dyn Fn(&str) -> Result<AsioDevice, AsioHostError> + Se
 /// A device loaded but not yet attached to the engine.
 enum Loaded {
     Asio(AsioDevice),
-    Wasapi(WasapiStream),
+    /// The stream, and the endpoint id (None for per-app capture).
+    Wasapi(WasapiStream, Option<String>),
     /// Nothing slow to do: the engine side is created when attached.
     Vasio,
 }
 
+/// Finds a WASAPI endpoint by its saved id, else by name.
+fn find_saved_endpoint(direction: Direction, name: &str, id: Option<&str>) -> Result<Endpoint, String> {
+    if let Some(ep) = id.and_then(|id| find_endpoint(direction, id).ok()) {
+        return Ok(ep);
+    }
+    find_endpoint(direction, name).map_err(|e| e.to_string())
+}
+
 /// Loads a device: the slow part of adding one (driver `init`, endpoint or
 /// process lookup, stream set-up). Needs neither the engine nor the manager.
-fn load(opener: &AsioOpener, kind: DeviceKind, name: &str) -> Result<Loaded, String> {
+fn load(opener: &AsioOpener, kind: DeviceKind, name: &str, endpoint_id: Option<&str>) -> Result<Loaded, String> {
     Ok(match kind {
         DeviceKind::Asio => Loaded::Asio(opener(name).map_err(|e| e.to_string())?),
         DeviceKind::Vasio => {
@@ -88,16 +103,20 @@ fn load(opener: &AsioOpener, kind: DeviceKind, name: &str) -> Result<Loaded, Str
         DeviceKind::WasapiRender | DeviceKind::WasapiCapture | DeviceKind::AppCapture => {
             let target = match kind {
                 DeviceKind::WasapiRender => {
-                    let ep = find_endpoint(Direction::Render, name).map_err(|e| e.to_string())?;
+                    let ep = find_saved_endpoint(Direction::Render, name, endpoint_id)?;
                     Target::Endpoint { id: ep.id, direction: Direction::Render }
                 }
                 DeviceKind::WasapiCapture => {
-                    let ep = find_endpoint(Direction::Capture, name).map_err(|e| e.to_string())?;
+                    let ep = find_saved_endpoint(Direction::Capture, name, endpoint_id)?;
                     Target::Endpoint { id: ep.id, direction: Direction::Capture }
                 }
                 _ => Target::App { pid: find_process(name).map_err(|e| e.to_string())? },
             };
-            Loaded::Wasapi(WasapiStream::open(target).map_err(|e| e.to_string())?)
+            let id = match &target {
+                Target::Endpoint { id, .. } => Some(id.clone()),
+                Target::App { .. } => None,
+            };
+            Loaded::Wasapi(WasapiStream::open(target).map_err(|e| e.to_string())?, id)
         }
     })
 }
@@ -113,7 +132,7 @@ pub struct PendingAdd {
 
 impl PendingAdd {
     pub fn load(self) -> LoadedAdd {
-        let loaded = load(&self.opener, self.kind, &self.name);
+        let loaded = load(&self.opener, self.kind, &self.name, None);
         LoadedAdd { kind: self.kind, name: self.name, loaded }
     }
 }
@@ -229,6 +248,7 @@ impl DeviceManager {
             inputs: ch.inputs as u32,
             first_output: ch.first_output as u32,
             outputs: ch.outputs as u32,
+            endpoint_id: None,
         });
         self.save()
     }
@@ -372,7 +392,7 @@ impl DeviceManager {
                 warnings.push(format!("{} is now the master clock device; its device binding was dropped", b.device()));
                 continue;
             }
-            let opened = load(&self.asio_open, b.kind, &b.name)
+            let opened = load(&self.asio_open, b.kind, &b.name, b.endpoint_id.as_deref())
                 .and_then(|loaded| self.attach(engine, b.kind, &b.name, Some(&b), loaded));
             match opened {
                 Ok(bound) => self.bound.push(bound),
@@ -516,10 +536,9 @@ impl DeviceManager {
         match loaded {
             Loaded::Asio(dev) => self.open_asio(engine, name, device, at, dev),
             Loaded::Vasio => self.open_vasio(engine, name, device, at),
-            Loaded::Wasapi(mut stream) => {
+            Loaded::Wasapi(mut stream, endpoint_id) => {
                 let f = stream.format();
-                let mut binding =
-                    Binding { kind, name: name.to_string(), first_input: 0, inputs: 0, first_output: 0, outputs: 0 };
+                let mut binding = Binding { endpoint_id, ..binding_of(kind, name) };
                 let (id, handler) = if f.direction == Direction::Render {
                     let spec = self.soft_spec(
                         name.to_string(),
@@ -603,6 +622,7 @@ impl DeviceManager {
             inputs: daw_outputs as u32,
             first_output: ch.first_output as u32,
             outputs: daw_inputs as u32,
+            endpoint_id: None,
         };
         let handles = stats.map(Handle::Vasio).into_iter().collect();
         Ok(Bound { binding, slots: vec![id], handles })
@@ -682,6 +702,7 @@ impl DeviceManager {
             inputs: ins as u32,
             first_output: 0,
             outputs: outs as u32,
+            endpoint_id: None,
         };
         for s in engine.slots().into_iter().filter(|s| slots.contains(&s.id)) {
             if s.inputs > 0 {
@@ -762,7 +783,7 @@ fn slot_stats(stats: Option<Arc<VasioStats>>) -> Arc<dyn StrictStats> {
 
 /// A binding with only its identity filled in (for comparisons).
 fn binding_of(kind: DeviceKind, name: &str) -> Binding {
-    Binding { kind, name: name.to_string(), first_input: 0, inputs: 0, first_output: 0, outputs: 0 }
+    Binding { kind, name: name.to_string(), first_input: 0, inputs: 0, first_output: 0, outputs: 0, endpoint_id: None }
 }
 
 /// Whether `binding` is the device `kind`/`name` (VASIO: the same instance,
@@ -798,6 +819,20 @@ pub fn parse_vasio(name: &str) -> Result<(u32, usize, usize), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wasapi_bindings_remember_the_endpoint_id_and_old_files_still_load() {
+        let old = r#"{"kind":"WasapiRender","name":"Speakers (USB Audio Device)","first_input":0,"inputs":0,
+            "first_output":4,"outputs":2}"#;
+        let b: Binding = serde_json::from_str(old).unwrap();
+        assert_eq!(b.endpoint_id, None, "files written before endpoint ids still load");
+        let with_id = Binding { endpoint_id: Some("{0.0.0.00000000}.{abc}".into()), ..b };
+        let text = serde_json::to_string(&with_id).unwrap();
+        assert!(text.contains("endpoint_id"));
+        assert_eq!(serde_json::from_str::<Binding>(&text).unwrap(), with_id);
+        let asio = binding_of(DeviceKind::Asio, "x");
+        assert!(!serde_json::to_string(&asio).unwrap().contains("endpoint_id"), "only written when known");
+    }
 
     #[test]
     fn vasio_names_parse() {
