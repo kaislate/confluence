@@ -127,9 +127,16 @@ fn without_the_engine_the_daw_keeps_running_on_silence() {
     // The shape the engine last served, saved under this test's private root
     // (never the machine's real settings).
     let saved = InstanceConfig { daw_inputs: 4, daw_outputs: 3, sample_rate: 48_000, block: 192 };
+    // Removes the saved shape even if anything below fails.
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            config::delete_root(&config::root());
+        }
+    }
+    let _cleanup = Cleanup;
     config::save(5, &saved).unwrap();
     let mut dev = open(5);
-    config::delete_root(&config::root());
     assert_eq!(dev.info().name, "Confluence VASIO 5");
     assert_eq!((dev.info().inputs(), dev.info().outputs(), dev.info().preferred_block), (4, 3, 192));
     let seen = Arc::new(Seen::default());

@@ -499,7 +499,11 @@ impl DeviceManager {
                             + hl.resync_requests.load(Ordering::Relaxed)
                             + hl.rate_changes.load(Ordering::Relaxed);
                     }
-                    Handle::Wasapi(stream) => lost |= stream.health().lost.load(Ordering::Relaxed),
+                    Handle::Wasapi(stream) => {
+                        let hl = stream.health();
+                        lost |= hl.lost.load(Ordering::Relaxed);
+                        faults += hl.faults.load(Ordering::Relaxed);
+                    }
                     Handle::Vasio(_) => {}
                 }
             }
@@ -536,7 +540,7 @@ impl DeviceManager {
             f.sync_all()
         };
         write().map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+        replace_durably(&tmp, path).map_err(|e| e.to_string())
     }
 
     fn soft_spec(
@@ -819,6 +823,21 @@ impl StrictStats for VasioStats {
 
 fn slot_stats(stats: Option<Arc<VasioStats>>) -> Arc<dyn StrictStats> {
     stats.unwrap_or_default()
+}
+
+/// Moves `from` over `to`, and returns only once the move itself is on disk.
+fn replace_durably(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    // SAFETY: two valid, NUL-terminated wide paths.
+    unsafe {
+        MoveFileExW(
+            &HSTRING::from(from.as_os_str()),
+            &HSTRING::from(to.as_os_str()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
 /// A binding with only its identity filled in (for comparisons).
