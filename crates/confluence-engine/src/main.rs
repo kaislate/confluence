@@ -67,7 +67,7 @@ mod app {
     /// Whatever drives the engine; dropping it stops the audio.
     enum Master {
         Internal(InternalClock),
-        Asio(AsioDevice),
+        Asio(Box<AsioDevice>),
     }
 
     fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -133,13 +133,14 @@ mod app {
                 if placement.is_none() {
                     warnings.extend(devices.restore(&mut engine));
                 }
-                let (_, _, ch) = start_asio_master(&mut dev, &mut engine, audio, &name, placement)?;
+                let (master_id, _, ch) = start_asio_master(&mut dev, &mut engine, audio, &name, placement)?;
+                devices.watch_master(master_id, dev.health());
                 if placement.is_some() {
                     warnings.extend(devices.restore(&mut engine));
                 }
                 devices.set_master(&name, ch)?;
                 eprintln!("confluence-engine: master asio:{name} at {rate} Hz, {block} frames");
-                Master::Asio(dev)
+                Master::Asio(Box::new(dev))
             }
             None => {
                 warnings.extend(devices.restore(&mut engine));
@@ -157,6 +158,31 @@ mod app {
                 if *cmd == Command::Shutdown {
                     shutdown.store(true, Ordering::SeqCst);
                     return Response::Ok;
+                }
+                // Device enumeration and driver initialisation can be slow (a bad
+                // driver can take seconds): do them without the lock, so the
+                // engine keeps ticking and other clients keep being answered.
+                match cmd {
+                    Command::ListDevices => {
+                        return match DeviceManager::list_devices() {
+                            Ok(d) => Response::Devices(d),
+                            Err(e) => Response::Error(e),
+                        };
+                    }
+                    Command::AddDevice { kind, name } => {
+                        let pending = match lock(&state).devices.begin_add(*kind, name) {
+                            Ok(p) => p,
+                            Err(e) => return Response::Error(e),
+                        };
+                        let loaded = pending.load();
+                        let mut s = lock(&state);
+                        let State { engine, devices, .. } = &mut *s;
+                        return match devices.finish_add(engine, loaded) {
+                            Ok(ids) => Response::SlotsAdded(ids),
+                            Err(e) => Response::Error(e),
+                        };
+                    }
+                    _ => {}
                 }
                 let mut s = lock(&state);
                 let State { engine, devices, journal } = &mut *s;

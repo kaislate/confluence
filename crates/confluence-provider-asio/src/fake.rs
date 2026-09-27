@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+
 use crate::convert::{decode, encode, SampleFormat};
 use crate::sys::*;
 
@@ -30,6 +33,9 @@ pub struct FakeConfig {
     pub skip_every: Option<u64>,
     /// Send `kAsioResetRequest` after this many callbacks.
     pub reset_after: Option<u64>,
+    /// Like some real drivers, set a thread timer during `init`: it only fires
+    /// if the host pumps window messages on the driver's thread.
+    pub posts_timer: bool,
     pub probe: Arc<FakeProbe>,
 }
 
@@ -48,6 +54,7 @@ impl FakeConfig {
             fail_init: false,
             skip_every: None,
             reset_after: None,
+            posts_timer: false,
             probe: Arc::new(FakeProbe::default()),
         }
     }
@@ -61,6 +68,21 @@ pub struct FakeProbe {
     /// Output channel 0 of the most recent block, decoded.
     pub last_output: Mutex<Vec<f32>>,
     pub released: AtomicBool,
+    /// Timer messages dispatched on the driver's thread (see `posts_timer`).
+    pub timer_ticks: AtomicU64,
+}
+
+thread_local! {
+    /// The probe of the fake whose timer fires on this thread.
+    static TIMER_PROBE: std::cell::RefCell<Option<Arc<FakeProbe>>> = const { std::cell::RefCell::new(None) };
+}
+
+unsafe extern "system" fn timer_tick(_: HWND, _: u32, _: usize, _: u32) {
+    TIMER_PROBE.with(|p| {
+        if let Some(p) = p.borrow().as_ref() {
+            p.timer_ticks.fetch_add(1, Ordering::Relaxed);
+        }
+    });
 }
 
 #[repr(C)]
@@ -68,13 +90,18 @@ struct Fake {
     base: IAsio,
     refs: AtomicU32,
     cfg: FakeConfig,
+    position: Arc<AtomicI64>,
+    run: Arc<AtomicBool>,
+    /// Changed by control calls; the callback thread never touches it.
+    state: Mutex<FakeState>,
+}
+
+struct FakeState {
     rate: f64,
     callbacks: Option<AsioCallbacks>,
     /// Inputs then outputs, two halves each.
     buffers: Vec<[Vec<u8>; 2]>,
     block: usize,
-    position: Arc<AtomicI64>,
-    run: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -85,20 +112,22 @@ pub(crate) fn create(cfg: FakeConfig) -> *mut IAsio {
         base: IAsio { vtbl: &FAKE_VTBL },
         refs: AtomicU32::new(1),
         cfg,
-        rate,
-        callbacks: None,
-        buffers: Vec::new(),
-        block: 0,
         position: Arc::new(AtomicI64::new(0)),
         run: Arc::new(AtomicBool::new(false)),
-        thread: None,
+        state: Mutex::new(FakeState { rate, callbacks: None, buffers: Vec::new(), block: 0, thread: None }),
     });
     Box::into_raw(fake).cast()
 }
 
-fn me<'a>(this: *mut IAsio) -> &'a mut Fake {
-    // SAFETY: only called through FAKE_VTBL, whose objects are `Fake`s.
-    unsafe { &mut *this.cast::<Fake>() }
+fn me<'a>(this: *mut IAsio) -> &'a Fake {
+    // SAFETY: only called through FAKE_VTBL, whose objects are `Fake`s. Shared
+    // access only: the host calls in from its control and callback threads.
+    unsafe { &*this.cast::<Fake>() }
+}
+
+fn state(this: *mut IAsio) -> std::sync::MutexGuard<'static, FakeState> {
+    let f: &'static Fake = me(this);
+    f.state.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn format(cfg: &FakeConfig) -> SampleFormat {
@@ -126,7 +155,13 @@ unsafe extern "system" fn release(this: *mut IAsio) -> u32 {
 }
 
 unsafe extern "system" fn init(this: *mut IAsio, _: *mut c_void) -> AsioBool {
-    (!me(this).cfg.fail_init) as AsioBool
+    let f = me(this);
+    if f.cfg.posts_timer {
+        TIMER_PROBE.with(|p| *p.borrow_mut() = Some(f.cfg.probe.clone()));
+        // SAFETY: a thread timer with a valid callback; it lives as long as this thread.
+        unsafe { SetTimer(None, 0, 20, Some(timer_tick)) };
+    }
+    (!f.cfg.fail_init) as AsioBool
 }
 
 unsafe extern "system" fn get_driver_name(this: *mut IAsio, name: *mut u8) {
@@ -151,17 +186,18 @@ unsafe extern "system" fn get_error_message(_: *mut IAsio, msg: *mut u8) {
 
 unsafe extern "system" fn start(this: *mut IAsio) -> AsioError {
     let f = me(this);
-    let Some(cb) = f.callbacks else { return ASE_INVALID_MODE };
+    let mut st = state(this);
+    let Some(cb) = st.callbacks else { return ASE_INVALID_MODE };
     let fmt = format(&f.cfg);
     let bps = fmt.bytes_per_sample();
-    let ptrs: Vec<[usize; 2]> = f.buffers.iter().map(|b| [b[0].as_ptr() as usize, b[1].as_ptr() as usize]).collect();
-    let (block, rate, cfg) = (f.block, f.rate, f.cfg.clone());
+    let ptrs: Vec<[usize; 2]> = st.buffers.iter().map(|b| [b[0].as_ptr() as usize, b[1].as_ptr() as usize]).collect();
+    let (block, rate, cfg) = (st.block, st.rate, f.cfg.clone());
     let (run, position) = (f.run.clone(), f.position.clone());
     run.store(true, Ordering::Release);
     let time_info = cfg.use_time_info
         && (cb.asio_message)(K_SELECTOR_SUPPORTED, K_SUPPORTS_TIME_INFO, std::ptr::null_mut(), std::ptr::null_mut())
             == 1;
-    f.thread = Some(std::thread::spawn(move || {
+    st.thread = Some(std::thread::spawn(move || {
         let period = Duration::from_secs_f64(block as f64 / rate);
         let mut next = Instant::now() + period;
         let (mut half, mut n) = (0usize, 0u64);
@@ -215,9 +251,9 @@ unsafe extern "system" fn start(this: *mut IAsio) -> AsioError {
 }
 
 unsafe extern "system" fn stop(this: *mut IAsio) -> AsioError {
-    let f = me(this);
-    f.run.store(false, Ordering::Release);
-    if let Some(t) = f.thread.take() {
+    me(this).run.store(false, Ordering::Release);
+    let thread = state(this).thread.take();
+    if let Some(t) = thread {
         let _ = t.join();
     }
     ASE_OK
@@ -270,12 +306,12 @@ unsafe extern "system" fn can_sample_rate(_: *mut IAsio, rate: f64) -> AsioError
 
 unsafe extern "system" fn get_sample_rate(this: *mut IAsio, rate: *mut f64) -> AsioError {
     // SAFETY: valid out-pointer.
-    unsafe { *rate = me(this).rate };
+    unsafe { *rate = state(this).rate };
     ASE_OK
 }
 
 unsafe extern "system" fn set_sample_rate(this: *mut IAsio, rate: f64) -> AsioError {
-    me(this).rate = rate;
+    state(this).rate = rate;
     ASE_OK
 }
 
@@ -326,23 +362,23 @@ unsafe extern "system" fn create_buffers(
     block: i32,
     callbacks: *const AsioCallbacks,
 ) -> AsioError {
-    let f = me(this);
-    let bytes = block as usize * format(&f.cfg).bytes_per_sample();
+    let bytes = block as usize * format(&me(this).cfg).bytes_per_sample();
     // SAFETY: the host passes `count` infos and a valid callbacks table.
     let (infos, cb) = unsafe { (std::slice::from_raw_parts_mut(infos, count as usize), *callbacks) };
-    f.callbacks = Some(cb);
-    f.block = block as usize;
-    f.buffers = infos.iter().map(|_| [vec![0u8; bytes], vec![0u8; bytes]]).collect();
-    for (bi, b) in infos.iter_mut().zip(f.buffers.iter_mut()) {
+    let mut st = state(this);
+    st.callbacks = Some(cb);
+    st.block = block as usize;
+    st.buffers = infos.iter().map(|_| [vec![0u8; bytes], vec![0u8; bytes]]).collect();
+    for (bi, b) in infos.iter_mut().zip(st.buffers.iter_mut()) {
         bi.buffers = [b[0].as_mut_ptr().cast(), b[1].as_mut_ptr().cast()];
     }
     ASE_OK
 }
 
 unsafe extern "system" fn dispose_buffers(this: *mut IAsio) -> AsioError {
-    let f = me(this);
-    f.buffers.clear();
-    f.callbacks = None;
+    let mut st = state(this);
+    st.buffers.clear();
+    st.callbacks = None;
     ASE_OK
 }
 

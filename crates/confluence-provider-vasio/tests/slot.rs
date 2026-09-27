@@ -22,7 +22,8 @@ struct Daw {
 impl Daw {
     fn connect(instance: u32, offset: f32) -> Daw {
         let client = Client::connect(&confluence_provider_vasio::stream_name(instance)).unwrap().unwrap();
-        let (mut reader, writer) = client.ends();
+        // SAFETY: the ends are stored with the client and dropped with it; taken once.
+        let (mut reader, writer) = unsafe { client.ends() };
         reader.skip_all();
         client.header().client_active.store(1, Ordering::Release);
         Daw { client, reader, writer, offset }
@@ -95,6 +96,8 @@ fn a_daw_that_stops_is_noticed_and_costs_only_silence() {
     assert_eq!(last, 0.0);
     let overruns = slot.stats().overruns.load(Ordering::Relaxed);
     assert!(overruns < 10, "a gone DAW is not an endless stream of overruns: {overruns}");
+    let underruns = slot.stats().underruns.load(Ordering::Relaxed);
+    assert!(underruns <= 1, "a DAW that vanishes is one glitch, not a burst: {underruns} underruns");
 }
 
 #[test]

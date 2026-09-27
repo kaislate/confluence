@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -28,6 +28,10 @@ static DRIVER: AtomicPtr<IAsio> = AtomicPtr::new(std::ptr::null_mut());
 static CALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// 0 = query the driver from bufferSwitch; 1 = also call stop() from inside it once.
 static MODE: AtomicU32 = AtomicU32::new(0);
+/// Largest |getSamplePosition timestamp - timeGetTime()| seen in a callback, in ms.
+static STAMP_ERROR_MS: AtomicI64 = AtomicI64::new(0);
+/// kAsioResetRequest messages received (this host does not support them).
+static RESETS: AtomicU64 = AtomicU64::new(0);
 
 fn vt(d: *mut IAsio) -> &'static IAsioVtbl {
     // SAFETY: a live driver object starts with its vtable pointer.
@@ -41,9 +45,17 @@ extern "C" fn buffer_switch(_half: i32, _direct: AsioBool) {
     let (mut pos, mut stamp) = (AsioSamples::default(), AsioTimeStamp::default());
     let (mut i, mut o) = (0, 0);
     // SAFETY: live driver; valid out-pointers.
-    unsafe {
-        (vt(d).get_sample_position)(d, &mut pos, &mut stamp);
+    let r = unsafe {
+        let r = (vt(d).get_sample_position)(d, &mut pos, &mut stamp);
         (vt(d).get_latencies)(d, &mut i, &mut o);
+        r
+    };
+    if r == ASE_OK {
+        // The SDK defines systemTime on the timeGetTime() basis, in nanoseconds.
+        // SAFETY: plain query.
+        let tgt = i64::from(unsafe { windows::Win32::Media::timeGetTime() });
+        let err = (stamp.value() / 1_000_000 - tgt).abs();
+        STAMP_ERROR_MS.fetch_max(err, Ordering::AcqRel);
     }
     if MODE.load(Ordering::Acquire) == 1 && CALLBACKS.load(Ordering::Acquire) == 20 {
         // Some hosts stop the driver from its own callback (e.g. on an error).
@@ -54,8 +66,11 @@ extern "C" fn buffer_switch(_half: i32, _direct: AsioBool) {
 
 extern "C" fn rate_changed(_: f64) {}
 
-extern "C" fn message(_selector: i32, _value: i32, _m: *mut c_void, _o: *mut f64) -> i32 {
-    0 // no time info: the driver calls plain bufferSwitch
+extern "C" fn message(selector: i32, _value: i32, _m: *mut c_void, _o: *mut f64) -> i32 {
+    if selector == K_RESET_REQUEST {
+        RESETS.fetch_add(1, Ordering::AcqRel);
+    }
+    0 // supports nothing: no time info (plain bufferSwitch), no reset requests
 }
 
 extern "C" fn switch_time_info(p: *mut AsioTime, half: i32, direct: AsioBool) -> *mut AsioTime {
@@ -124,10 +139,16 @@ fn a_host_that_calls_back_into_the_driver_never_hangs() {
     DRIVER.store(d, Ordering::Release);
     MODE.store(0, Ordering::Release);
     let _infos = prepare(d);
+    let (mut pos, mut stamp) = (AsioSamples::default(), AsioTimeStamp::default());
+    // SAFETY: live driver; valid out-pointers.
+    let r = unsafe { (vt(d).get_sample_position)(d, &mut pos, &mut stamp) };
+    assert_eq!(r, ASE_SP_NOT_ADVANCING, "no position while not running (SDK)");
     // SAFETY: live driver.
     assert_eq!(unsafe { (vt(d).start)(d) }, ASE_OK);
     std::thread::sleep(Duration::from_millis(300));
     assert!(CALLBACKS.load(Ordering::Acquire) > 10);
+    let err = STAMP_ERROR_MS.load(Ordering::Acquire);
+    assert!(err <= 20, "systemTime is on the timeGetTime() basis: off by {err} ms");
     let p = SendPtr(d);
     must_return("stop() while the callback queries the driver", move || {
         let p = p;
@@ -164,6 +185,30 @@ fn a_host_that_calls_back_into_the_driver_never_hangs() {
             (vt(p.0).release)(p.0);
         }
     });
+    // 3. The engine appears with another shape: a host that does not support
+    //    reset requests must not be sent one.
+    let d = create(8);
+    DRIVER.store(d, Ordering::Release);
+    MODE.store(0, Ordering::Release);
+    let _infos = prepare(d);
+    let block = {
+        let (mut min, mut max, mut pref, mut gran) = (0, 0, 0, 0);
+        // SAFETY: live driver.
+        unsafe { (vt(d).get_buffer_size)(d, &mut min, &mut max, &mut pref, &mut gran) };
+        pref as usize
+    };
+    // SAFETY: live driver.
+    assert_eq!(unsafe { (vt(d).start)(d) }, ASE_OK);
+    // The engine comes up with another shape: a host that supports resets would get one.
+    let _engine = confluence_provider_vasio::VasioSlot::open(8, 2, 2, 48_000.0, if block == 128 { 256 } else { 128 });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(RESETS.load(Ordering::Acquire), 0, "unsupported messages are not sent");
+    // SAFETY: live driver, last reference.
+    unsafe {
+        (vt(d).stop)(d);
+        (vt(d).dispose_buffers)(d);
+        (vt(d).release)(d);
+    }
 }
 
 #[test]

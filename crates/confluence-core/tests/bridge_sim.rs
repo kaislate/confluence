@@ -401,3 +401,56 @@ fn output_starting_far_from_target_converges_without_a_limit_cycle() {
     assert!(worst_corr < 100.0, "correction still swinging after 40 s: {worst_corr:.0} ppm ({h:?})");
     assert!(worst_err < 256.0, "fill still swinging after 40 s: {worst_err:.0} frames ({h:?})");
 }
+
+/// A playback device starts whenever its driver gets going, at any phase
+/// relative to the engine's blocks. Whatever the phase, the loop must start
+/// without a saturated correction (it once spent ~10 s at ±1000 ppm), and
+/// without splicing silence into the audio to get there.
+#[test]
+fn output_starts_cleanly_at_any_phase() {
+    for late in [0.0, 0.013, 0.2, 0.5, 1.37] {
+        let cfg = config(48_000.0, 512, 512);
+        let (mut eng, mut dev, stats) = soft_output(cfg).unwrap();
+        let dev_rate = 48_000.0 * (1.0 + 40e-6);
+        let mut block = PlanarBuffer::new(2, 512);
+        let mut buf = vec![0.0f32; 1024];
+        let (mut dev_frames, mut master_blocks) = (0u64, 0u64);
+        let (mut worst_corr, mut audible, mut zeros, mut longest_gap) = (0.0f64, false, 0usize, 0usize);
+        loop {
+            let t_dev = late + (dev_frames + 512) as f64 / dev_rate;
+            let t_master = (master_blocks + 1) as f64 * 512.0 / MASTER_RATE;
+            if t_master > late + 20.0 {
+                break;
+            }
+            if t_master <= t_dev {
+                let base = master_blocks * 512;
+                for n in 0..512 {
+                    // Offset so no sample is exactly zero.
+                    let s = (0.25 + 0.2 * (TAU * TONE_HZ * (base + n as u64) as f64 / MASTER_RATE).sin()) as f32;
+                    block.channel_mut(0)[n] = s;
+                    block.channel_mut(1)[n] = s;
+                }
+                eng.write(&block, 0, t_master, 0.0);
+                master_blocks += 1;
+            } else {
+                dev.read_interleaved(&mut buf, t_dev);
+                for n in 0..512 {
+                    let x = buf[2 * n];
+                    audible |= x != 0.0;
+                    if audible {
+                        zeros = if x == 0.0 { zeros + 1 } else { 0 };
+                        longest_gap = longest_gap.max(zeros);
+                    }
+                }
+                dev_frames += 512;
+                if dev_frames > 4 * 512 {
+                    worst_corr = worst_corr.max(stats.snapshot().correction_ppm.abs());
+                }
+            }
+        }
+        let h = stats.snapshot();
+        assert_eq!(h.underruns + h.overruns, 0, "start at +{late} s: {h:?}");
+        assert!(worst_corr < 300.0, "start at +{late} s needed a {worst_corr:.0} ppm correction ({h:?})");
+        assert!(longest_gap < 8, "start at +{late} s spliced {longest_gap} samples of silence into the audio");
+    }
+}

@@ -98,12 +98,21 @@ pub fn load_at(root: &str, instance: u32) -> Option<InstanceConfig> {
     ok.then_some(cfg)
 }
 
+/// Environment variable that redirects the registry root (tests use it so
+/// they never read or write the machine's real VASIO settings).
+pub const ROOT_VAR: &str = "CONFLUENCE_VASIO_CONFIG_ROOT";
+
+/// The registry root in use: [`ROOT`], unless [`ROOT_VAR`] redirects it.
+pub fn root() -> String {
+    std::env::var(ROOT_VAR).ok().filter(|r| !r.is_empty()).unwrap_or_else(|| ROOT.to_string())
+}
+
 pub fn save(instance: u32, cfg: &InstanceConfig) -> std::io::Result<()> {
-    save_at(ROOT, instance, cfg)
+    save_at(&root(), instance, cfg)
 }
 
 pub fn load(instance: u32) -> Option<InstanceConfig> {
-    load_at(ROOT, instance)
+    load_at(&root(), instance)
 }
 
 /// Removes everything under `root` (tests and uninstall).

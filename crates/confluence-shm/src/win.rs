@@ -161,6 +161,10 @@ impl Drop for Event {
 struct Stream {
     map: Mapping,
     event: Event,
+    /// The layout validated when the stream was created or connected. Ring
+    /// memory is always computed from this, never re-read from the header,
+    /// which another process could change afterwards.
+    layout: Layout,
 }
 
 impl Stream {
@@ -171,25 +175,25 @@ impl Stream {
     }
 
     fn memories(&self) -> (RingMemory, RingMemory) {
-        let h = self.header();
+        let (h, l) = (self.header(), self.layout);
         let base = self.map.ptr();
         let to_samples = Layout::samples_offset();
         let from_samples =
-            to_samples + (h.to_client_channels * h.capacity_frames) as usize * std::mem::size_of::<f32>();
+            to_samples + (l.to_client_channels * l.capacity_frames) as usize * std::mem::size_of::<f32>();
         (
             RingMemory {
                 counters: &h.to_client,
-                // SAFETY: inside the mapping (layout checked against its size).
+                // SAFETY: inside the mapping (the snapshot layout was checked against its size).
                 samples: unsafe { base.add(to_samples) }.cast(),
-                capacity: h.capacity_frames as u64,
-                channels: h.to_client_channels as usize,
+                capacity: l.capacity_frames as u64,
+                channels: l.to_client_channels as usize,
             },
             RingMemory {
                 counters: &h.from_client,
                 // SAFETY: as above.
                 samples: unsafe { base.add(from_samples) }.cast(),
-                capacity: h.capacity_frames as u64,
-                channels: h.from_client_channels as usize,
+                capacity: l.capacity_frames as u64,
+                channels: l.from_client_channels as usize,
             },
         )
     }
@@ -239,7 +243,7 @@ impl Server {
         dir.magic.store(DIRECTORY_MAGIC, Ordering::Relaxed);
         dir.generation.store(generation, Ordering::Release);
         dir.state.store(STATE_READY, Ordering::Release);
-        Ok(Server { directory, stream: Stream { map, event }, generation })
+        Ok(Server { directory, stream: Stream { map, event, layout }, generation })
     }
 
     pub fn header(&self) -> &Header {
@@ -250,8 +254,17 @@ impl Server {
         self.generation
     }
 
-    /// The server's ends: it writes to the client and reads from it. Call once.
-    pub fn ends(&self) -> (RingWriter, RingReader) {
+    /// The layout this stream was created with.
+    pub fn layout(&self) -> Layout {
+        self.stream.layout
+    }
+
+    /// The server's ends: it writes to the client and reads from it.
+    ///
+    /// # Safety
+    /// The ends point into this server's mapping: they must not be used after
+    /// the server is dropped, and each end may exist only once at a time.
+    pub unsafe fn ends(&self) -> (RingWriter, RingReader) {
         let (to, from) = self.stream.memories();
         // SAFETY: the rings live in `self`'s mapping; the caller keeps the
         // server alive while using them (enforced by `ServerEnds` in callers).
@@ -301,11 +314,13 @@ impl Client {
         if map.size < std::mem::size_of::<Header>() {
             return Err(ShmError::Malformed);
         }
-        let stream = Stream { map, event };
-        let h = stream.header();
-        if h.magic != MAGIC || h.version != VERSION || !h.layout().is_sane() || stream.map.size < h.layout().bytes() {
+        // SAFETY: the mapping is at least a header long (checked above).
+        let h = unsafe { &*map.ptr().cast::<Header>() };
+        let layout = h.layout();
+        if h.magic != MAGIC || h.version != VERSION || !layout.is_sane() || map.size < layout.bytes() {
             return Err(ShmError::Malformed);
         }
+        let stream = Stream { map, event, layout };
         Ok(Some(Client { directory, stream, generation }))
     }
 
@@ -325,8 +340,16 @@ impl Client {
         dir.state.load(Ordering::Acquire) == STATE_READY && dir.generation.load(Ordering::Acquire) == self.generation
     }
 
-    /// The client's ends: it reads from the server and writes to it. Call once.
-    pub fn ends(&self) -> (RingReader, RingWriter) {
+    /// The layout validated when this client connected.
+    pub fn layout(&self) -> Layout {
+        self.stream.layout
+    }
+
+    /// The client's ends: it reads from the server and writes to it.
+    ///
+    /// # Safety
+    /// As for [`Server::ends`]: not past the client's lifetime, one of each at a time.
+    pub unsafe fn ends(&self) -> (RingReader, RingWriter) {
         let (to, from) = self.stream.memories();
         // SAFETY: as for `Server::ends`.
         let ((_, reader), (writer, _)) = unsafe { (ring(to), ring(from)) };
@@ -363,8 +386,8 @@ mod tests {
         let server = Server::create(&name, layout()).unwrap();
         let client = Client::connect(&name).unwrap().expect("server is publishing");
         assert_eq!(client.header().layout(), layout());
-        let (mut to_client, mut from_client) = server.ends();
-        let (mut reader, mut writer) = client.ends();
+        // SAFETY: one of each end; server and client outlive them.
+        let ((mut to_client, mut from_client), (mut reader, mut writer)) = unsafe { (server.ends(), client.ends()) };
         assert!(to_client.write_frames(64, |ch, f| ch as f32 + f as f32 / 100.0));
         server.wake_client();
         assert!(client.wait(1000), "the wake-up event crosses to the client");
@@ -394,6 +417,25 @@ mod tests {
         assert_eq!(again.header().layout(), bigger, "a new generation may have a different size");
         // The old client's view stays valid (no crash) even though it is stale.
         assert_eq!(client.header().layout(), layout());
+    }
+
+    #[test]
+    fn a_header_changed_after_connecting_cannot_move_the_rings() {
+        let name = base("tamper");
+        let server = Server::create(&name, layout()).unwrap();
+        let client = Client::connect(&name).unwrap().unwrap();
+        // Another process in the session scribbles on the header after validation.
+        // SAFETY: test-only write to the mapping's plain (non-atomic) header field.
+        unsafe {
+            let h = server.header() as *const Header as *mut Header;
+            (*h).capacity_frames = 1 << 20;
+            (*h).to_client_channels = 1024;
+        }
+        assert_eq!(client.layout(), layout(), "the client keeps the layout it validated");
+        // SAFETY: one end per side; both outlive their use here.
+        let ((mut to_client, _), (mut reader, _)) = unsafe { (server.ends(), client.ends()) };
+        assert!(to_client.write_frames(64, |ch, f| ch as f32 + f as f32));
+        assert!(reader.read_frames(64, |ch, f, s| assert_eq!(s, ch as f32 + f as f32)));
     }
 
     #[test]

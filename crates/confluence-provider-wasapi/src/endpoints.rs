@@ -7,6 +7,7 @@ use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, EDataFlow, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
     DEVICE_STATE_ACTIVE,
 };
+use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 use windows::Win32::System::Variant::VT_LPWSTR;
 
@@ -67,10 +68,12 @@ pub(crate) fn describe(device: &IMMDevice, direction: Direction) -> Result<Endpo
         CoTaskMemFree(Some(id_ptr.0 as *const _));
 
         let store = device.OpenPropertyStore(STGM_READ).call("IMMDevice::OpenPropertyStore")?;
-        let value = store.GetValue(&PKEY_Device_FriendlyName).call("IPropertyStore::GetValue")?;
+        let mut value = store.GetValue(&PKEY_Device_FriendlyName).call("IPropertyStore::GetValue")?;
         let inner = &value.Anonymous.Anonymous;
         let name =
             if inner.vt == VT_LPWSTR { inner.Anonymous.pwszVal.to_string().unwrap_or_default() } else { id.clone() };
+        // The value owns a CoTaskMem string; PROPVARIANT has no destructor here.
+        let _ = PropVariantClear(&mut value);
 
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None).call("IMMDevice::Activate")?;
         let fmt = client.GetMixFormat().call("IAudioClient::GetMixFormat")?;

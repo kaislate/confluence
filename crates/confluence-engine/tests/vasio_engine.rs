@@ -50,6 +50,14 @@ fn route(engine: &mut Engine, input: u32, output: u32) {
 fn hardware_to_a_daw_and_back_through_vasio() {
     confluence_provider_vasio::isolate_for_tests();
     let root = format!("Software\\ConfluenceTest\\VASIO.engine.{}", std::process::id());
+    // Removes the scratch key even if an assertion below fails.
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            confluence_provider_vasio::config::delete_root(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
     let probe = Arc::new(FakeProbe::default());
     let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 256));
     let mut devices = DeviceManager::new(None)
@@ -76,6 +84,15 @@ fn hardware_to_a_daw_and_back_through_vasio() {
     );
 
     let clock = InternalClock::start(audio, 48_000.0).unwrap();
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(10));
+        engine.tick();
+    }
+    let attached = |engine: &mut Engine| {
+        let Response::Health { slots, .. } = engine.handle(&Command::Health) else { panic!() };
+        slots.iter().find(|h| h.id == ids[0]).unwrap().attached
+    };
+    assert_eq!(attached(&mut engine), Some(false), "health says when no DAW is attached");
     let mut daw = daw(1);
     for _ in 0..300 {
         std::thread::sleep(Duration::from_millis(10));
@@ -87,6 +104,7 @@ fn hardware_to_a_daw_and_back_through_vasio() {
     let Response::Health { slots, .. } = engine.handle(&Command::Health) else { panic!() };
     let h = slots.iter().find(|h| h.id == ids[0]).unwrap();
     assert_eq!((h.underruns, h.overruns), (0, 0), "{h:?}");
+    assert_eq!(h.attached, Some(true));
 
     // Removing the slot releases the instance; the DAW keeps running on silence.
     assert_eq!(devices.handle(&mut engine, &Command::RemoveSlot { id: ids[0] }), Some(Response::Ok));
@@ -97,5 +115,4 @@ fn hardware_to_a_daw_and_back_through_vasio() {
     assert!(daw.is_running());
     daw.stop();
     clock.stop();
-    confluence_provider_vasio::config::delete_root(&root);
 }
