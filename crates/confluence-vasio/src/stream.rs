@@ -15,6 +15,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -28,8 +29,11 @@ use confluence_shm::Client;
 
 /// A server heartbeat frozen this long means the engine is stalled or gone.
 const STALL_S: f64 = 0.5;
-/// How often to look for the engine while unlinked.
-const RETRY_S: f64 = 0.5;
+/// How often the prober looks for the engine while unlinked.
+const PROBE_INTERVAL: Duration = Duration::from_millis(100);
+/// How long a driver that did not own an instance's previous stream waits
+/// before claiming a fresh one, so the previous owner gets it back first.
+const CLAIM_GRACE_S: f64 = 0.3;
 /// Consecutive engine wake-ups missed before pacing falls back to the timer.
 const MISSED_WAKES_TO_STALL: u32 = 2;
 
@@ -51,7 +55,95 @@ struct Watch {
 #[derive(Debug, Default)]
 pub(crate) struct Position {
     pub samples: AtomicI64,
+    /// On the SDK's `timeGetTime()` basis, in nanoseconds.
     pub nanos: AtomicI64,
+    /// True while the stream thread is delivering blocks.
+    pub running: AtomicBool,
+}
+
+/// Nanoseconds on the `timeGetTime()` basis the ASIO SDK specifies for
+/// `systemTime`, with QueryPerformanceCounter resolution between anchors.
+struct SystemClock {
+    anchor_ns: i64,
+    anchor_s: f64,
+}
+
+impl SystemClock {
+    fn new() -> Self {
+        // SAFETY: plain query.
+        let ms = unsafe { windows::Win32::Media::timeGetTime() };
+        SystemClock { anchor_ns: i64::from(ms) * 1_000_000, anchor_s: now_seconds() }
+    }
+
+    fn nanos(&self, now: f64) -> i64 {
+        self.anchor_ns + ((now - self.anchor_s) * 1e9) as i64
+    }
+}
+
+/// Looks for the engine on a helper thread, so the thread that drives the
+/// DAW's `bufferSwitch` never allocates or opens mappings to find it.
+struct Prober {
+    want: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    found: Receiver<Client>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Prober {
+    fn start(name: String) -> Self {
+        let (want, stop) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+        let (tx, found) = sync_channel(1);
+        let (w, st) = (want.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name("confluence-vasio-probe".into())
+            .spawn(move || {
+                while !st.load(Ordering::Acquire) {
+                    if w.load(Ordering::Acquire) {
+                        if let Ok(Some(client)) = Client::connect(&name) {
+                            w.store(false, Ordering::Release);
+                            if tx.send(client).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    std::thread::sleep(PROBE_INTERVAL);
+                }
+            })
+            .ok();
+        Prober { want, stop, found, thread }
+    }
+
+    /// A connection found since the last call (never blocks or allocates).
+    fn take(&self) -> Option<Client> {
+        self.found.try_recv().ok()
+    }
+
+    /// Asks for another connection attempt.
+    fn look_again(&self) {
+        self.want.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for Prober {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        // Unblock a pending send by draining, then wait for the thread.
+        while self.found.try_recv().is_ok() {}
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// What the stream thread remembers between connection attempts.
+struct ConnectState {
+    can_reset: bool,
+    reset_requested_for: Option<u64>,
+    watch: Option<Watch>,
+    /// This driver owned the instance's previous stream (it gets the next one first).
+    was_owner: bool,
+    /// When this driver first saw a fresh, unclaimed stream.
+    first_seen: Option<(u64, f64)>,
 }
 
 /// One channel's `2 * block` double buffer, owned by the driver object.
@@ -147,33 +239,46 @@ enum Tick {
 }
 
 impl Link {
-    fn connect(p: &Params, reset_requested_for: &mut Option<u64>, watch: &mut Option<Watch>) -> Option<Link> {
-        let client = Client::connect(&stream_name(p.instance)).ok()??;
-        let layout = client.header().layout();
-        if InstanceConfig::from_layout(&layout) != p.cfg {
+    fn connect(p: &Params, client: Client, st: &mut ConnectState) -> Option<Link> {
+        let (now, generation) = (now_seconds(), client.generation());
+        if InstanceConfig::from_layout(&client.layout()) != p.cfg {
             // The engine runs a different shape than the DAW opened: ask the DAW
-            // to re-initialise (once per engine generation).
-            if *reset_requested_for != Some(client.generation()) {
-                *reset_requested_for = Some(client.generation());
-                (p.callbacks.asio_message)(K_RESET_REQUEST, 0, null_mut(), null_mut());
+            // to re-initialise (once per engine generation, if it supports that).
+            if st.reset_requested_for != Some(generation) {
+                st.reset_requested_for = Some(generation);
+                if st.can_reset {
+                    (p.callbacks.asio_message)(K_RESET_REQUEST, 0, null_mut(), null_mut());
+                }
             }
             return None;
         }
         let h = client.header();
-        let (now, generation) = (now_seconds(), client.generation());
         let current = h.client_active.load(Ordering::Acquire);
         if current != 0 {
             // Another driver streams this instance. Take over only once its
             // heartbeat has stood still for a while (it crashed or hung).
             let heartbeat = h.client_alive.load(Ordering::Acquire);
-            match *watch {
+            match st.watch {
                 Some(w) if w.generation == generation && w.heartbeat == heartbeat => {
                     if now - w.since < STALL_S {
                         return None;
                     }
                 }
                 _ => {
-                    *watch = Some(Watch { generation, heartbeat, since: now });
+                    st.watch = Some(Watch { generation, heartbeat, since: now });
+                    return None;
+                }
+            }
+        } else if !st.was_owner {
+            // A fresh stream: let the previous owner reclaim it first.
+            match st.first_seen {
+                Some((g, since)) if g == generation => {
+                    if now - since < CLAIM_GRACE_S {
+                        return None;
+                    }
+                }
+                _ => {
+                    st.first_seen = Some((generation, now));
                     return None;
                 }
             }
@@ -182,7 +287,7 @@ impl Link {
         if h.client_active.compare_exchange(current, id, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return None;
         }
-        *watch = None;
+        (st.watch, st.first_seen) = (None, None);
         // SAFETY: the ends live in the same `Link` as `client` and are only used
         // through it while it is alive (dropping an end touches no memory).
         let (mut from_engine, to_engine) = unsafe { client.ends() };
@@ -250,6 +355,11 @@ impl Link {
     }
 
     fn send_outputs(&mut self, p: &Params, half: usize) {
+        if self.client.header().client_active.load(Ordering::Acquire) != self.id {
+            // Displaced while the DAW was inside bufferSwitch: never write into
+            // a stream another driver now owns.
+            return;
+        }
         let block = p.block;
         let outputs = &p.outputs;
         self.to_engine.write_frames(block, |ch, f| match outputs[ch] {
@@ -278,10 +388,12 @@ fn run(p: Params, stop: &AtomicBool) {
     let block_s = p.block as f64 / p.cfg.sample_rate as f64;
     let timeout_ms = ((2.0 * block_s * 1000.0).ceil() as u32).max(10);
     let time_info = supports_time_info(&p.callbacks);
+    let can_reset = (p.callbacks.asio_message)(K_SELECTOR_SUPPORTED, K_RESET_REQUEST, null_mut(), null_mut()) != 0;
+    let mut st = ConnectState { can_reset, reset_requested_for: None, watch: None, was_owner: false, first_seen: None };
+    let prober = Prober::start(stream_name(p.instance));
+    let clock = SystemClock::new();
     let mut link: Option<Link> = None;
-    let mut reset_requested_for = None;
-    let mut watch = None;
-    let mut next_retry = 0.0;
+    p.position.running.store(true, Ordering::Release);
     let mut deadline = now_seconds() + block_s;
     let mut half = 0usize;
     let mut samples = 0i64;
@@ -291,7 +403,12 @@ fn run(p: Params, stop: &AtomicBool) {
             let tick = match link.as_mut().map(|l| l.next_block(&p, half, timeout_ms)) {
                 Some(Some(t)) => t,
                 Some(None) => {
+                    // A link that ends while this driver still owned it (engine
+                    // closed or restarted) gets first claim on the next stream.
+                    st.was_owner =
+                        link.as_ref().is_some_and(|l| l.client.header().client_active.load(Ordering::Acquire) == l.id);
                     link = None;
+                    prober.look_again();
                     silence(&p, half);
                     Tick::Timer
                 }
@@ -311,17 +428,22 @@ fn run(p: Params, stop: &AtomicBool) {
                     deadline = (deadline + block_s).max(now_seconds() - 2.0 * block_s);
                 }
             }
-            if link.is_none() && now >= next_retry {
-                next_retry = now + RETRY_S;
-                link = Link::connect(&p, &mut reset_requested_for, &mut watch);
+            if link.is_none() {
+                if let Some(client) = prober.take() {
+                    link = Link::connect(&p, client, &mut st);
+                    if link.is_none() {
+                        prober.look_again();
+                    }
+                }
             }
+            let system_ns = clock.nanos(now_seconds());
             p.position.samples.store(samples, Ordering::Release);
-            p.position.nanos.store((now_seconds() * 1e9) as i64, Ordering::Release);
+            p.position.nanos.store(system_ns, Ordering::Release);
             if time_info {
                 // SAFETY: plain-old-data struct; all-zero is a valid value.
                 let mut t: AsioTime = unsafe { std::mem::zeroed() };
                 t.time_info.speed = 1.0;
-                t.time_info.system_time = AsioTimeStamp::from_value((now_seconds() * 1e9) as i64);
+                t.time_info.system_time = AsioTimeStamp::from_value(system_ns);
                 t.time_info.sample_position = AsioSamples::from_value(samples);
                 t.time_info.sample_rate = p.cfg.sample_rate as f64;
                 t.time_info.flags = K_SYSTEM_TIME_VALID | K_SAMPLE_POSITION_VALID;
@@ -344,4 +466,5 @@ fn run(p: Params, stop: &AtomicBool) {
             std::thread::sleep(Duration::from_secs_f64(block_s));
         }
     }
+    p.position.running.store(false, Ordering::Release);
 }

@@ -233,8 +233,17 @@ fn a_second_daw_on_the_same_instance_gets_silence_until_the_first_stops() {
     wait_until("the first DAW's audio after a stall", Duration::from_secs(3), || *a.last_input.lock().unwrap() == 0.25);
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(*b.last_input.lock().unwrap(), 0.0, "the waiting DAW did not take over a live DAW's instance");
+    // After an engine restart, the DAW that had the instance gets it back.
+    drop(engine);
+    let engine = Engine::start(3, 48_000.0, 256, 0.125);
+    wait_until("the first DAW's audio after a restart", Duration::from_secs(3), || {
+        *a.last_input.lock().unwrap() == 0.125
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(*b.last_input.lock().unwrap(), 0.0, "the waiting DAW did not grab the restarted engine");
+    assert_eq!(engine.heard(), 0.625);
     first.stop();
-    wait_until("the second DAW to take over", Duration::from_secs(3), || *b.last_input.lock().unwrap() == 0.25);
+    wait_until("the second DAW to take over", Duration::from_secs(3), || *b.last_input.lock().unwrap() == 0.125);
     second.stop();
 }
 

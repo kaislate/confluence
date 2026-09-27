@@ -350,7 +350,12 @@ unsafe extern "system" fn get_sample_position(
             *pos = AsioSamples::from_value(p.samples.load(Ordering::Acquire));
             *stamp = AsioTimeStamp::from_value(p.nanos.load(Ordering::Acquire));
         }
-        ASE_OK
+        // The SDK: no advancing position while the stream is not running.
+        if p.running.load(Ordering::Acquire) {
+            ASE_OK
+        } else {
+            ASE_SP_NOT_ADVANCING
+        }
     })
 }
 

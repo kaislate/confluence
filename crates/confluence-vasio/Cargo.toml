@@ -17,6 +17,7 @@ confluence-rt = { path = "../confluence-rt" }
 confluence-shm = { path = "../confluence-shm" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Media",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
 ] }
@@ -25,7 +26,7 @@ windows = { version = "0.62", features = [
 confluence-core = { path = "../confluence-core" }
 confluence-provider-asio = { path = "../confluence-provider-asio" }
 confluence-provider-vasio = { path = "../confluence-provider-vasio" }
-windows = { version = "0.62", features = ["Win32_System_LibraryLoader"] }
+windows = { version = "0.62", features = ["Win32_Media", "Win32_System_LibraryLoader"] }
 
 [lints]
 workspace = true
