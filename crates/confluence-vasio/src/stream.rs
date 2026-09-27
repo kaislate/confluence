@@ -165,13 +165,28 @@ struct ProbeShared {
     shape_differs: AtomicU64,
 }
 
+/// A stream this driver has claimed. Dropping it gives the claim back (unless
+/// another driver has taken over since), so a claim the stream thread never
+/// took, or a link that ends, does not leave the instance looking owned.
+struct Claim {
+    client: Client,
+    /// The id this driver claimed the stream with.
+    id: u32,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let _ = self.client.header().client_active.compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
 /// One probing attempt: connect, decide, claim.
-fn probe_once(name: &str, chooser: &mut Chooser, shared: &ProbeShared) -> Option<(Client, u32)> {
+fn probe_once(name: &str, chooser: &mut Chooser, shared: &ProbeShared) -> Option<Claim> {
     let client = Client::connect(name).ok()??;
     match chooser.decide(&client, shared.was_owner.load(Ordering::Acquire)) {
         Verdict::Claimed(id) => {
             shared.was_owner.store(false, Ordering::Release);
-            Some((client, id))
+            Some(Claim { client, id })
         }
         Verdict::Wait => None,
         Verdict::ShapeDiffers(generation) => {
@@ -187,7 +202,7 @@ fn probe_once(name: &str, chooser: &mut Chooser, shared: &ProbeShared) -> Option
 /// is woken at once when asked to look again or to stop.
 struct Prober {
     shared: Arc<ProbeShared>,
-    found: Receiver<(Client, u32)>,
+    found: Receiver<Claim>,
     thread: Option<JoinHandle<()>>,
     /// Only if the helper thread could not be started: probe inline, rarely.
     fallback: Option<(String, Chooser, f64)>,
@@ -225,7 +240,7 @@ impl Prober {
 
     /// A stream claimed since the last call. Never blocks; allocates only in
     /// the fallback case where the helper thread could not be started.
-    fn take(&mut self) -> Option<(Client, u32)> {
+    fn take(&mut self) -> Option<Claim> {
         if let Some((name, chooser, next)) = self.fallback.as_mut() {
             let now = now_seconds();
             if now < *next || !self.shared.want.load(Ordering::Acquire) {
@@ -326,23 +341,14 @@ impl Stream {
 
 /// A live connection to the engine.
 struct Link {
-    client: Client,
+    /// Dropped first: its ends below touch no memory when dropped.
+    claim: Claim,
     from_engine: RingReader,
     to_engine: RingWriter,
-    /// The id this driver claimed the stream with.
-    id: u32,
     last_heartbeat: u64,
     heartbeat_changed_at: f64,
     missed_wakes: u32,
     stalled: bool,
-}
-
-impl Drop for Link {
-    /// The DAW stopped (or the link died): tell the engine this is not a glitch.
-    /// A claim another driver has since taken over is left alone.
-    fn drop(&mut self) {
-        let _ = self.client.header().client_active.compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
-    }
 }
 
 enum Tick {
@@ -354,17 +360,17 @@ enum Tick {
 
 impl Link {
     /// A link over a stream the prober has claimed for this driver.
-    fn claimed(client: Client, id: u32) -> Link {
-        // SAFETY: the ends live in the same `Link` as `client` and are only used
-        // through it while it is alive (dropping an end touches no memory).
-        let (mut from_engine, to_engine) = unsafe { client.ends() };
+    fn claimed(claim: Claim) -> Link {
+        // SAFETY: the ends live in the same `Link` as the claim's client and
+        // are only used through it while it is alive (dropping an end touches
+        // no memory).
+        let (mut from_engine, to_engine) = unsafe { claim.client.ends() };
         from_engine.skip_all();
-        let last_heartbeat = client.header().server_heartbeat.load(Ordering::Acquire);
+        let last_heartbeat = claim.client.header().server_heartbeat.load(Ordering::Acquire);
         Link {
-            client,
+            claim,
             from_engine,
             to_engine,
-            id,
             last_heartbeat,
             heartbeat_changed_at: now_seconds(),
             missed_wakes: 0,
@@ -374,12 +380,12 @@ impl Link {
 
     /// Fills the DAW's inputs for this block. `None` = the link is dead.
     fn next_block(&mut self, p: &Params, half: usize, timeout_ms: u32) -> Option<Tick> {
-        let owner = self.client.header().client_active.load(Ordering::Acquire);
-        if !self.client.is_current() || owner != self.id {
+        let owner = self.claim.client.header().client_active.load(Ordering::Acquire);
+        if !self.claim.client.is_current() || owner != self.claim.id {
             return None;
         }
         let now = now_seconds();
-        let hb = self.client.header().server_heartbeat.load(Ordering::Acquire);
+        let hb = self.claim.client.header().server_heartbeat.load(Ordering::Acquire);
         if hb != self.last_heartbeat {
             self.last_heartbeat = hb;
             self.heartbeat_changed_at = now;
@@ -391,7 +397,7 @@ impl Link {
         } else if now - self.heartbeat_changed_at > STALL_S {
             self.stalled = true;
         }
-        if !self.stalled && !self.client.wait(timeout_ms) {
+        if !self.stalled && !self.claim.client.wait(timeout_ms) {
             // Missed wake-ups: after a couple, pace on the timer so the DAW
             // keeps its full callback rate while the engine is away.
             self.missed_wakes += 1;
@@ -422,7 +428,7 @@ impl Link {
     }
 
     fn send_outputs(&mut self, p: &Params, half: usize) {
-        if self.client.header().client_active.load(Ordering::Acquire) != self.id {
+        if self.claim.client.header().client_active.load(Ordering::Acquire) != self.claim.id {
             // Displaced while the DAW was inside bufferSwitch: never write into
             // a stream another driver now owns.
             return;
@@ -434,7 +440,7 @@ impl Link {
             Some(b) => unsafe { *b.half(half, block).add(f) },
             None => 0.0,
         });
-        self.client.header().client_heartbeat.fetch_add(1, Ordering::Release);
+        self.claim.client.header().client_heartbeat.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -472,8 +478,9 @@ fn run(p: Params, stop: &AtomicBool) {
                 Some(None) => {
                     // A link that ends while this driver still owned it (engine
                     // closed or restarted) gets first claim on the next stream.
-                    let was_owner =
-                        link.as_ref().is_some_and(|l| l.client.header().client_active.load(Ordering::Acquire) == l.id);
+                    let was_owner = link
+                        .as_ref()
+                        .is_some_and(|l| l.claim.client.header().client_active.load(Ordering::Acquire) == l.claim.id);
                     prober.shared.was_owner.store(was_owner, Ordering::Release);
                     link = None;
                     prober.look_again();
@@ -497,8 +504,8 @@ fn run(p: Params, stop: &AtomicBool) {
                 }
             }
             if link.is_none() {
-                if let Some((client, id)) = prober.take() {
-                    link = Some(Link::claimed(client, id));
+                if let Some(claim) = prober.take() {
+                    link = Some(Link::claimed(claim));
                 }
                 // The engine runs another shape than the DAW opened: ask the DAW
                 // to re-initialise (once per engine generation, if it supports that).
@@ -531,7 +538,7 @@ fn run(p: Params, stop: &AtomicBool) {
             if let Some(l) = link.as_ref() {
                 // Alive even while the engine is away, so a waiting DAW never
                 // mistakes an engine stall for this DAW having died.
-                l.client.header().client_alive.fetch_add(1, Ordering::Release);
+                l.claim.client.header().client_alive.fetch_add(1, Ordering::Release);
             }
             samples += p.block as i64;
             half ^= 1;
@@ -541,4 +548,34 @@ fn run(p: Params, stop: &AtomicBool) {
         }
     }
     p.position.running.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use confluence_shm::{Layout, Server};
+
+    #[test]
+    fn a_claim_the_stream_thread_never_took_is_given_back() {
+        let name = format!("VASIO.unit.{}.claim", std::process::id());
+        let cfg = InstanceConfig::default();
+        let layout = Layout {
+            sample_rate: f64::from(cfg.sample_rate),
+            block: cfg.block,
+            to_client_channels: cfg.daw_inputs,
+            from_client_channels: cfg.daw_outputs,
+            capacity_frames: cfg.block * 4,
+        };
+        let server = Server::create(&name, layout).unwrap();
+        let prober = Prober::start(name, cfg);
+        let give_up = now_seconds() + 5.0;
+        while server.header().client_active.load(Ordering::Acquire) == 0 {
+            assert!(now_seconds() < give_up, "the prober never claimed the stream");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The DAW stops before the stream thread took the claimed stream.
+        drop(prober);
+        assert_eq!(server.header().client_active.load(Ordering::Acquire), 0, "the instance looks owned");
+    }
 }
