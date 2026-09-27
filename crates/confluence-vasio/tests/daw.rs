@@ -49,6 +49,8 @@ struct Engine {
     run: Arc<AtomicBool>,
     /// Stop without shutting the stream down (like a crash).
     crash: Arc<AtomicBool>,
+    /// While set, the engine runs no blocks (a stall).
+    paused: Arc<AtomicBool>,
     heard: Arc<Mutex<f32>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -58,13 +60,19 @@ impl Engine {
         let mut slot = VasioSlot::open(instance, 2, 2, rate, block).unwrap();
         let (run, heard) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(0.0)));
         let crash = Arc::new(AtomicBool::new(false));
-        let (r, h, c) = (run.clone(), heard.clone(), crash.clone());
+        let paused = Arc::new(AtomicBool::new(false));
+        let (r, h, c, pz) = (run.clone(), heard.clone(), crash.clone(), paused.clone());
         let thread = std::thread::spawn(move || {
             let period = Duration::from_secs_f64(block as f64 / rate);
             let (mut ins, mut outs) = (PlanarBuffer::new(2, block), PlanarBuffer::new(2, block));
             outs.channel_mut(0).fill(send);
             let mut next = Instant::now();
             while r.load(Ordering::Acquire) {
+                if pz.load(Ordering::Acquire) {
+                    std::thread::sleep(period);
+                    next = Instant::now();
+                    continue;
+                }
                 slot.receive(&mut ins, 0);
                 *h.lock().unwrap() = ins.channel(0)[0];
                 slot.send(&outs, 0);
@@ -76,7 +84,14 @@ impl Engine {
                 std::mem::forget(slot);
             }
         });
-        Engine { run, crash, heard, thread: Some(thread) }
+        Engine { run, crash, paused, heard, thread: Some(thread) }
+    }
+
+    /// Runs no blocks for `d` (the engine stalls), then carries on.
+    fn stall(&self, d: Duration) {
+        self.paused.store(true, Ordering::Release);
+        std::thread::sleep(d);
+        self.paused.store(false, Ordering::Release);
     }
 
     fn crash(self) {
@@ -213,6 +228,11 @@ fn a_second_daw_on_the_same_instance_gets_silence_until_the_first_stops() {
     assert!(b.callbacks.load(Ordering::Relaxed) > 50, "but it keeps running");
     assert_eq!(*a.last_input.lock().unwrap(), 0.25, "the first DAW's audio is untouched");
     assert_eq!(engine.heard(), 0.75);
+    // An engine stall must not hand the instance to the waiting DAW.
+    engine.stall(Duration::from_millis(1500));
+    wait_until("the first DAW's audio after a stall", Duration::from_secs(3), || *a.last_input.lock().unwrap() == 0.25);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(*b.last_input.lock().unwrap(), 0.0, "the waiting DAW did not take over a live DAW's instance");
     first.stop();
     wait_until("the second DAW to take over", Duration::from_secs(3), || *b.last_input.lock().unwrap() == 0.25);
     second.stop();

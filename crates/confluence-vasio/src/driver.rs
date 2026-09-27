@@ -36,6 +36,8 @@ struct Driver {
     base: IAsio,
     refs: AtomicU32,
     instance: u32,
+    /// Outside the lock: hosts read it from inside `bufferSwitch`.
+    position: Arc<Position>,
     inner: Mutex<Inner>,
 }
 
@@ -48,7 +50,8 @@ struct Inner {
     buffers: Vec<(bool, usize, Box<[f32]>)>,
     callbacks: Option<AsioCallbacks>,
     stream: Option<Stream>,
-    position: Arc<Position>,
+    /// A stream stopped from its own thread: signalled, joined later from another thread.
+    stopping: Option<Stream>,
 }
 
 /// A new driver object with one reference.
@@ -58,6 +61,7 @@ pub(crate) fn create(instance: u32) -> *mut IAsio {
         base: IAsio { vtbl: &VTBL },
         refs: AtomicU32::new(1),
         instance,
+        position: Arc::default(),
         inner: Mutex::new(Inner::default()),
     });
     Box::into_raw(d).cast()
@@ -72,6 +76,29 @@ fn inner(this: *mut IAsio) -> MutexGuard<'static, Inner> {
     let d: &'static Driver = me(this);
     // A poisoned lock only means an earlier call panicked; the state is still usable.
     d.inner.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Stops the stream thread without holding the driver lock while waiting for
+/// it: a host may call into the driver from inside `bufferSwitch`, and that
+/// call must not wait on a thread that is waiting on it. Returns false if
+/// called from the stream thread itself: the thread is only signalled, and is
+/// joined later from another thread, so the buffers must stay alive for now.
+fn halt(this: *mut IAsio) -> bool {
+    let (running, stopping) = {
+        let mut g = inner(this);
+        (g.stream.take(), g.stopping.take())
+    };
+    let mut done = true;
+    for s in [running, stopping].into_iter().flatten() {
+        if s.is_current_thread() {
+            s.signal();
+            inner(this).stopping = Some(s);
+            done = false;
+        } else {
+            s.stop();
+        }
+    }
+    done
 }
 
 /// Runs an entry point body; a panic becomes `on_panic` instead of unwinding into the host.
@@ -124,15 +151,12 @@ unsafe extern "system" fn add_ref(this: *mut IAsio) -> u32 {
 unsafe extern "system" fn release(this: *mut IAsio) -> u32 {
     let left = me(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
-        guard((), || {
-            // Stop the stream thread before its buffers go away.
-            let mut g = inner(this);
-            if let Some(s) = g.stream.take() {
-                s.stop();
-            }
-        });
-        // SAFETY: last reference; created by Box::into_raw in `create`.
-        drop(unsafe { Box::from_raw(this.cast::<Driver>()) });
+        // Stop the stream thread before its buffers go away. Released from the
+        // stream thread itself (a very odd host), the object is leaked instead.
+        if guard(false, || halt(this)) {
+            // SAFETY: last reference; created by Box::into_raw in `create`.
+            drop(unsafe { Box::from_raw(this.cast::<Driver>()) });
+        }
         LIVE.fetch_sub(1, Ordering::AcqRel);
     }
     left
@@ -140,8 +164,15 @@ unsafe extern "system" fn release(this: *mut IAsio) -> u32 {
 
 unsafe extern "system" fn init(this: *mut IAsio, _sys_handle: *mut c_void) -> AsioBool {
     guard(ASIO_FALSE, || {
+        // A second init without disposeBuffers: the old buffers may not fit
+        // the new shape, so they go (the host must create buffers again).
+        if !halt(this) {
+            return ASIO_FALSE;
+        }
         let cfg = current_config(me(this).instance);
         let mut g = inner(this);
+        g.buffers.clear();
+        g.callbacks = None;
         g.cfg = Some(cfg);
         g.error.clear();
         ASIO_TRUE
@@ -162,10 +193,14 @@ unsafe extern "system" fn get_error_message(this: *mut IAsio, msg: *mut u8) {
 
 unsafe extern "system" fn start(this: *mut IAsio) -> AsioError {
     guard(ASE_HW_MALFUNCTION, || {
-        let mut g = inner(this);
-        if g.stream.is_some() {
+        if inner(this).stream.is_some() {
             return ASE_OK;
         }
+        // Reap a stream stopped from its own callback before starting a new one.
+        if !halt(this) {
+            return ASE_INVALID_MODE;
+        }
+        let mut g = inner(this);
         let (Some(cfg), Some(callbacks)) = (g.cfg, g.callbacks) else { return ASE_INVALID_MODE };
         let block = cfg.block as usize;
         let mut inputs = vec![None; cfg.daw_inputs as usize];
@@ -181,7 +216,7 @@ unsafe extern "system" fn start(this: *mut IAsio) -> AsioError {
             callbacks,
             inputs,
             outputs,
-            position: g.position.clone(),
+            position: me(this).position.clone(),
         };
         match Stream::start(params) {
             Ok(s) => {
@@ -198,9 +233,7 @@ unsafe extern "system" fn start(this: *mut IAsio) -> AsioError {
 
 unsafe extern "system" fn stop(this: *mut IAsio) -> AsioError {
     guard(ASE_HW_MALFUNCTION, || {
-        if let Some(s) = inner(this).stream.take() {
-            s.stop();
-        }
+        halt(this);
         ASE_OK
     })
 }
@@ -311,7 +344,7 @@ unsafe extern "system" fn get_sample_position(
     stamp: *mut AsioTimeStamp,
 ) -> AsioError {
     guard(ASE_HW_MALFUNCTION, || {
-        let p = inner(this).position.clone();
+        let p = &me(this).position;
         // SAFETY: valid out-pointers.
         unsafe {
             *pos = AsioSamples::from_value(p.samples.load(Ordering::Acquire));
@@ -352,11 +385,11 @@ unsafe extern "system" fn create_buffers(
     callbacks: *const AsioCallbacks,
 ) -> AsioError {
     guard(ASE_HW_MALFUNCTION, || {
-        let mut g = inner(this);
-        let Some(cfg) = g.cfg else { return ASE_NOT_PRESENT };
-        if g.stream.is_some() {
+        if inner(this).stream.is_some() || !halt(this) {
             return ASE_INVALID_MODE;
         }
+        let mut g = inner(this);
+        let Some(cfg) = g.cfg else { return ASE_NOT_PRESENT };
         if block != cfg.block as i32 {
             g.error = format!("Confluence runs at a block of {} frames", cfg.block);
             return ASE_INVALID_MODE;
@@ -388,12 +421,14 @@ unsafe extern "system" fn create_buffers(
 
 unsafe extern "system" fn dispose_buffers(this: *mut IAsio) -> AsioError {
     guard(ASE_HW_MALFUNCTION, || {
+        let stopped = halt(this);
         let mut g = inner(this);
-        if let Some(s) = g.stream.take() {
-            s.stop();
-        }
-        g.buffers.clear();
         g.callbacks = None;
+        // Called from the stream thread itself, the buffers are still in use
+        // until that thread is joined; they go with the next createBuffers or Release.
+        if stopped {
+            g.buffers.clear();
+        }
         ASE_OK
     })
 }

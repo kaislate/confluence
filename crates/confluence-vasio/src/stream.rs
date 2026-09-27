@@ -99,9 +99,21 @@ impl Stream {
         Ok(Stream { stop, thread })
     }
 
-    /// Stops the thread and waits for it (the DAW's buffers stay valid until then).
-    pub fn stop(self) {
+    /// Asks the thread to stop after its current block (never blocks).
+    pub fn signal(&self) {
         self.stop.store(true, Ordering::Release);
+    }
+
+    /// True when called from this stream's own thread (i.e. from inside the
+    /// DAW's `bufferSwitch`), where waiting for the thread would deadlock.
+    pub fn is_current_thread(&self) -> bool {
+        self.thread.thread().id() == std::thread::current().id()
+    }
+
+    /// Stops the thread and waits for it (the DAW's buffers stay valid until
+    /// then). Must not be called from the stream thread itself.
+    pub fn stop(self) {
+        self.signal();
         let _ = self.thread.join();
     }
 }
@@ -153,7 +165,7 @@ impl Link {
         if current != 0 {
             // Another driver streams this instance. Take over only once its
             // heartbeat has stood still for a while (it crashed or hung).
-            let heartbeat = h.client_heartbeat.load(Ordering::Acquire);
+            let heartbeat = h.client_alive.load(Ordering::Acquire);
             match *watch {
                 Some(w) if w.generation == generation && w.heartbeat == heartbeat => {
                     if now - w.since < STALL_S {
@@ -317,6 +329,11 @@ fn run(p: Params, stop: &AtomicBool) {
             }
             if let (Tick::Engine, Some(l)) = (tick, link.as_mut()) {
                 l.send_outputs(&p, half);
+            }
+            if let Some(l) = link.as_ref() {
+                // Alive even while the engine is away, so a waiting DAW never
+                // mistakes an engine stall for this DAW having died.
+                l.client.header().client_alive.fetch_add(1, Ordering::Release);
             }
             samples += p.block as i64;
             half ^= 1;

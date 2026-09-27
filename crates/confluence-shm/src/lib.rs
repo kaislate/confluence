@@ -81,8 +81,11 @@ pub struct Header {
     pub client_active: AtomicU32,
     /// Blocks the server has run (it advances even with no client).
     pub server_heartbeat: AtomicU64,
-    /// Blocks the client has processed.
+    /// Blocks the client has processed (with the server's audio).
     pub client_heartbeat: AtomicU64,
+    /// Advanced by the client that owns the stream on every tick, even while
+    /// the server is stalled: tells a waiting client the owner is alive.
+    pub client_alive: AtomicU64,
     pub to_client: RingCounters,
     pub from_client: RingCounters,
 }

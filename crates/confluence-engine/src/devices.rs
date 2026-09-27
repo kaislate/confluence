@@ -192,7 +192,7 @@ impl DeviceManager {
         if kind == DeviceKind::Asio && self.master_name.as_deref() == Some(name) {
             return Err(format!("{device} is the master clock device"));
         }
-        let existing = self.bound.iter().position(|b| b.binding.kind == kind && b.binding.name == name);
+        let existing = self.bound.iter().position(|b| same_device(&b.binding, kind, name));
         let offline = match existing {
             Some(i) if !self.bound[i].handles.is_empty() => {
                 return Err(format!("{device} is already open as slot(s) {:?}", self.bound[i].slots));
@@ -244,6 +244,10 @@ impl DeviceManager {
         let bindings = std::mem::take(&mut self.saved.devices);
         let mut warnings = Vec::new();
         for b in bindings {
+            if self.bound.iter().any(|x| same_device(&x.binding, b.kind, &b.name)) {
+                warnings.push(format!("{} duplicates an open device; its binding was dropped", b.device()));
+                continue;
+            }
             if b.kind == DeviceKind::Asio && self.master_name.as_deref() == Some(b.name.as_str()) {
                 warnings.push(format!("{} is now the master clock device; its device binding was dropped", b.device()));
                 continue;
@@ -626,6 +630,21 @@ impl StrictStats for VasioStats {
 
 fn slot_stats(stats: Option<Arc<VasioStats>>) -> Arc<dyn StrictStats> {
     stats.unwrap_or_default()
+}
+
+/// Whether `binding` is the device `kind`/`name` (VASIO: the same instance,
+/// however its shape is spelled).
+fn same_device(binding: &Binding, kind: DeviceKind, name: &str) -> bool {
+    if binding.kind != kind {
+        return false;
+    }
+    match kind {
+        DeviceKind::Vasio => match (parse_vasio(&binding.name), parse_vasio(name)) {
+            (Ok(a), Ok(b)) => a.0 == b.0,
+            _ => binding.name == name,
+        },
+        _ => binding.name == name,
+    }
 }
 
 /// Parses a VASIO device name: `N`, `N:C` or `N:IxO` (DAW inputs x outputs).
