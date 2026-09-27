@@ -6,10 +6,12 @@ Status: Milestone 0 in progress. Done so far:
 
 - the engine core and clock-drift correction;
 - the headless engine;
-- ASIO (several drivers in one process), WASAPI and per-application capture.
+- ASIO (several drivers in one process), WASAPI and per-application capture;
+- VASIO, a virtual ASIO driver that connects DAWs to the engine.
 
 ## Build and test
 
+    cargo build --workspace   # also builds the VASIO DLL that one test loads
     cargo test --workspace
     cargo run -p confluence-engine
     cargo run -p confluence-cli -- health
@@ -31,6 +33,20 @@ Add devices as soft slots. Each one gets its own channels and a drift-corrected 
     cargo run -p confluence-cli -- remove-slot 3
 
 A saved device that is missing at startup keeps its channels as an OFFLINE slot, so routes to it survive.
+
+## VASIO (virtual ASIO for DAWs)
+
+`confluence_vasio.dll` gives DAWs eight ASIO drivers, "Confluence VASIO 1" to "8". Register it once from an **administrator** terminal (`regsvr32 /u` removes it):
+
+    cargo build --release -p confluence-vasio
+    regsvr32 "<full path>\confluence_vasio.dll"
+
+Then serve an instance from the engine and route to and from it like any other device:
+
+    cargo run -p confluence-cli -- add-device vasio 1         # 2 in / 2 out
+    cargo run -p confluence-cli -- add-device vasio 2:8x2     # 8 DAW inputs, 2 DAW outputs
+
+VASIO runs on the engine's clock at the engine's sample rate and block size (the DAW cannot change them), and adds two blocks of round-trip latency. If the engine is not running, the DAW keeps running on silence and reconnects by itself when the engine starts.
 
 ## Hardware tests
 
