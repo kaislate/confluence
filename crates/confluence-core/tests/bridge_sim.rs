@@ -465,3 +465,35 @@ fn output_starts_cleanly_at_any_phase() {
         );
     }
 }
+
+#[test]
+fn an_output_that_stalls_before_priming_is_not_flooded() {
+    let (mut eng, mut dev, stats) = soft_output(config(48_000.0, 512, 512)).unwrap();
+    let block = PlanarBuffer::new(2, 512);
+    let mut buf = vec![0.0f32; 1024];
+    // The device calls back once (starting to prime), then stalls for 2 s.
+    dev.read_interleaved(&mut buf, 0.0);
+    let mut master_blocks = 0u64;
+    let mut t_master = || {
+        master_blocks += 1;
+        master_blocks as f64 * 512.0 / MASTER_RATE
+    };
+    for _ in 0..190 {
+        eng.write(&block, 0, t_master(), 0.0);
+    }
+    let h = stats.snapshot();
+    assert_eq!((h.overruns, h.underruns), (0, 0), "a device that has not begun is not overrun: {h:?}");
+    // It resumes: it primes and runs without xruns or piled-up latency.
+    let mut t_dev = 2.0;
+    for _ in 0..(10 * 48_000 / 512) {
+        let t = t_master();
+        while t_dev + 512.0 / 48_000.0 <= t {
+            t_dev += 512.0 / 48_000.0;
+            dev.read_interleaved(&mut buf, t_dev);
+        }
+        eng.write(&block, 0, t, 0.0);
+    }
+    let h = stats.snapshot();
+    assert_eq!((h.overruns, h.underruns), (0, 0), "{h:?}");
+    assert!(h.fill_frames < h.target_frames + 512.0, "{h:?}");
+}

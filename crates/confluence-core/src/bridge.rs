@@ -509,6 +509,13 @@ impl OutputEngineSide {
             if !t.stats.device_started.load(Ordering::Acquire) {
                 return;
             }
+            // It primes at the target plus its block; this is a master block
+            // beyond that. Only a device that stalls while priming gets here:
+            // stop queuing rather than fill the ring and count an overrun on
+            // every block.
+            if fill >= t.target() + (t.cfg.device_block + t.cfg.master_block) as f64 {
+                return;
+            }
             self.asrc.set_relative_ratio(1.0 / (1.0 + master_ppm * 1e-6));
         } else {
             if !t.running {
