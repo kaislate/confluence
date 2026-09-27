@@ -37,6 +37,9 @@ const QUIET_WINDOWS_TO_SHRINK: u32 = 3;
 /// Upper bound on adaptive target growth, in device blocks above the base target.
 const MAX_EXTRA_BLOCKS: f64 = 8.0;
 const STAMP_QUEUE: usize = 256;
+/// Rate at which latency left over from a stream's start drains away, in
+/// frames per second (at 48 kHz, 2 frames/s needs a steady ~40 ppm correction).
+const START_EXCESS_DRAIN_PER_S: f64 = 2.0;
 
 /// (frames transferred since the previous callback, callback time in seconds).
 type Stamp = (u32, f64);
@@ -136,6 +139,11 @@ struct Tracker {
     target: f64,
     fixed_target: Option<f64>,
     running: bool,
+    /// The loop has run at least once (the first start adopts the initial fill).
+    started: bool,
+    /// Fill above the target that the first start found; the effective target
+    /// includes it and it drains slowly, so the start needs no large correction.
+    start_excess: f64,
     run_time: f64,
     /// Smallest headroom seen in the current window, in device frames.
     window_min_headroom: f64,
@@ -160,6 +168,8 @@ impl Tracker {
             target: cfg.base_target(),
             fixed_target: None,
             running: false,
+            started: false,
+            start_excess: 0.0,
             run_time: 0.0,
             window_min_headroom: f64::INFINITY,
             window_time: 0.0,
@@ -176,7 +186,7 @@ impl Tracker {
     }
 
     fn target(&self) -> f64 {
-        self.fixed_target.unwrap_or(self.target)
+        self.fixed_target.unwrap_or(self.target + self.start_excess)
     }
 
     fn drain_stamps(&mut self) {
@@ -228,6 +238,7 @@ impl Tracker {
             self.ctl.lock();
         }
         let corr = self.ctl.update(err, dt);
+        self.start_excess = (self.start_excess - START_EXCESS_DRAIN_PER_S * dt).max(0.0);
         self.run_time += dt;
         self.window_time += dt;
         if self.window_time >= HEADROOM_WINDOW_S {
@@ -482,13 +493,14 @@ impl OutputEngineSide {
             t.xrun();
         }
         let ring = ((self.ring_slots - self.samples.slots()) / ch) as f64;
-        let mut fill = ring - t.frames_since_stamp(now);
+        let fill = ring - t.frames_since_stamp(now);
         if t.last_stamp.is_none() {
             // The device has not consumed anything yet (driver start-up): fill
             // the ring to the target at the nominal ratio and drop the rest.
             // Running the controller now would only integrate the start-up
-            // wait into a large, slowly unwinding correction.
-            if fill >= t.target() {
+            // wait into a large, slowly unwinding correction. The device primes
+            // to the target plus the block it takes first, so fill that far.
+            if fill >= t.target() + t.cfg.device_block as f64 {
                 return;
             }
             self.asrc.set_relative_ratio(1.0 / (1.0 + master_ppm * 1e-6));
@@ -498,22 +510,19 @@ impl OutputEngineSide {
                 // target (re-centring latency). Blocks produced meanwhile are
                 // dropped: queuing them would only add delay, and it avoids
                 // counting one stall as an overrun on every block.
-                if fill > t.target() {
+                if t.started && fill > t.target() {
                     return;
                 }
-                t.running = true;
-                // Start with zero error (spec §6.3): the device primed to the
-                // target and then took a block, so top the ring back up to the
-                // target with silence rather than make the loop pull a block's
-                // worth of fill back at a saturated correction.
-                let deficit = (t.target() - fill).floor();
-                if deficit >= 1.0 {
-                    let n = (deficit as usize).min(self.samples.slots() / ch);
-                    if let Ok(chunk) = self.samples.write_chunk_uninit(n * ch) {
-                        chunk.fill_from_iter(std::iter::repeat_n(0.0, n * ch));
-                        fill += n as f64;
-                    }
+                if !t.started {
+                    // First start: begin where the ring is. Priming is block
+                    // granular, so the first fill is up to a block above the
+                    // target; forcing it down would mean a saturated correction
+                    // or dropping audio. Start the loop there instead and let
+                    // the excess drain slowly (never below the target).
+                    t.started = true;
+                    t.start_excess = (fill - t.target).max(0.0);
                 }
+                t.running = true;
             }
             let corr = t.correction(fill);
             let rel = (1.0 + t.device_est.ppm() * 1e-6) / (1.0 + master_ppm * 1e-6) * (1.0 - corr * 1e-6);
@@ -542,17 +551,24 @@ impl OutputDeviceSide {
     /// Device callback: fills `data` with whole interleaved frames to be played, at `time`.
     pub fn read_interleaved(&mut self, data: &mut [f32], time: f64) {
         let frames = data.len() / self.channels;
-        let _ = self.stamps.push((frames as u32, time));
         let avail = self.samples.slots() / self.channels;
         if !self.primed {
-            // Prime to the engine side's current (possibly raised) target.
+            // Prime to the engine side's current (possibly raised) target plus
+            // the block about to be taken, so the ring still holds the target
+            // afterwards and the loop starts with zero error (spec §6.3),
+            // without splicing silence into the audio.
             let target = f64::from_bits(self.stats.target_bits.load(Ordering::Relaxed));
-            if (avail as f64) < target.max(self.prime_frames as f64) {
+            if (avail as f64) < target.max(self.prime_frames as f64) + frames as f64 {
                 data.fill(0.0);
                 return;
             }
             self.primed = true;
         }
+        // A stamp means "consumed `frames` at `time`": only sent while actually
+        // consuming. Stamps from a device still priming (playing silence and
+        // taking nothing) made the engine count phantom consumption and start
+        // its loop a block off.
+        let _ = self.stamps.push((frames as u32, time));
         self.stats.device_min_headroom.fetch_min(avail as i64 - frames as i64, Ordering::Relaxed);
         if self.samples.pop_entire_slice(&mut data[..frames * self.channels]).is_err() {
             self.stats.underruns.fetch_add(1, Ordering::Relaxed);

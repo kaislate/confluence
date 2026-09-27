@@ -10,7 +10,7 @@ use confluence_api::{ClockRole, Command, DeviceInfo, DeviceKind, Response};
 use confluence_core::asrc::AsrcQuality;
 use confluence_core::bridge::{InputDeviceSide, OutputDeviceSide};
 use confluence_provider_asio::registry::installed_drivers;
-use confluence_provider_asio::{AsioDevice, AsioHostError, AsioIo, StreamConfig, StreamInfo};
+use confluence_provider_asio::{AsioDevice, AsioHealth, AsioHostError, AsioIo, StreamConfig, StreamInfo};
 use confluence_provider_wasapi::{
     endpoints, find_endpoint, find_process, Direction, Endpoint, Handler, Target, WasapiStream,
 };
@@ -127,12 +127,20 @@ fn load(opener: &AsioOpener, kind: DeviceKind, name: &str, endpoint_id: Option<&
 pub struct PendingAdd {
     kind: DeviceKind,
     name: String,
+    /// An offline device's saved endpoint id, tried before its name.
+    endpoint_id: Option<String>,
     opener: Arc<AsioOpener>,
 }
 
 impl PendingAdd {
+    /// Never panics: a driver or lookup that panics becomes an error, so the
+    /// device is not left reserved as "being opened".
     pub fn load(self) -> LoadedAdd {
-        let loaded = load(&self.opener, self.kind, &self.name, None);
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load(&self.opener, self.kind, &self.name, self.endpoint_id.as_deref())
+        }));
+        let device = format!("{}:{}", self.kind.prefix(), self.name);
+        let loaded = opened.unwrap_or_else(|_| Err(format!("opening {device} panicked")));
         LoadedAdd { kind: self.kind, name: self.name, loaded }
     }
 }
@@ -163,6 +171,8 @@ pub struct DeviceManager {
     unplaced: Vec<Binding>,
     /// The file could not be read (or moved aside): never overwrite it.
     save_blocked: bool,
+    /// The ASIO master's slot and driver health, for `annotate`.
+    master_health: Option<(u32, Arc<AsioHealth>)>,
 }
 
 impl DeviceManager {
@@ -180,6 +190,7 @@ impl DeviceManager {
             vasio_config_root: Some(confluence_provider_vasio::config::root()),
             unplaced: Vec::new(),
             save_blocked: false,
+            master_health: None,
         }
     }
 
@@ -311,7 +322,9 @@ impl DeviceManager {
             return Err(format!("{}:{name} is being opened", kind.prefix()));
         }
         self.loading.push((kind, name.to_string()));
-        Ok(PendingAdd { kind, name: name.to_string(), opener: self.asio_open.clone() })
+        let endpoint_id =
+            self.bound.iter().find(|b| same_device(&b.binding, kind, name)).and_then(|b| b.binding.endpoint_id.clone());
+        Ok(PendingAdd { kind, name: name.to_string(), endpoint_id, opener: self.asio_open.clone() })
     }
 
     /// Last step of adding a device: attaches what was loaded to the engine
@@ -348,6 +361,8 @@ impl DeviceManager {
         };
         let ids = bound.slots.clone();
         self.bound.push(bound);
+        // It is open now: an old unplaceable binding of it must not come back.
+        self.unplaced.retain(|u| !same_device(u, kind, name));
         self.save()?;
         Ok(ids)
     }
@@ -369,6 +384,7 @@ impl DeviceManager {
     pub fn remove(&mut self, engine: &mut Engine, slot: u32) -> Result<bool, String> {
         let Some(i) = self.bound.iter().position(|b| b.slots.contains(&slot)) else { return Ok(false) };
         let b = self.bound.remove(i);
+        self.unplaced.retain(|u| !same_device(u, b.binding.kind, &b.binding.name));
         drop(b.handles); // stop callbacks before the bridge sides are detached
         for id in b.slots {
             engine.remove_slot(id).map_err(|e| e.to_string())?;
@@ -448,10 +464,24 @@ impl DeviceManager {
         })
     }
 
+    /// Reports the ASIO master's own faults and driver requests in `Health`
+    /// (its slot `id`; the master is not one of this manager's devices).
+    pub fn watch_master(&mut self, id: u32, health: Arc<AsioHealth>) {
+        self.master_health = Some((id, health));
+    }
+
     /// Adds each open device's own health (loss, faults, driver requests) to
     /// the engine's `Health` response for that device's slots.
     pub fn annotate(&self, resp: &mut Response) {
         let Response::Health { slots, .. } = resp else { return };
+        if let Some((id, hl)) = &self.master_health {
+            for h in slots.iter_mut().filter(|h| h.id == *id) {
+                h.device_faults = hl.faults.load(Ordering::Relaxed);
+                h.driver_requests = hl.reset_requests.load(Ordering::Relaxed)
+                    + hl.resync_requests.load(Ordering::Relaxed)
+                    + hl.rate_changes.load(Ordering::Relaxed);
+            }
+        }
         for b in &self.bound {
             let (mut lost, mut faults, mut requests) = (false, 0, 0);
             for h in &b.handles {

@@ -26,10 +26,14 @@ use crate::AsioCallback;
 
 pub const MAX_DRIVERS: usize = 16;
 
-/// A handler that panics this many blocks in a row is no longer called: its
+/// A handler that panics this many blocks in a row is then only retried every
+/// [`FAULT_RETRY_BLOCKS`] blocks until it succeeds again: meanwhile its
 /// outputs stay silent and every block counts as a fault. This bounds how
-/// often a panic (and its hook) runs on the driver's real-time thread.
+/// often a panic (and its hook) runs on the driver's real-time thread, while
+/// a fault that clears lets the handler back in.
 pub const MAX_CONSECUTIVE_FAULTS: u32 = 8;
+/// How often a tripped handler is retried, in blocks.
+pub const FAULT_RETRY_BLOCKS: u32 = 16;
 
 /// Stream counters, readable from any thread.
 #[derive(Default, Debug)]
@@ -282,8 +286,8 @@ fn run(st: &SlotState, half: usize, time: Option<*mut AsioTime>) {
         half,
     };
     let faults_in_a_row = st.consecutive_faults.load(Ordering::Relaxed);
-    let ok = faults_in_a_row < MAX_CONSECUTIVE_FAULTS
-        && catch_unwind(AssertUnwindSafe(|| callback.process(&mut io))).is_ok();
+    let call = faults_in_a_row < MAX_CONSECUTIVE_FAULTS || faults_in_a_row.is_multiple_of(FAULT_RETRY_BLOCKS);
+    let ok = call && catch_unwind(AssertUnwindSafe(|| callback.process(&mut io))).is_ok();
     if ok {
         st.consecutive_faults.store(0, Ordering::Relaxed);
     } else {

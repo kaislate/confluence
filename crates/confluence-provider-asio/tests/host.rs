@@ -212,7 +212,11 @@ fn a_handler_that_always_panics_is_switched_off_after_a_few_blocks() {
     std::panic::set_hook(prev);
     let h = dev.health();
     assert!(h.callbacks.load(Ordering::Relaxed) > 50, "the driver kept running");
-    assert!(calls.load(Ordering::Relaxed) <= 8, "a handler that always panics is not called every block");
+    let (calls, blocks) = (calls.load(Ordering::Relaxed), h.callbacks.load(Ordering::Relaxed));
+    assert!(
+        calls * 4 < blocks,
+        "a handler that always panics is not called every block: {calls} calls in {blocks} blocks"
+    );
     assert_eq!(h.faults.load(Ordering::Relaxed), h.callbacks.load(Ordering::Relaxed), "every block counts as faulted");
     assert!(probe.last_output.lock().unwrap().iter().all(|&s| s == 0.0), "outputs stay silent");
 }
@@ -235,4 +239,34 @@ fn the_control_thread_pumps_messages_for_drivers_that_need_it() {
     std::thread::sleep(Duration::from_millis(300));
     let ticks = probe.timer_ticks.load(Ordering::Relaxed);
     assert!(ticks >= 5, "window messages are dispatched on the driver's thread: {ticks} timer ticks");
+}
+
+#[test]
+fn a_handler_that_stops_panicking_is_heard_again() {
+    let cfg = FakeConfig::new("Fake M");
+    let probe = cfg.probe.clone();
+    let mut dev = open(cfg);
+    let calls = Arc::new(AtomicU64::new(0));
+    let c = calls.clone();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    dev.start(
+        StreamConfig::default(),
+        Box::new(move |io: &mut AsioIo<'_>| {
+            // A fault that clears (e.g. one bad routing state): the first 30 calls panic.
+            if c.fetch_add(1, Ordering::Relaxed) < 30 {
+                panic!("transient handler bug");
+            }
+            io.write_output(0, &[0.5; 128]);
+        }),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(3_000));
+    dev.stop();
+    std::panic::set_hook(prev);
+    assert!(
+        probe.last_output.lock().unwrap().iter().all(|&s| (s - 0.5).abs() < 1e-3),
+        "once the fault clears, the handler is back in charge ({} calls)",
+        calls.load(Ordering::Relaxed)
+    );
 }

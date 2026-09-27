@@ -133,7 +133,8 @@ mod app {
                 if placement.is_none() {
                     warnings.extend(devices.restore(&mut engine));
                 }
-                let (_, _, ch) = start_asio_master(&mut dev, &mut engine, audio, &name, placement)?;
+                let (master_id, _, ch) = start_asio_master(&mut dev, &mut engine, audio, &name, placement)?;
+                devices.watch_master(master_id, dev.health());
                 if placement.is_some() {
                     warnings.extend(devices.restore(&mut engine));
                 }

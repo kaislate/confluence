@@ -411,3 +411,67 @@ fn a_slow_driver_does_not_hold_up_the_manager_or_the_engine() {
     assert_eq!(engine.slots().len(), 4);
     assert!(devices.begin_add(DeviceKind::Asio, "fake:slow").is_err(), "now it is open");
 }
+
+#[test]
+fn the_masters_driver_requests_show_in_health() {
+    let mut cfg = FakeConfig::new("fake:m");
+    cfg.reset_after = Some(10);
+    let mut master = AsioDevice::open(DriverSource::Fake(cfg)).unwrap();
+    let block = master.info().preferred_block as usize;
+    let (mut engine, audio) = Engine::new(EngineConfig::new(master.info().sample_rate, block));
+    let (id, _, ch) = start_asio_master(&mut master, &mut engine, audio, "fake:m", None).unwrap();
+    let mut devices = DeviceManager::new(None);
+    devices.set_master("fake:m", ch).unwrap();
+    devices.watch_master(id, master.health());
+    std::thread::sleep(Duration::from_millis(300));
+    let mut resp = engine.handle(&Command::Health);
+    devices.annotate(&mut resp);
+    let Response::Health { slots, .. } = resp else { panic!() };
+    let h = slots.iter().find(|h| h.id == id).unwrap();
+    assert!(h.driver_requests >= 1, "the master's own driver requests are visible: {h:?}");
+    master.stop();
+}
+
+#[test]
+fn a_device_that_is_added_and_removed_is_not_brought_back_from_an_old_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("devices.json");
+    let (a, m) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
+    {
+        let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let mut devices =
+            DeviceManager::open_file(path.clone()).0.with_asio_opener(opener(vec![("fake:a", a.clone())]));
+        devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap();
+    }
+    // Next run: a master takes fake:a's channels, so its binding is kept aside.
+    let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut master = opener(vec![("fake:m", m.clone())])("fake:m").unwrap();
+    start_asio_master(&mut master, &mut engine, audio, "fake:m", None).unwrap();
+    let (devices, _) = DeviceManager::open_file(path.clone());
+    let mut devices = devices.with_asio_opener(opener(vec![("fake:a", a.clone())]));
+    devices.claim_master("fake:m");
+    // fake:a is present but its old channels are taken: it is kept aside, not opened.
+    let taken = devices.restore(&mut engine);
+    assert!(!taken.is_empty(), "{taken:?}");
+    // The user adds it again (fresh channels), then removes it: it must stay gone.
+    let ids = devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap();
+    assert_eq!(devices.handle(&mut engine, &Command::RemoveSlot { id: ids[0] }), Some(Response::Ok));
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("fake:a"), "a removed device does not come back next run: {saved}");
+    master.stop();
+}
+
+#[test]
+fn a_device_whose_open_panics_can_be_tried_again() {
+    let open: AsioOpener =
+        Box::new(|name: &str| -> Result<AsioDevice, AsioHostError> { panic!("driver lookup bug for {name}") });
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_asio_opener(open);
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let loaded = devices.begin_add(DeviceKind::Asio, "fake:bad").unwrap().load();
+    std::panic::set_hook(prev);
+    let err = devices.finish_add(&mut engine, loaded).unwrap_err();
+    assert!(err.contains("panicked"), "{err}");
+    assert!(devices.begin_add(DeviceKind::Asio, "fake:bad").is_ok(), "not stuck as 'being opened'");
+}
