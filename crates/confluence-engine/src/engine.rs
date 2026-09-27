@@ -405,6 +405,17 @@ impl Engine {
     /// Detaches a slot: its channels go silent, routes touching them fade out
     /// and are removed, and the channels become free for reuse.
     pub fn remove_slot(&mut self, id: u32) -> Result<(), EngineError> {
+        self.detach(id, true)
+    }
+
+    /// Detaches a slot but keeps the routes on its channels (a device that
+    /// failed to come back hands its channels, routes and all, back to its
+    /// offline slot).
+    pub fn detach_slot(&mut self, id: u32) -> Result<(), EngineError> {
+        self.detach(id, false)
+    }
+
+    fn detach(&mut self, id: u32, drop_routes: bool) -> Result<(), EngineError> {
         let idx = self.slots.iter().position(|s| s.state.id == id).ok_or(EngineError::NoSuchSlot(id))?;
         let rec = &self.slots[idx];
         if rec.state.role == ClockRole::Master && rec.state.online {
@@ -428,7 +439,7 @@ impl Engine {
         let ins = s.first_input..s.first_input + s.inputs;
         let outs = s.first_output..s.first_output + s.outputs;
         for (input, output, _) in self.matrix.points() {
-            if ins.contains(&input) || outs.contains(&output) {
+            if drop_routes && (ins.contains(&input) || outs.contains(&output)) {
                 // In range by construction; removal cannot fail.
                 let _ = self.matrix.remove_point(input, output);
             }
@@ -487,6 +498,7 @@ impl Engine {
             Command::Health => Response::Health {
                 blocks: self.blocks(),
                 slots: self.slots.iter().filter_map(|s| self.health(s)).collect(),
+                notices: Vec::new(),
             },
             Command::RemoveSlot { id } => match self.remove_slot(id) {
                 Ok(()) => Response::Ok,

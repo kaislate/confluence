@@ -6,7 +6,7 @@
 //! ring and feed a [`RateEstimator`]. A [`FillController`] trims the resampling
 //! ratio so the ring stays near its target fill.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -83,6 +83,9 @@ pub struct BridgeStats {
     /// Output bridges: smallest headroom the device side saw since the engine
     /// side last looked (`i64::MAX` = no reading).
     device_min_headroom: AtomicI64,
+    /// Output bridges: the device has called back at least once (it may still
+    /// be priming). Until then the engine queues nothing.
+    device_started: AtomicBool,
 }
 
 impl Default for BridgeStats {
@@ -95,6 +98,7 @@ impl Default for BridgeStats {
             device_ppm_bits: AtomicU64::new(0),
             correction_ppm_bits: AtomicU64::new(0),
             device_min_headroom: AtomicI64::new(i64::MAX),
+            device_started: AtomicBool::new(false),
         }
     }
 }
@@ -495,12 +499,21 @@ impl OutputEngineSide {
         let ring = ((self.ring_slots - self.samples.slots()) / ch) as f64;
         let fill = ring - t.frames_since_stamp(now);
         if t.last_stamp.is_none() {
-            // The device has not consumed anything yet (driver start-up): fill
-            // the ring to the target at the nominal ratio and drop the rest.
-            // Running the controller now would only integrate the start-up
-            // wait into a large, slowly unwinding correction. The device primes
-            // to the target plus the block it takes first, so fill that far.
-            if fill >= t.target() + t.cfg.device_block as f64 {
+            // The device has not consumed anything yet. Until it calls back at
+            // all (driver start-up), queue nothing: audio queued now would play
+            // late, and dropping some of it later would splice the pre-roll.
+            // Once it runs, feed it every block at the nominal ratio while it
+            // primes, so it starts on one continuous stream. The controller
+            // waits for real consumption: running it now would only integrate
+            // the start-up wait into a large, slowly unwinding correction.
+            if !t.stats.device_started.load(Ordering::Acquire) {
+                return;
+            }
+            // It primes at the target plus its block; this is a master block
+            // beyond that. Only a device that stalls while priming gets here:
+            // stop queuing rather than fill the ring and count an overrun on
+            // every block.
+            if fill >= t.target() + (t.cfg.device_block + t.cfg.master_block) as f64 {
                 return;
             }
             self.asrc.set_relative_ratio(1.0 / (1.0 + master_ppm * 1e-6));
@@ -551,6 +564,9 @@ impl OutputDeviceSide {
     /// Device callback: fills `data` with whole interleaved frames to be played, at `time`.
     pub fn read_interleaved(&mut self, data: &mut [f32], time: f64) {
         let frames = data.len() / self.channels;
+        if !self.primed {
+            self.stats.device_started.store(true, Ordering::Release);
+        }
         let avail = self.samples.slots() / self.channels;
         if !self.primed {
             // Prime to the engine side's current (possibly raised) target plus

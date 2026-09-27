@@ -33,7 +33,7 @@ fn drifting_input_reaches_drifting_output_cleanly() {
     sim.outputs.push(SimOutput::new(out_dev, 2, 44_100.0 * (1.0 - 150e-6), 441, 1, 30.0));
     sim.run_until(90.0, 0.02, |_| engine.tick());
 
-    let Response::Health { blocks, slots } = engine.handle(&Command::Health) else { panic!() };
+    let Response::Health { blocks, slots, .. } = engine.handle(&Command::Health) else { panic!() };
     assert!(blocks > 16_000, "blocks {blocks}");
     for h in &slots {
         assert_eq!(h.underruns + h.overruns, 0, "{h:?}");

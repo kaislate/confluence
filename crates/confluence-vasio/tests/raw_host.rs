@@ -30,6 +30,10 @@ static CALLBACKS: AtomicU64 = AtomicU64::new(0);
 static MODE: AtomicU32 = AtomicU32::new(0);
 /// Largest |getSamplePosition timestamp - timeGetTime()| seen in a callback, in ms.
 static STAMP_ERROR_MS: AtomicI64 = AtomicI64::new(0);
+/// Largest amount the timestamp fell behind timeGetTime(), in ms. timeGetTime
+/// is coarse (up to 15.6 ms ticks) but never ahead of true time, so a correctly
+/// anchored systemTime is never behind it.
+static STAMP_BEHIND_MS: AtomicI64 = AtomicI64::new(0);
 /// kAsioResetRequest messages received (this host does not support them).
 static RESETS: AtomicU64 = AtomicU64::new(0);
 
@@ -56,6 +60,7 @@ extern "C" fn buffer_switch(_half: i32, _direct: AsioBool) {
         let tgt = i64::from(unsafe { windows::Win32::Media::timeGetTime() });
         let err = (stamp.value() / 1_000_000 - tgt).abs();
         STAMP_ERROR_MS.fetch_max(err, Ordering::AcqRel);
+        STAMP_BEHIND_MS.fetch_max(tgt - stamp.value() / 1_000_000, Ordering::AcqRel);
     }
     if MODE.load(Ordering::Acquire) == 1 && CALLBACKS.load(Ordering::Acquire) == 20 {
         // Some hosts stop the driver from its own callback (e.g. on an error).
@@ -149,6 +154,8 @@ fn a_host_that_calls_back_into_the_driver_never_hangs() {
     assert!(CALLBACKS.load(Ordering::Acquire) > 10);
     let err = STAMP_ERROR_MS.load(Ordering::Acquire);
     assert!(err <= 20, "systemTime is on the timeGetTime() basis: off by {err} ms");
+    let behind = STAMP_BEHIND_MS.load(Ordering::Acquire);
+    assert!(behind <= 1, "systemTime is anchored on a timeGetTime() tick, never behind it: {behind} ms behind");
     let p = SendPtr(d);
     must_return("stop() while the callback queries the driver", move || {
         let p = p;

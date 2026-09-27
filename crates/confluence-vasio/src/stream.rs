@@ -14,7 +14,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -33,7 +33,7 @@ const STALL_S: f64 = 0.5;
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// How long a driver that did not own an instance's previous stream waits
 /// before claiming a fresh one, so the previous owner gets it back first.
-const CLAIM_GRACE_S: f64 = 0.3;
+const CLAIM_GRACE_S: f64 = 0.5;
 /// Consecutive engine wake-ups missed before pacing falls back to the timer.
 const MISSED_WAKES_TO_STALL: u32 = 2;
 
@@ -69,10 +69,20 @@ struct SystemClock {
 }
 
 impl SystemClock {
+    /// Anchors on a `timeGetTime()` tick edge: a single sample could be up to
+    /// a whole tick (15.6 ms at the default timer resolution) stale.
     fn new() -> Self {
-        // SAFETY: plain query.
-        let ms = unsafe { windows::Win32::Media::timeGetTime() };
-        SystemClock { anchor_ns: i64::from(ms) * 1_000_000, anchor_s: now_seconds() }
+        // SAFETY (both calls): plain queries.
+        let first = unsafe { windows::Win32::Media::timeGetTime() };
+        let give_up = now_seconds() + 0.02;
+        loop {
+            let ms = unsafe { windows::Win32::Media::timeGetTime() };
+            let now = now_seconds();
+            if ms != first || now > give_up {
+                return SystemClock { anchor_ns: i64::from(ms) * 1_000_000, anchor_s: now };
+            }
+            std::hint::spin_loop();
+        }
     }
 
     fn nanos(&self, now: f64) -> i64 {
@@ -80,70 +90,189 @@ impl SystemClock {
     }
 }
 
-/// Looks for the engine on a helper thread, so the thread that drives the
-/// DAW's `bufferSwitch` never allocates or opens mappings to find it.
+/// Decides whether a connected stream can be claimed, remembering what it saw
+/// between attempts.
+struct Chooser {
+    cfg: InstanceConfig,
+    watch: Option<Watch>,
+    /// When a fresh, unclaimed stream was first seen.
+    first_seen: Option<(u64, f64)>,
+}
+
+enum Verdict {
+    /// Claimed with this id.
+    Claimed(u32),
+    /// Another DAW owns it, or the previous owner gets it first: try later.
+    Wait,
+    /// The engine runs another shape than the DAW opened (its generation).
+    ShapeDiffers(u64),
+}
+
+impl Chooser {
+    fn decide(&mut self, client: &Client, was_owner: bool) -> Verdict {
+        let (now, generation) = (now_seconds(), client.generation());
+        if InstanceConfig::from_layout(&client.layout()) != self.cfg {
+            return Verdict::ShapeDiffers(generation);
+        }
+        let h = client.header();
+        let current = h.client_active.load(Ordering::Acquire);
+        if current != 0 {
+            // Another driver streams this instance. Take over only once its
+            // heartbeat has stood still for a while (it crashed or hung).
+            let heartbeat = h.client_alive.load(Ordering::Acquire);
+            match self.watch {
+                Some(w) if w.generation == generation && w.heartbeat == heartbeat => {
+                    if now - w.since < STALL_S {
+                        return Verdict::Wait;
+                    }
+                }
+                _ => {
+                    self.watch = Some(Watch { generation, heartbeat, since: now });
+                    return Verdict::Wait;
+                }
+            }
+        } else if !was_owner {
+            // A fresh stream: let the previous owner reclaim it first.
+            match self.first_seen {
+                Some((g, since)) if g == generation => {
+                    if now - since < CLAIM_GRACE_S {
+                        return Verdict::Wait;
+                    }
+                }
+                _ => {
+                    self.first_seen = Some((generation, now));
+                    return Verdict::Wait;
+                }
+            }
+        }
+        let id = new_client_id();
+        if h.client_active.compare_exchange(current, id, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Verdict::Wait;
+        }
+        (self.watch, self.first_seen) = (None, None);
+        Verdict::Claimed(id)
+    }
+}
+
+/// State shared by the stream thread and its prober.
+#[derive(Default)]
+struct ProbeShared {
+    want: AtomicBool,
+    stop: AtomicBool,
+    /// The last stream ended while this driver owned it (it reclaims first).
+    was_owner: AtomicBool,
+    /// Generation of an engine stream whose shape differs from the DAW's (0 = none).
+    shape_differs: AtomicU64,
+}
+
+/// A stream this driver has claimed. Dropping it gives the claim back (unless
+/// another driver has taken over since), so a claim the stream thread never
+/// took, or a link that ends, does not leave the instance looking owned.
+struct Claim {
+    client: Client,
+    /// The id this driver claimed the stream with.
+    id: u32,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let _ = self.client.header().client_active.compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// One probing attempt: connect, decide, claim.
+fn probe_once(name: &str, chooser: &mut Chooser, shared: &ProbeShared) -> Option<Claim> {
+    let client = Client::connect(name).ok()??;
+    match chooser.decide(&client, shared.was_owner.load(Ordering::Acquire)) {
+        Verdict::Claimed(id) => {
+            shared.was_owner.store(false, Ordering::Release);
+            Some(Claim { client, id })
+        }
+        Verdict::Wait => None,
+        Verdict::ShapeDiffers(generation) => {
+            shared.shape_differs.store(generation, Ordering::Release);
+            None
+        }
+    }
+}
+
+/// Looks for the engine on a helper thread and hands over only streams it has
+/// already claimed, so the thread that drives the DAW's `bufferSwitch` never
+/// opens, maps or drops mappings to find it. It sleeps between attempts but
+/// is woken at once when asked to look again or to stop.
 struct Prober {
-    want: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    found: Receiver<Client>,
+    shared: Arc<ProbeShared>,
+    found: Receiver<Claim>,
     thread: Option<JoinHandle<()>>,
+    /// Only if the helper thread could not be started: probe inline, rarely.
+    fallback: Option<(String, Chooser, f64)>,
 }
 
 impl Prober {
-    fn start(name: String) -> Self {
-        let (want, stop) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+    fn start(name: String, cfg: InstanceConfig) -> Self {
+        let shared = Arc::new(ProbeShared::default());
+        shared.want.store(true, Ordering::Release);
         let (tx, found) = sync_channel(1);
-        let (w, st) = (want.clone(), stop.clone());
-        let thread = std::thread::Builder::new()
-            .name("confluence-vasio-probe".into())
-            .spawn(move || {
-                while !st.load(Ordering::Acquire) {
-                    if w.load(Ordering::Acquire) {
-                        if let Ok(Some(client)) = Client::connect(&name) {
-                            w.store(false, Ordering::Release);
-                            if tx.send(client).is_err() {
+        let chooser = Chooser { cfg, watch: None, first_seen: None };
+        let sh = shared.clone();
+        let spawned = std::thread::Builder::new().name("confluence-vasio-probe".into()).spawn({
+            let name = name.clone();
+            let mut chooser = Chooser { cfg, watch: None, first_seen: None };
+            move || {
+                while !sh.stop.load(Ordering::Acquire) {
+                    if sh.want.load(Ordering::Acquire) {
+                        if let Some(claimed) = probe_once(&name, &mut chooser, &sh) {
+                            sh.want.store(false, Ordering::Release);
+                            if tx.send(claimed).is_err() {
                                 return;
                             }
                         }
                     }
-                    std::thread::sleep(PROBE_INTERVAL);
+                    std::thread::park_timeout(PROBE_INTERVAL);
                 }
-            })
-            .ok();
-        Prober { want, stop, found, thread }
+            }
+        });
+        match spawned {
+            Ok(thread) => Prober { shared, found, thread: Some(thread), fallback: None },
+            Err(_) => Prober { shared, found, thread: None, fallback: Some((name, chooser, 0.0)) },
+        }
     }
 
-    /// A connection found since the last call (never blocks or allocates).
-    fn take(&self) -> Option<Client> {
+    /// A stream claimed since the last call. Never blocks; allocates only in
+    /// the fallback case where the helper thread could not be started.
+    fn take(&mut self) -> Option<Claim> {
+        if let Some((name, chooser, next)) = self.fallback.as_mut() {
+            let now = now_seconds();
+            if now < *next || !self.shared.want.load(Ordering::Acquire) {
+                return None;
+            }
+            *next = now + 0.5;
+            let claimed = probe_once(name, chooser, &self.shared)?;
+            self.shared.want.store(false, Ordering::Release);
+            return Some(claimed);
+        }
         self.found.try_recv().ok()
     }
 
-    /// Asks for another connection attempt.
+    /// Asks for another attempt now.
     fn look_again(&self) {
-        self.want.store(true, Ordering::Release);
+        self.shared.want.store(true, Ordering::Release);
+        if let Some(t) = &self.thread {
+            t.thread().unpark();
+        }
     }
 }
 
 impl Drop for Prober {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        // Unblock a pending send by draining, then wait for the thread.
+        self.shared.stop.store(true, Ordering::Release);
+        // Unblock a pending send by draining; wake the thread; wait for it.
         while self.found.try_recv().is_ok() {}
         if let Some(t) = self.thread.take() {
+            t.thread().unpark();
             let _ = t.join();
         }
     }
-}
-
-/// What the stream thread remembers between connection attempts.
-struct ConnectState {
-    can_reset: bool,
-    reset_requested_for: Option<u64>,
-    watch: Option<Watch>,
-    /// This driver owned the instance's previous stream (it gets the next one first).
-    was_owner: bool,
-    /// When this driver first saw a fresh, unclaimed stream.
-    first_seen: Option<(u64, f64)>,
 }
 
 /// One channel's `2 * block` double buffer, owned by the driver object.
@@ -212,23 +341,14 @@ impl Stream {
 
 /// A live connection to the engine.
 struct Link {
-    client: Client,
+    /// Dropped first: its ends below touch no memory when dropped.
+    claim: Claim,
     from_engine: RingReader,
     to_engine: RingWriter,
-    /// The id this driver claimed the stream with.
-    id: u32,
     last_heartbeat: u64,
     heartbeat_changed_at: f64,
     missed_wakes: u32,
     stalled: bool,
-}
-
-impl Drop for Link {
-    /// The DAW stopped (or the link died): tell the engine this is not a glitch.
-    /// A claim another driver has since taken over is left alone.
-    fn drop(&mut self) {
-        let _ = self.client.header().client_active.compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
-    }
 }
 
 enum Tick {
@@ -239,80 +359,33 @@ enum Tick {
 }
 
 impl Link {
-    fn connect(p: &Params, client: Client, st: &mut ConnectState) -> Option<Link> {
-        let (now, generation) = (now_seconds(), client.generation());
-        if InstanceConfig::from_layout(&client.layout()) != p.cfg {
-            // The engine runs a different shape than the DAW opened: ask the DAW
-            // to re-initialise (once per engine generation, if it supports that).
-            if st.reset_requested_for != Some(generation) {
-                st.reset_requested_for = Some(generation);
-                if st.can_reset {
-                    (p.callbacks.asio_message)(K_RESET_REQUEST, 0, null_mut(), null_mut());
-                }
-            }
-            return None;
-        }
-        let h = client.header();
-        let current = h.client_active.load(Ordering::Acquire);
-        if current != 0 {
-            // Another driver streams this instance. Take over only once its
-            // heartbeat has stood still for a while (it crashed or hung).
-            let heartbeat = h.client_alive.load(Ordering::Acquire);
-            match st.watch {
-                Some(w) if w.generation == generation && w.heartbeat == heartbeat => {
-                    if now - w.since < STALL_S {
-                        return None;
-                    }
-                }
-                _ => {
-                    st.watch = Some(Watch { generation, heartbeat, since: now });
-                    return None;
-                }
-            }
-        } else if !st.was_owner {
-            // A fresh stream: let the previous owner reclaim it first.
-            match st.first_seen {
-                Some((g, since)) if g == generation => {
-                    if now - since < CLAIM_GRACE_S {
-                        return None;
-                    }
-                }
-                _ => {
-                    st.first_seen = Some((generation, now));
-                    return None;
-                }
-            }
-        }
-        let id = new_client_id();
-        if h.client_active.compare_exchange(current, id, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return None;
-        }
-        (st.watch, st.first_seen) = (None, None);
-        // SAFETY: the ends live in the same `Link` as `client` and are only used
-        // through it while it is alive (dropping an end touches no memory).
-        let (mut from_engine, to_engine) = unsafe { client.ends() };
+    /// A link over a stream the prober has claimed for this driver.
+    fn claimed(claim: Claim) -> Link {
+        // SAFETY: the ends live in the same `Link` as the claim's client and
+        // are only used through it while it is alive (dropping an end touches
+        // no memory).
+        let (mut from_engine, to_engine) = unsafe { claim.client.ends() };
         from_engine.skip_all();
-        let last_heartbeat = h.server_heartbeat.load(Ordering::Acquire);
-        Some(Link {
-            client,
+        let last_heartbeat = claim.client.header().server_heartbeat.load(Ordering::Acquire);
+        Link {
+            claim,
             from_engine,
             to_engine,
-            id,
             last_heartbeat,
-            heartbeat_changed_at: now,
+            heartbeat_changed_at: now_seconds(),
             missed_wakes: 0,
             stalled: false,
-        })
+        }
     }
 
     /// Fills the DAW's inputs for this block. `None` = the link is dead.
     fn next_block(&mut self, p: &Params, half: usize, timeout_ms: u32) -> Option<Tick> {
-        let owner = self.client.header().client_active.load(Ordering::Acquire);
-        if !self.client.is_current() || owner != self.id {
+        let owner = self.claim.client.header().client_active.load(Ordering::Acquire);
+        if !self.claim.client.is_current() || owner != self.claim.id {
             return None;
         }
         let now = now_seconds();
-        let hb = self.client.header().server_heartbeat.load(Ordering::Acquire);
+        let hb = self.claim.client.header().server_heartbeat.load(Ordering::Acquire);
         if hb != self.last_heartbeat {
             self.last_heartbeat = hb;
             self.heartbeat_changed_at = now;
@@ -324,7 +397,7 @@ impl Link {
         } else if now - self.heartbeat_changed_at > STALL_S {
             self.stalled = true;
         }
-        if !self.stalled && !self.client.wait(timeout_ms) {
+        if !self.stalled && !self.claim.client.wait(timeout_ms) {
             // Missed wake-ups: after a couple, pace on the timer so the DAW
             // keeps its full callback rate while the engine is away.
             self.missed_wakes += 1;
@@ -355,7 +428,7 @@ impl Link {
     }
 
     fn send_outputs(&mut self, p: &Params, half: usize) {
-        if self.client.header().client_active.load(Ordering::Acquire) != self.id {
+        if self.claim.client.header().client_active.load(Ordering::Acquire) != self.claim.id {
             // Displaced while the DAW was inside bufferSwitch: never write into
             // a stream another driver now owns.
             return;
@@ -367,7 +440,7 @@ impl Link {
             Some(b) => unsafe { *b.half(half, block).add(f) },
             None => 0.0,
         });
-        self.client.header().client_heartbeat.fetch_add(1, Ordering::Release);
+        self.claim.client.header().client_heartbeat.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -389,8 +462,8 @@ fn run(p: Params, stop: &AtomicBool) {
     let timeout_ms = ((2.0 * block_s * 1000.0).ceil() as u32).max(10);
     let time_info = supports_time_info(&p.callbacks);
     let can_reset = (p.callbacks.asio_message)(K_SELECTOR_SUPPORTED, K_RESET_REQUEST, null_mut(), null_mut()) != 0;
-    let mut st = ConnectState { can_reset, reset_requested_for: None, watch: None, was_owner: false, first_seen: None };
-    let prober = Prober::start(stream_name(p.instance));
+    let mut reset_requested_for = None;
+    let mut prober = Prober::start(stream_name(p.instance), p.cfg);
     let clock = SystemClock::new();
     let mut link: Option<Link> = None;
     p.position.running.store(true, Ordering::Release);
@@ -405,8 +478,10 @@ fn run(p: Params, stop: &AtomicBool) {
                 Some(None) => {
                     // A link that ends while this driver still owned it (engine
                     // closed or restarted) gets first claim on the next stream.
-                    st.was_owner =
-                        link.as_ref().is_some_and(|l| l.client.header().client_active.load(Ordering::Acquire) == l.id);
+                    let was_owner = link
+                        .as_ref()
+                        .is_some_and(|l| l.claim.client.header().client_active.load(Ordering::Acquire) == l.claim.id);
+                    prober.shared.was_owner.store(was_owner, Ordering::Release);
                     link = None;
                     prober.look_again();
                     silence(&p, half);
@@ -429,10 +504,16 @@ fn run(p: Params, stop: &AtomicBool) {
                 }
             }
             if link.is_none() {
-                if let Some(client) = prober.take() {
-                    link = Link::connect(&p, client, &mut st);
-                    if link.is_none() {
-                        prober.look_again();
+                if let Some(claim) = prober.take() {
+                    link = Some(Link::claimed(claim));
+                }
+                // The engine runs another shape than the DAW opened: ask the DAW
+                // to re-initialise (once per engine generation, if it supports that).
+                let differs = prober.shared.shape_differs.load(Ordering::Acquire);
+                if differs != 0 && reset_requested_for != Some(differs) {
+                    reset_requested_for = Some(differs);
+                    if can_reset {
+                        (p.callbacks.asio_message)(K_RESET_REQUEST, 0, null_mut(), null_mut());
                     }
                 }
             }
@@ -457,7 +538,7 @@ fn run(p: Params, stop: &AtomicBool) {
             if let Some(l) = link.as_ref() {
                 // Alive even while the engine is away, so a waiting DAW never
                 // mistakes an engine stall for this DAW having died.
-                l.client.header().client_alive.fetch_add(1, Ordering::Release);
+                l.claim.client.header().client_alive.fetch_add(1, Ordering::Release);
             }
             samples += p.block as i64;
             half ^= 1;
@@ -467,4 +548,34 @@ fn run(p: Params, stop: &AtomicBool) {
         }
     }
     p.position.running.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use confluence_shm::{Layout, Server};
+
+    #[test]
+    fn a_claim_the_stream_thread_never_took_is_given_back() {
+        let name = format!("VASIO.unit.{}.claim", std::process::id());
+        let cfg = InstanceConfig::default();
+        let layout = Layout {
+            sample_rate: f64::from(cfg.sample_rate),
+            block: cfg.block,
+            to_client_channels: cfg.daw_inputs,
+            from_client_channels: cfg.daw_outputs,
+            capacity_frames: cfg.block * 4,
+        };
+        let server = Server::create(&name, layout).unwrap();
+        let prober = Prober::start(name, cfg);
+        let give_up = now_seconds() + 5.0;
+        while server.header().client_active.load(Ordering::Acquire) == 0 {
+            assert!(now_seconds() < give_up, "the prober never claimed the stream");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The DAW stops before the stream thread took the claimed stream.
+        drop(prober);
+        assert_eq!(server.header().client_active.load(Ordering::Acquire), 0, "the instance looks owned");
+    }
 }

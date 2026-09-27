@@ -416,6 +416,7 @@ fn output_starts_cleanly_at_any_phase() {
         let mut buf = vec![0.0f32; 1024];
         let (mut dev_frames, mut master_blocks) = (0u64, 0u64);
         let (mut worst_corr, mut audible, mut zeros, mut longest_gap) = (0.0f64, false, 0usize, 0usize);
+        let (mut cont, mut heard) = (Continuity::default(), 0usize);
         loop {
             let t_dev = late + (dev_frames + 512) as f64 / dev_rate;
             let t_master = (master_blocks + 1) as f64 * 512.0 / MASTER_RATE;
@@ -437,6 +438,11 @@ fn output_starts_cleanly_at_any_phase() {
                 for n in 0..512 {
                     let x = buf[2 * n];
                     audible |= x != 0.0;
+                    // Judge once the resampler has warmed up: the onset itself fades
+                    // in over the sinc filter's length (~34 samples for Sinc64).
+                    heard += audible as usize;
+                    cont.armed = heard > 128;
+                    cont.push(x);
                     if audible {
                         zeros = if x == 0.0 { zeros + 1 } else { 0 };
                         longest_gap = longest_gap.max(zeros);
@@ -452,5 +458,42 @@ fn output_starts_cleanly_at_any_phase() {
         assert_eq!(h.underruns + h.overruns, 0, "start at +{late} s: {h:?}");
         assert!(worst_corr < 300.0, "start at +{late} s needed a {worst_corr:.0} ppm correction ({h:?})");
         assert!(longest_gap < 8, "start at +{late} s spliced {longest_gap} samples of silence into the audio");
+        assert!(
+            cont.max < MAX_SECOND_DIFF,
+            "start at +{late} s: a click in the audio (second difference {})",
+            cont.max
+        );
     }
+}
+
+#[test]
+fn an_output_that_stalls_before_priming_is_not_flooded() {
+    let (mut eng, mut dev, stats) = soft_output(config(48_000.0, 512, 512)).unwrap();
+    let block = PlanarBuffer::new(2, 512);
+    let mut buf = vec![0.0f32; 1024];
+    // The device calls back once (starting to prime), then stalls for 2 s.
+    dev.read_interleaved(&mut buf, 0.0);
+    let mut master_blocks = 0u64;
+    let mut t_master = || {
+        master_blocks += 1;
+        master_blocks as f64 * 512.0 / MASTER_RATE
+    };
+    for _ in 0..190 {
+        eng.write(&block, 0, t_master(), 0.0);
+    }
+    let h = stats.snapshot();
+    assert_eq!((h.overruns, h.underruns), (0, 0), "a device that has not begun is not overrun: {h:?}");
+    // It resumes: it primes and runs without xruns or piled-up latency.
+    let mut t_dev = 2.0;
+    for _ in 0..(10 * 48_000 / 512) {
+        let t = t_master();
+        while t_dev + 512.0 / 48_000.0 <= t {
+            t_dev += 512.0 / 48_000.0;
+            dev.read_interleaved(&mut buf, t_dev);
+        }
+        eng.write(&block, 0, t, 0.0);
+    }
+    let h = stats.snapshot();
+    assert_eq!((h.overruns, h.underruns), (0, 0), "{h:?}");
+    assert!(h.fill_frames < h.target_frames + 512.0, "{h:?}");
 }

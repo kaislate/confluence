@@ -159,7 +159,13 @@ pub enum Response {
     Ok,
     Points(Vec<PointState>),
     Slots(Vec<SlotState>),
-    Health { blocks: u64, slots: Vec<SlotHealth> },
+    /// `notices`: engine-wide conditions a user should know about (e.g.
+    /// device changes not being saved).
+    Health {
+        blocks: u64,
+        slots: Vec<SlotHealth>,
+        notices: Vec<String>,
+    },
     Error(String),
     Devices(Vec<DeviceInfo>),
     SlotsAdded(Vec<u32>),
