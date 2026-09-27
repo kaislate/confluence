@@ -481,3 +481,33 @@ fn a_device_whose_open_panics_can_be_tried_again() {
     assert!(err.contains("panicked"), "{err}");
     assert!(devices.begin_add(DeviceKind::Asio, "fake:bad").is_ok(), "not stuck as 'being opened'");
 }
+
+#[test]
+fn a_slow_driver_start_does_not_hold_up_the_manager() {
+    let (slow, quick) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
+    let open: AsioOpener = Box::new(move |name: &str| {
+        let mut cfg = FakeConfig::new(name);
+        if name == "fake:slowstart" {
+            cfg.probe = slow.clone();
+            cfg.start_delay = Some(Duration::from_millis(800)); // createBuffers + start take long
+        } else {
+            cfg.probe = quick.clone();
+        }
+        AsioDevice::open(DriverSource::Fake(cfg))
+    });
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_asio_opener(open);
+    let loaded = devices.begin_add(DeviceKind::Asio, "fake:slowstart").unwrap().load();
+    let attached = devices.attach_add(&mut engine, loaded).unwrap();
+    let slots = attached.slots().to_vec();
+    let starting = std::thread::spawn(move || attached.start());
+    // While the driver starts, the manager and the engine keep working...
+    devices.add(&mut engine, DeviceKind::Asio, "fake:quick").unwrap();
+    engine.tick();
+    // ...but the starting device's slots cannot be pulled out from under it.
+    let resp = devices.handle(&mut engine, &Command::RemoveSlot { id: slots[0] });
+    assert!(matches!(&resp, Some(Response::Error(e)) if e.contains("starting")), "{resp:?}");
+    let started = starting.join().unwrap();
+    assert_eq!(devices.commit_add(&mut engine, started).unwrap(), slots);
+    assert_eq!(devices.bindings().len(), 2);
+}

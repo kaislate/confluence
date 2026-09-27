@@ -175,9 +175,19 @@ mod app {
                             Err(e) => return Response::Error(e),
                         };
                         let loaded = pending.load();
+                        let attached = {
+                            let mut s = lock(&state);
+                            let State { engine, devices, .. } = &mut *s;
+                            match devices.attach_add(engine, loaded) {
+                                Ok(a) => a,
+                                Err(e) => return Response::Error(e),
+                            }
+                        };
+                        // Starting an ASIO driver can be slow too: not under the lock.
+                        let started = attached.start();
                         let mut s = lock(&state);
                         let State { engine, devices, .. } = &mut *s;
-                        return match devices.finish_add(engine, loaded) {
+                        return match devices.commit_add(engine, started) {
                             Ok(ids) => Response::SlotsAdded(ids),
                             Err(e) => Response::Error(e),
                         };

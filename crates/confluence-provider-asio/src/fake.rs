@@ -36,6 +36,8 @@ pub struct FakeConfig {
     /// Like some real drivers, set a thread timer during `init`: it only fires
     /// if the host pumps window messages on the driver's thread.
     pub posts_timer: bool,
+    /// Take this long in `start` (a slow or stuck driver).
+    pub start_delay: Option<Duration>,
     pub probe: Arc<FakeProbe>,
 }
 
@@ -55,6 +57,7 @@ impl FakeConfig {
             skip_every: None,
             reset_after: None,
             posts_timer: false,
+            start_delay: None,
             probe: Arc::new(FakeProbe::default()),
         }
     }
@@ -186,6 +189,9 @@ unsafe extern "system" fn get_error_message(_: *mut IAsio, msg: *mut u8) {
 
 unsafe extern "system" fn start(this: *mut IAsio) -> AsioError {
     let f = me(this);
+    if let Some(d) = f.cfg.start_delay {
+        std::thread::sleep(d);
+    }
     let mut st = state(this);
     let Some(cb) = st.callbacks else { return ASE_INVALID_MODE };
     let fmt = format(&f.cfg);

@@ -10,7 +10,7 @@ use confluence_api::{ClockRole, Command, DeviceInfo, DeviceKind, Response};
 use confluence_core::asrc::AsrcQuality;
 use confluence_core::bridge::{InputDeviceSide, OutputDeviceSide};
 use confluence_provider_asio::registry::installed_drivers;
-use confluence_provider_asio::{AsioDevice, AsioHealth, AsioHostError, AsioIo, StreamConfig, StreamInfo};
+use confluence_provider_asio::{AsioCallback, AsioDevice, AsioHealth, AsioHostError, AsioIo, StreamConfig, StreamInfo};
 use confluence_provider_wasapi::{
     endpoints, find_endpoint, find_process, Direction, Endpoint, Handler, Target, WasapiStream,
 };
@@ -145,6 +145,60 @@ impl PendingAdd {
     }
 }
 
+/// An ASIO driver wired to its slots but not yet started.
+struct PendingStart {
+    dev: AsioDevice,
+    callback: Box<dyn AsioCallback>,
+    block: usize,
+}
+
+/// A device attached to the engine but not started yet (from
+/// [`DeviceManager::attach_add`]). Its [`start`](Self::start) can be slow (an
+/// ASIO driver's createBuffers and start): run it without the engine lock.
+pub struct AttachedAdd {
+    kind: DeviceKind,
+    name: String,
+    offline: Option<Binding>,
+    bound: Bound,
+    start: Option<PendingStart>,
+}
+
+impl AttachedAdd {
+    /// The engine slots the device will stream through.
+    pub fn slots(&self) -> &[u32] {
+        &self.bound.slots
+    }
+
+    /// Starts the device. Never panics: a failure is reported by
+    /// [`DeviceManager::commit_add`], which also undoes the slots.
+    pub fn start(mut self) -> StartedAdd {
+        let result = match self.start.take() {
+            None => Ok(()),
+            Some(PendingStart { mut dev, callback, block }) => {
+                let cfg = StreamConfig { sample_rate: None, block: Some(block) };
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dev.start(cfg, callback))) {
+                    Ok(Ok(_)) => {
+                        self.bound.handles.push(Handle::Asio(dev));
+                        Ok(())
+                    }
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("starting the device panicked".into()),
+                }
+            }
+        };
+        StartedAdd { kind: self.kind, name: self.name, offline: self.offline, bound: self.bound, result }
+    }
+}
+
+/// The result of [`AttachedAdd::start`], for [`DeviceManager::commit_add`].
+pub struct StartedAdd {
+    kind: DeviceKind,
+    name: String,
+    offline: Option<Binding>,
+    bound: Bound,
+    result: Result<(), String>,
+}
+
 /// The result of [`PendingAdd::load`], for [`DeviceManager::finish_add`].
 pub struct LoadedAdd {
     kind: DeviceKind,
@@ -163,6 +217,8 @@ pub struct DeviceManager {
     asio_open: Arc<AsioOpener>,
     /// Devices between `begin_add` and `finish_add`.
     loading: Vec<(DeviceKind, String)>,
+    /// Slots of devices between `attach_add` and `commit_add`.
+    attaching: Vec<u32>,
     quality: AsrcQuality,
     /// Where VASIO shapes are remembered for the DLL (`None`: not at all).
     vasio_config_root: Option<String>,
@@ -186,6 +242,7 @@ impl DeviceManager {
             path,
             asio_open: Arc::new(Box::new(AsioDevice::open_installed)),
             loading: Vec::new(),
+            attaching: Vec::new(),
             quality: AsrcQuality::Sinc64,
             vasio_config_root: Some(confluence_provider_vasio::config::root()),
             unplaced: Vec::new(),
@@ -330,6 +387,15 @@ impl DeviceManager {
     /// Last step of adding a device: attaches what was loaded to the engine
     /// and saves the binding. A device that failed to load is reported here.
     pub fn finish_add(&mut self, engine: &mut Engine, loaded: LoadedAdd) -> Result<Vec<u32>, String> {
+        let attached = self.attach_add(engine, loaded)?;
+        let started = attached.start();
+        self.commit_add(engine, started)
+    }
+
+    /// Attaches what was loaded to the engine (creates its slots) without
+    /// starting it; follow with [`AttachedAdd::start`] (without the engine
+    /// lock) and [`commit_add`](Self::commit_add).
+    pub fn attach_add(&mut self, engine: &mut Engine, loaded: LoadedAdd) -> Result<AttachedAdd, String> {
         let LoadedAdd { kind, name, loaded } = loaded;
         self.loading.retain(|(k, n)| !(*k == kind && *n == name));
         let name = name.as_str();
@@ -348,8 +414,8 @@ impl DeviceManager {
             }
             None => None,
         };
-        let bound = match self.attach(engine, kind, name, offline.as_ref(), loaded) {
-            Ok(bound) => bound,
+        let (bound, start) = match self.attach(engine, kind, name, offline.as_ref(), loaded) {
+            Ok(attached) => attached,
             Err(e) => {
                 // Still missing: keep holding its channels.
                 if let Some(b) = offline {
@@ -359,10 +425,31 @@ impl DeviceManager {
                 return Err(e);
             }
         };
+        self.attaching.extend(bound.slots.iter().copied());
+        Ok(AttachedAdd { kind, name: name.to_string(), offline, bound, start })
+    }
+
+    /// Last step of adding a device: records a started device and saves the
+    /// binding, or undoes the slots of one that failed to start (an offline
+    /// device gets its channels and routes back).
+    pub fn commit_add(&mut self, engine: &mut Engine, started: StartedAdd) -> Result<Vec<u32>, String> {
+        let StartedAdd { kind, name, offline, bound, result } = started;
+        self.attaching.retain(|id| !bound.slots.contains(id));
+        if let Err(e) = result {
+            for id in &bound.slots {
+                let _ = engine.detach_slot(*id);
+            }
+            drop(bound);
+            if let Some(b) = offline {
+                let parked = Self::park_offline(engine, b).map_err(|pe| format!("{e}; {pe}"))?;
+                self.bound.push(parked);
+            }
+            return Err(e);
+        }
         let ids = bound.slots.clone();
         self.bound.push(bound);
         // It is open now: an old unplaceable binding of it must not come back.
-        self.unplaced.retain(|u| !same_device(u, kind, name));
+        self.unplaced.retain(|u| !same_device(u, kind, &name));
         self.save()?;
         Ok(ids)
     }
@@ -409,7 +496,8 @@ impl DeviceManager {
                 continue;
             }
             let opened = load(&self.asio_open, b.kind, &b.name, b.endpoint_id.as_deref())
-                .and_then(|loaded| self.attach(engine, b.kind, &b.name, Some(&b), loaded));
+                .and_then(|loaded| self.attach(engine, b.kind, &b.name, Some(&b), loaded))
+                .and_then(|(bound, start)| start_now(engine, bound, start));
             match opened {
                 Ok(bound) => self.bound.push(bound),
                 Err(e) => {
@@ -455,6 +543,9 @@ impl DeviceManager {
                 Ok(ids) => Response::SlotsAdded(ids),
                 Err(e) => Response::Error(e),
             },
+            Command::RemoveSlot { id } if self.attaching.contains(id) => {
+                Response::Error(format!("slot {id} belongs to a device that is still starting"))
+            }
             Command::RemoveSlot { id } => match self.remove(engine, *id) {
                 Ok(true) => Response::Ok,
                 Ok(false) => return None,
@@ -571,11 +662,11 @@ impl DeviceManager {
         name: &str,
         at: Option<&Binding>,
         loaded: Loaded,
-    ) -> Result<Bound, String> {
+    ) -> Result<(Bound, Option<PendingStart>), String> {
         let device = format!("{}:{}", kind.prefix(), name);
         match loaded {
-            Loaded::Asio(dev) => self.open_asio(engine, name, device, at, dev),
-            Loaded::Vasio => self.open_vasio(engine, name, device, at),
+            Loaded::Asio(dev) => self.open_asio(engine, name, device, at, dev).map(|(b, s)| (b, Some(s))),
+            Loaded::Vasio => self.open_vasio(engine, name, device, at).map(|b| (b, None)),
             Loaded::Wasapi(mut stream, endpoint_id) => {
                 let f = stream.format();
                 let mut binding = Binding { endpoint_id, ..binding_of(kind, name) };
@@ -612,7 +703,7 @@ impl DeviceManager {
                 if let Some(s) = slot {
                     (binding.first_input, binding.first_output) = (s.first_input, s.first_output);
                 }
-                Ok(Bound { binding, slots: vec![id], handles: vec![Handle::Wasapi(stream)] })
+                Ok((Bound { binding, slots: vec![id], handles: vec![Handle::Wasapi(stream)] }, None))
             }
         }
     }
@@ -674,8 +765,8 @@ impl DeviceManager {
         name: &str,
         device: String,
         at: Option<&Binding>,
-        mut dev: AsioDevice,
-    ) -> Result<Bound, String> {
+        dev: AsioDevice,
+    ) -> Result<(Bound, PendingStart), String> {
         let info = dev.info().clone();
         let (ins, outs) = (info.inputs(), info.outputs());
         let (rate, block) = (info.sample_rate, info.preferred_block.max(1) as usize);
@@ -731,10 +822,6 @@ impl DeviceManager {
                 }
             }
         };
-        if let Err(e) = dev.start(StreamConfig { sample_rate: None, block: Some(block) }, Box::new(callback)) {
-            undo(engine, &slots);
-            return Err(e.to_string());
-        }
         let mut binding = Binding {
             kind: DeviceKind::Asio,
             name: name.to_string(),
@@ -752,7 +839,8 @@ impl DeviceManager {
                 binding.first_output = s.first_output;
             }
         }
-        Ok(Bound { binding, slots, handles: vec![Handle::Asio(dev)] })
+        // Started later (possibly without the engine lock): see AttachedAdd::start.
+        Ok((Bound { binding, slots, handles: Vec::new() }, PendingStart { dev, callback: Box::new(callback), block }))
     }
 }
 
@@ -838,6 +926,24 @@ fn replace_durably(from: &std::path::Path, to: &std::path::Path) -> std::io::Res
         )
     }
     .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
+}
+
+/// Starts a just-attached device on the spot (start-up restore, which holds
+/// the engine lock anyway). On failure its slots are detached, keeping routes.
+fn start_now(engine: &mut Engine, mut bound: Bound, start: Option<PendingStart>) -> Result<Bound, String> {
+    let Some(PendingStart { mut dev, callback, block }) = start else { return Ok(bound) };
+    match dev.start(StreamConfig { sample_rate: None, block: Some(block) }, callback) {
+        Ok(_) => {
+            bound.handles.push(Handle::Asio(dev));
+            Ok(bound)
+        }
+        Err(e) => {
+            for id in &bound.slots {
+                let _ = engine.detach_slot(*id);
+            }
+            Err(e.to_string())
+        }
+    }
 }
 
 /// A binding with only its identity filled in (for comparisons).
