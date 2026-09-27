@@ -111,6 +111,10 @@ pub enum DeviceKind {
     WasapiCapture,
     /// Per-application capture (process loopback); `name` is the process name or PID.
     AppCapture,
+    /// A Confluence virtual ASIO driver instance for a DAW. `name` is `N`
+    /// (instance N, 2 channels each way), `N:C` (C each way) or `N:IxO`
+    /// (I DAW inputs, O DAW outputs).
+    Vasio,
 }
 
 impl DeviceKind {
@@ -121,14 +125,21 @@ impl DeviceKind {
             DeviceKind::WasapiRender => "wasapi-out",
             DeviceKind::WasapiCapture => "wasapi-in",
             DeviceKind::AppCapture => "app",
+            DeviceKind::Vasio => "vasio",
         }
     }
 
     /// Parses a prefix produced by [`DeviceKind::prefix`].
     pub fn from_prefix(p: &str) -> Option<Self> {
-        [DeviceKind::Asio, DeviceKind::WasapiRender, DeviceKind::WasapiCapture, DeviceKind::AppCapture]
-            .into_iter()
-            .find(|k| k.prefix() == p)
+        [
+            DeviceKind::Asio,
+            DeviceKind::WasapiRender,
+            DeviceKind::WasapiCapture,
+            DeviceKind::AppCapture,
+            DeviceKind::Vasio,
+        ]
+        .into_iter()
+        .find(|k| k.prefix() == p)
     }
 }
 

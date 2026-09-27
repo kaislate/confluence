@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive"] }
 [target.'cfg(windows)'.dependencies]
 confluence-provider-asio = { path = "../confluence-provider-asio" }
 confluence-provider-wasapi = { path = "../confluence-provider-wasapi" }
+confluence-provider-vasio = { path = "../confluence-provider-vasio" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -28,6 +29,8 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+confluence-vasio = { path = "../confluence-vasio" }
+confluence-provider-vasio = { path = "../confluence-provider-vasio" }
 tempfile = "3"
 assert_no_alloc.workspace = true
 

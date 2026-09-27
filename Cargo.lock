@@ -297,8 +297,10 @@ dependencies = [
  "confluence-api",
  "confluence-core",
  "confluence-provider-asio",
+ "confluence-provider-vasio",
  "confluence-provider-wasapi",
  "confluence-rt",
+ "confluence-vasio",
  "serde",
  "serde_json",
  "tempfile",
@@ -312,6 +314,16 @@ version = "0.1.0"
 dependencies = [
  "confluence-core",
  "confluence-rt",
+ "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "confluence-provider-vasio"
+version = "0.1.0"
+dependencies = [
+ "confluence-core",
+ "confluence-shm",
  "thiserror",
  "windows",
 ]
@@ -331,6 +343,26 @@ dependencies = [
 name = "confluence-rt"
 version = "0.1.0"
 dependencies = [
+ "windows",
+]
+
+[[package]]
+name = "confluence-shm"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "confluence-vasio"
+version = "0.1.0"
+dependencies = [
+ "confluence-core",
+ "confluence-provider-asio",
+ "confluence-provider-vasio",
+ "confluence-rt",
+ "confluence-shm",
  "windows",
 ]
 

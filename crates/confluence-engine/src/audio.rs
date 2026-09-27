@@ -29,9 +29,27 @@ pub(crate) struct OutputEntry {
     pub side: OutputEngineSide,
 }
 
+/// The audio-thread end of a *strict* slot: a device on the engine's own
+/// clock (no resampling), such as a VASIO driver, exchanging exactly one
+/// block each way per master block. Both calls must be real-time safe.
+pub trait StrictSide: Send {
+    /// Before routing: writes the slot's input channels of `inputs`.
+    fn receive(&mut self, inputs: &mut PlanarBuffer);
+    /// After routing: takes the slot's output channels of `outputs`.
+    fn send(&mut self, outputs: &PlanarBuffer);
+}
+
+pub(crate) struct StrictEntry {
+    pub id: u32,
+    pub first_input: usize,
+    pub inputs: usize,
+    pub side: Box<dyn StrictSide>,
+}
+
 pub(crate) enum AudioMsg {
     AddInput(Box<InputEntry>),
     AddOutput(Box<OutputEntry>),
+    AddStrict(Box<StrictEntry>),
     Remove(u32),
 }
 
@@ -39,6 +57,7 @@ pub(crate) enum AudioMsg {
 pub(crate) enum Returned {
     Input(Box<InputEntry>),
     Output(Box<OutputEntry>),
+    Strict(Box<StrictEntry>),
 }
 
 pub struct AudioEngine {
@@ -51,6 +70,8 @@ pub struct AudioEngine {
     pub(crate) soft_inputs: Vec<Box<InputEntry>>,
     #[allow(clippy::vec_box)]
     pub(crate) soft_outputs: Vec<Box<OutputEntry>>,
+    #[allow(clippy::vec_box)]
+    pub(crate) strict: Vec<Box<StrictEntry>>,
     pub(crate) inbox: Receiver<AudioMsg>,
     pub(crate) returns: Sender<Returned>,
     pub(crate) blocks: Arc<AtomicU64>,
@@ -94,12 +115,18 @@ impl AudioEngine {
 
     fn run(&mut self, now: f64, master_ppm: f64) {
         self.apply_messages();
+        for e in self.strict.iter_mut() {
+            e.side.receive(&mut self.inputs);
+        }
         for e in self.soft_inputs.iter_mut() {
             e.side.read(&mut self.inputs, e.first_channel, now, master_ppm);
         }
         self.router.process(&self.inputs, &mut self.outputs);
         for e in self.soft_outputs.iter_mut() {
             e.side.write(&self.outputs, e.first_channel, now, master_ppm);
+        }
+        for e in self.strict.iter_mut() {
+            e.side.send(&self.outputs);
         }
         self.blocks.fetch_add(1, Ordering::Relaxed);
     }
@@ -126,6 +153,13 @@ impl AudioEngine {
                         self.give_back(Returned::Output(e));
                     }
                 }
+                AudioMsg::AddStrict(e) => {
+                    if self.strict.len() < self.strict.capacity() {
+                        self.strict.push(e);
+                    } else {
+                        self.give_back(Returned::Strict(e));
+                    }
+                }
                 AudioMsg::Remove(id) => {
                     if let Some(i) = self.soft_inputs.iter().position(|e| e.id == id) {
                         let e = self.soft_inputs.swap_remove(i);
@@ -139,6 +173,13 @@ impl AudioEngine {
                     if let Some(i) = self.soft_outputs.iter().position(|e| e.id == id) {
                         let e = self.soft_outputs.swap_remove(i);
                         self.give_back(Returned::Output(e));
+                    }
+                    if let Some(i) = self.strict.iter().position(|e| e.id == id) {
+                        let e = self.strict.swap_remove(i);
+                        for ch in e.first_input..e.first_input + e.inputs {
+                            self.inputs.channel_mut(ch).fill(0.0);
+                        }
+                        self.give_back(Returned::Strict(e));
                     }
                 }
             }

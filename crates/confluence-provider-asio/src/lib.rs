@@ -15,7 +15,7 @@ pub mod sys;
 mod trampolines;
 
 #[cfg(windows)]
-pub use device::{AsioDevice, AsioHostError, DriverInfo, DriverSource, StreamConfig, StreamInfo};
+pub use device::{AsioDevice, AsioHostError, DriverInfo, DriverSource, GetClassObject, StreamConfig, StreamInfo};
 #[cfg(windows)]
 pub use io::AsioIo;
 #[cfg(windows)]

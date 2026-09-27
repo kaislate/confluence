@@ -96,7 +96,30 @@ pub enum DriverSource {
     Installed(DriverEntry),
     /// An in-process fake driver (tests without hardware).
     Fake(crate::fake::FakeConfig),
+    /// A driver's COM class factory called directly: the same path a host
+    /// takes through `CoCreateInstance`, minus the registry lookup (tests of
+    /// our own drivers, e.g. VASIO, without registering them).
+    ClassFactory {
+        get_class_object: GetClassObject,
+        clsid: GUID,
+        name: String,
+    },
 }
+
+/// Signature of an in-proc COM server's `DllGetClassObject`.
+pub type GetClassObject = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> i32;
+
+/// `IClassFactory`'s vtable (after `IUnknown`).
+#[repr(C)]
+struct ClassFactoryVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    create_instance: unsafe extern "system" fn(*mut c_void, *mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    lock_server: unsafe extern "system" fn(*mut c_void, i32) -> i32,
+}
+
+const IID_ICLASS_FACTORY: GUID = GUID::from_u128(0x00000001_0000_0000_c000_000000000046);
 
 enum Ctl {
     Start(StreamConfig, Box<dyn AsioCallback>, fn() -> f64, SyncSender<Result<StreamInfo, AsioHostError>>),
@@ -250,6 +273,27 @@ fn create(source: &DriverSource) -> Result<Driver, AsioHostError> {
             Ok(Driver(p.cast()))
         }
         DriverSource::Fake(cfg) => Ok(Driver(crate::fake::create(cfg.clone()))),
+        DriverSource::ClassFactory { get_class_object, clsid, name } => {
+            let failed = |what: &str, hr: i32| AsioHostError::Create(format!("{name}: {what} failed (0x{hr:08x})"));
+            let mut factory: *mut c_void = std::ptr::null_mut();
+            // SAFETY: valid GUID pointers and out-pointer, as DllGetClassObject requires.
+            let hr = unsafe { get_class_object(clsid, &IID_ICLASS_FACTORY, &mut factory) };
+            if hr < 0 || factory.is_null() {
+                return Err(failed("DllGetClassObject", hr));
+            }
+            // SAFETY: a COM object starts with its vtable pointer; this one is an IClassFactory.
+            let vt = unsafe { &**factory.cast::<*const ClassFactoryVtbl>() };
+            let mut p: *mut c_void = std::ptr::null_mut();
+            // ASIO convention: the interface id requested is the driver's own CLSID.
+            // SAFETY: live factory; valid pointers.
+            let hr = unsafe { (vt.create_instance)(factory, std::ptr::null_mut(), clsid, &mut p) };
+            // SAFETY: we own the reference DllGetClassObject returned.
+            unsafe { (vt.release)(factory) };
+            if hr < 0 || p.is_null() {
+                return Err(failed("CreateInstance", hr));
+            }
+            Ok(Driver(p.cast()))
+        }
     }
 }
 

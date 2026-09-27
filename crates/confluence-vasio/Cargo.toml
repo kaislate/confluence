@@ -1,0 +1,31 @@
+[package]
+name = "confluence-vasio"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Confluence virtual ASIO driver: an in-proc COM server a DAW loads to exchange audio with the engine"
+
+[lib]
+# cdylib: the DLL DAWs load. rlib: lets tests drive the same code in-process.
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(windows)'.dependencies]
+confluence-provider-asio = { path = "../confluence-provider-asio" }
+confluence-provider-vasio = { path = "../confluence-provider-vasio" }
+confluence-rt = { path = "../confluence-rt" }
+confluence-shm = { path = "../confluence-shm" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+] }
+
+[dev-dependencies]
+confluence-core = { path = "../confluence-core" }
+confluence-provider-asio = { path = "../confluence-provider-asio" }
+confluence-provider-vasio = { path = "../confluence-provider-vasio" }
+windows = { version = "0.62", features = ["Win32_System_LibraryLoader"] }
+
+[lints]
+workspace = true
