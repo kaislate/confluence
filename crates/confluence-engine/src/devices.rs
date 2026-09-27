@@ -80,6 +80,11 @@ pub struct DeviceManager {
     quality: AsrcQuality,
     /// Where VASIO shapes are remembered for the DLL (`None`: not at all).
     vasio_config_root: Option<String>,
+    /// Saved bindings whose channels could not be reserved this run: kept so
+    /// they are written back and tried again next time.
+    unplaced: Vec<Binding>,
+    /// The file could not be read (or moved aside): never overwrite it.
+    save_blocked: bool,
 }
 
 impl DeviceManager {
@@ -94,32 +99,51 @@ impl DeviceManager {
             asio_open: Box::new(AsioDevice::open_installed),
             quality: AsrcQuality::Sinc64,
             vasio_config_root: Some(confluence_provider_vasio::config::ROOT.to_string()),
+            unplaced: Vec::new(),
+            save_blocked: false,
         }
     }
 
-    /// Reads saved bindings from `path`. An unreadable file is renamed to
-    /// `.bad` (never silently discarded) and reported as a warning.
+    /// Reads saved bindings from `path`. A corrupt file is renamed to `.bad`
+    /// (never silently discarded) and reported as a warning. A file that
+    /// cannot be read, or cannot be moved aside, is never overwritten: this
+    /// session's device changes are then not saved.
     pub fn open_file(path: PathBuf) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
+        let mut save_blocked = false;
         let saved = match std::fs::read_to_string(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
             Err(e) => {
-                warnings.push(format!("could not read {}: {e}", path.display()));
+                warnings.push(format!(
+                    "could not read {}: {e}; it is left untouched and device changes will not be saved",
+                    path.display()
+                ));
+                save_blocked = true;
                 Saved::default()
             }
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
                 let bad = path.with_extension("bad");
-                let _ = std::fs::rename(&path, &bad);
-                warnings.push(format!(
-                    "{} is not valid ({e}); kept as {} and starting with no devices",
-                    path.display(),
-                    bad.display()
-                ));
+                match std::fs::rename(&path, &bad) {
+                    Ok(()) => warnings.push(format!(
+                        "{} is not valid ({e}); kept as {} and starting with no devices",
+                        path.display(),
+                        bad.display()
+                    )),
+                    Err(re) => {
+                        warnings.push(format!(
+                            "{} is not valid ({e}) and could not be moved aside ({re}); it is left in place, \
+                             starting with no devices, and device changes will not be saved",
+                            path.display()
+                        ));
+                        save_blocked = true;
+                    }
+                }
                 Saved::default()
             }),
         };
         let mut m = Self::new(Some(path));
         m.saved = saved;
+        m.save_blocked = save_blocked;
         (m, warnings)
     }
 
@@ -256,9 +280,12 @@ impl DeviceManager {
                 Ok(bound) => self.bound.push(bound),
                 Err(e) => {
                     warnings.push(format!("{} is offline: {e}", b.device()));
-                    match Self::park_offline(engine, b) {
+                    match Self::park_offline(engine, b.clone()) {
                         Ok(parked) => self.bound.push(parked),
-                        Err(e) => warnings.push(e),
+                        Err(e) => {
+                            warnings.push(e);
+                            self.unplaced.push(b);
+                        }
                     }
                 }
             }
@@ -335,13 +362,26 @@ impl DeviceManager {
 
     fn save(&self) -> Result<(), String> {
         let Some(path) = &self.path else { return Ok(()) };
-        let saved = Saved { master: self.master.clone(), devices: self.bindings() };
+        if self.save_blocked {
+            return Ok(());
+        }
+        let mut devices = self.bindings();
+        devices.extend(self.unplaced.iter().cloned());
+        let saved = Saved { master: self.master.clone(), devices };
         let json = serde_json::to_string_pretty(&saved).map_err(|e| e.to_string())?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
+        // Write, flush to disk, then atomically replace: a power loss leaves
+        // either the old file or the new one, never an empty one.
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()
+        };
+        write().map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, path).map_err(|e| e.to_string())
     }
 
