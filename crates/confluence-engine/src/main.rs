@@ -158,6 +158,31 @@ mod app {
                     shutdown.store(true, Ordering::SeqCst);
                     return Response::Ok;
                 }
+                // Device enumeration and driver initialisation can be slow (a bad
+                // driver can take seconds): do them without the lock, so the
+                // engine keeps ticking and other clients keep being answered.
+                match cmd {
+                    Command::ListDevices => {
+                        return match DeviceManager::list_devices() {
+                            Ok(d) => Response::Devices(d),
+                            Err(e) => Response::Error(e),
+                        };
+                    }
+                    Command::AddDevice { kind, name } => {
+                        let pending = match lock(&state).devices.begin_add(*kind, name) {
+                            Ok(p) => p,
+                            Err(e) => return Response::Error(e),
+                        };
+                        let loaded = pending.load();
+                        let mut s = lock(&state);
+                        let State { engine, devices, .. } = &mut *s;
+                        return match devices.finish_add(engine, loaded) {
+                            Ok(ids) => Response::SlotsAdded(ids),
+                            Err(e) => Response::Error(e),
+                        };
+                    }
+                    _ => {}
+                }
                 let mut s = lock(&state);
                 let State { engine, devices, journal } = &mut *s;
                 let mut resp = match devices.handle(engine, cmd) {

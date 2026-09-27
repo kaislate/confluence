@@ -66,7 +66,64 @@ pub struct Saved {
 }
 
 /// Opens an ASIO driver by name (injectable so tests can use fake drivers).
-pub type AsioOpener = Box<dyn Fn(&str) -> Result<AsioDevice, AsioHostError> + Send>;
+pub type AsioOpener = Box<dyn Fn(&str) -> Result<AsioDevice, AsioHostError> + Send + Sync>;
+
+/// A device loaded but not yet attached to the engine.
+enum Loaded {
+    Asio(AsioDevice),
+    Wasapi(WasapiStream),
+    /// Nothing slow to do: the engine side is created when attached.
+    Vasio,
+}
+
+/// Loads a device: the slow part of adding one (driver `init`, endpoint or
+/// process lookup, stream set-up). Needs neither the engine nor the manager.
+fn load(opener: &AsioOpener, kind: DeviceKind, name: &str) -> Result<Loaded, String> {
+    Ok(match kind {
+        DeviceKind::Asio => Loaded::Asio(opener(name).map_err(|e| e.to_string())?),
+        DeviceKind::Vasio => {
+            parse_vasio(name)?;
+            Loaded::Vasio
+        }
+        DeviceKind::WasapiRender | DeviceKind::WasapiCapture | DeviceKind::AppCapture => {
+            let target = match kind {
+                DeviceKind::WasapiRender => {
+                    let ep = find_endpoint(Direction::Render, name).map_err(|e| e.to_string())?;
+                    Target::Endpoint { id: ep.id, direction: Direction::Render }
+                }
+                DeviceKind::WasapiCapture => {
+                    let ep = find_endpoint(Direction::Capture, name).map_err(|e| e.to_string())?;
+                    Target::Endpoint { id: ep.id, direction: Direction::Capture }
+                }
+                _ => Target::App { pid: find_process(name).map_err(|e| e.to_string())? },
+            };
+            Loaded::Wasapi(WasapiStream::open(target).map_err(|e| e.to_string())?)
+        }
+    })
+}
+
+/// A device being added, between [`DeviceManager::begin_add`] and
+/// [`DeviceManager::finish_add`]. Its [`load`](Self::load) is the slow part:
+/// run it without holding the engine's lock.
+pub struct PendingAdd {
+    kind: DeviceKind,
+    name: String,
+    opener: Arc<AsioOpener>,
+}
+
+impl PendingAdd {
+    pub fn load(self) -> LoadedAdd {
+        let loaded = load(&self.opener, self.kind, &self.name);
+        LoadedAdd { kind: self.kind, name: self.name, loaded }
+    }
+}
+
+/// The result of [`PendingAdd::load`], for [`DeviceManager::finish_add`].
+pub struct LoadedAdd {
+    kind: DeviceKind,
+    name: String,
+    loaded: Result<Loaded, String>,
+}
 
 pub struct DeviceManager {
     bound: Vec<Bound>,
@@ -76,7 +133,9 @@ pub struct DeviceManager {
     /// Bindings read at startup, not yet restored.
     saved: Saved,
     path: Option<PathBuf>,
-    asio_open: AsioOpener,
+    asio_open: Arc<AsioOpener>,
+    /// Devices between `begin_add` and `finish_add`.
+    loading: Vec<(DeviceKind, String)>,
     quality: AsrcQuality,
     /// Where VASIO shapes are remembered for the DLL (`None`: not at all).
     vasio_config_root: Option<String>,
@@ -96,7 +155,8 @@ impl DeviceManager {
             master_name: None,
             saved: Saved::default(),
             path,
-            asio_open: Box::new(AsioDevice::open_installed),
+            asio_open: Arc::new(Box::new(AsioDevice::open_installed)),
+            loading: Vec::new(),
             quality: AsrcQuality::Sinc64,
             vasio_config_root: Some(confluence_provider_vasio::config::ROOT.to_string()),
             unplaced: Vec::new(),
@@ -174,7 +234,7 @@ impl DeviceManager {
     }
 
     pub fn with_asio_opener(mut self, opener: AsioOpener) -> Self {
-        self.asio_open = opener;
+        self.asio_open = Arc::new(opener);
         self
     }
 
@@ -188,6 +248,12 @@ impl DeviceManager {
     /// driver is loaded, so they are reported as 0; VASIO instances are
     /// listed by number.
     pub fn list(&self) -> Result<Vec<DeviceInfo>, String> {
+        Self::list_devices()
+    }
+
+    /// As [`list`](Self::list), without the manager: enumeration can be slow,
+    /// so the engine runs it without holding its lock.
+    pub fn list_devices() -> Result<Vec<DeviceInfo>, String> {
         let mut out: Vec<DeviceInfo> = installed_drivers()
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -212,15 +278,33 @@ impl DeviceManager {
     /// already open (or is the master) is refused: many drivers misbehave when
     /// loaded twice. An offline device comes back on its saved channels.
     pub fn add(&mut self, engine: &mut Engine, kind: DeviceKind, name: &str) -> Result<Vec<u32>, String> {
-        let device = format!("{}:{}", kind.prefix(), name);
-        if kind == DeviceKind::Asio && self.master_name.as_deref() == Some(name) {
-            return Err(format!("{device} is the master clock device"));
+        let loaded = self.begin_add(kind, name)?.load();
+        self.finish_add(engine, loaded)
+    }
+
+    /// First step of adding a device: refuses one that is the master, already
+    /// open or already being opened, and reserves it. Always follow with
+    /// [`PendingAdd::load`] (without the engine lock) and [`finish_add`](Self::finish_add).
+    pub fn begin_add(&mut self, kind: DeviceKind, name: &str) -> Result<PendingAdd, String> {
+        self.check_addable(kind, name)?;
+        if self.loading.iter().any(|(k, n)| same_device(&binding_of(*k, n), kind, name)) {
+            return Err(format!("{}:{name} is being opened", kind.prefix()));
         }
+        self.loading.push((kind, name.to_string()));
+        Ok(PendingAdd { kind, name: name.to_string(), opener: self.asio_open.clone() })
+    }
+
+    /// Last step of adding a device: attaches what was loaded to the engine
+    /// and saves the binding. A device that failed to load is reported here.
+    pub fn finish_add(&mut self, engine: &mut Engine, loaded: LoadedAdd) -> Result<Vec<u32>, String> {
+        let LoadedAdd { kind, name, loaded } = loaded;
+        self.loading.retain(|(k, n)| !(*k == kind && *n == name));
+        let name = name.as_str();
+        self.check_addable(kind, name)?;
         let existing = self.bound.iter().position(|b| same_device(&b.binding, kind, name));
+        // A device that failed to load: an offline slot keeps holding its channels.
+        let loaded = loaded?;
         let offline = match existing {
-            Some(i) if !self.bound[i].handles.is_empty() => {
-                return Err(format!("{device} is already open as slot(s) {:?}", self.bound[i].slots));
-            }
             Some(i) => {
                 // Offline: hand its channels back to the device, routes and all.
                 let b = self.bound.remove(i);
@@ -231,7 +315,7 @@ impl DeviceManager {
             }
             None => None,
         };
-        let bound = match self.open(engine, kind, name, offline.as_ref()) {
+        let bound = match self.attach(engine, kind, name, offline.as_ref(), loaded) {
             Ok(bound) => bound,
             Err(e) => {
                 // Still missing: keep holding its channels.
@@ -246,6 +330,18 @@ impl DeviceManager {
         self.bound.push(bound);
         self.save()?;
         Ok(ids)
+    }
+
+    /// Refuses a device that is the master or already open (an offline one may be re-added).
+    fn check_addable(&self, kind: DeviceKind, name: &str) -> Result<(), String> {
+        let device = format!("{}:{}", kind.prefix(), name);
+        if kind == DeviceKind::Asio && self.master_name.as_deref() == Some(name) {
+            return Err(format!("{device} is the master clock device"));
+        }
+        match self.bound.iter().find(|b| same_device(&b.binding, kind, name)) {
+            Some(b) if !b.handles.is_empty() => Err(format!("{device} is already open as slot(s) {:?}", b.slots)),
+            _ => Ok(()),
+        }
     }
 
     /// Closes the device owning `slot` (all its slots) and saves the bindings.
@@ -276,7 +372,9 @@ impl DeviceManager {
                 warnings.push(format!("{} is now the master clock device; its device binding was dropped", b.device()));
                 continue;
             }
-            match self.open(engine, b.kind, &b.name, Some(&b)) {
+            let opened = load(&self.asio_open, b.kind, &b.name)
+                .and_then(|loaded| self.attach(engine, b.kind, &b.name, Some(&b), loaded));
+            match opened {
                 Ok(bound) => self.bound.push(bound),
                 Err(e) => {
                     warnings.push(format!("{} is offline: {e}", b.device()));
@@ -405,30 +503,20 @@ impl DeviceManager {
         }
     }
 
-    fn open(
+    /// Attaches a loaded device to the engine: creates its slots and starts it.
+    fn attach(
         &mut self,
         engine: &mut Engine,
         kind: DeviceKind,
         name: &str,
         at: Option<&Binding>,
+        loaded: Loaded,
     ) -> Result<Bound, String> {
         let device = format!("{}:{}", kind.prefix(), name);
-        match kind {
-            DeviceKind::Asio => self.open_asio(engine, name, device, at),
-            DeviceKind::Vasio => self.open_vasio(engine, name, device, at),
-            DeviceKind::WasapiRender | DeviceKind::WasapiCapture | DeviceKind::AppCapture => {
-                let target = match kind {
-                    DeviceKind::WasapiRender => {
-                        let ep = find_endpoint(Direction::Render, name).map_err(|e| e.to_string())?;
-                        Target::Endpoint { id: ep.id, direction: Direction::Render }
-                    }
-                    DeviceKind::WasapiCapture => {
-                        let ep = find_endpoint(Direction::Capture, name).map_err(|e| e.to_string())?;
-                        Target::Endpoint { id: ep.id, direction: Direction::Capture }
-                    }
-                    _ => Target::App { pid: find_process(name).map_err(|e| e.to_string())? },
-                };
-                let mut stream = WasapiStream::open(target).map_err(|e| e.to_string())?;
+        match loaded {
+            Loaded::Asio(dev) => self.open_asio(engine, name, device, at, dev),
+            Loaded::Vasio => self.open_vasio(engine, name, device, at),
+            Loaded::Wasapi(mut stream) => {
                 let f = stream.format();
                 let mut binding =
                     Binding { kind, name: name.to_string(), first_input: 0, inputs: 0, first_output: 0, outputs: 0 };
@@ -526,8 +614,8 @@ impl DeviceManager {
         name: &str,
         device: String,
         at: Option<&Binding>,
+        mut dev: AsioDevice,
     ) -> Result<Bound, String> {
-        let mut dev = (self.asio_open)(name).map_err(|e| e.to_string())?;
         let info = dev.info().clone();
         let (ins, outs) = (info.inputs(), info.outputs());
         let (rate, block) = (info.sample_rate, info.preferred_block.max(1) as usize);
@@ -670,6 +758,11 @@ impl StrictStats for VasioStats {
 
 fn slot_stats(stats: Option<Arc<VasioStats>>) -> Arc<dyn StrictStats> {
     stats.unwrap_or_default()
+}
+
+/// A binding with only its identity filled in (for comparisons).
+fn binding_of(kind: DeviceKind, name: &str) -> Binding {
+    Binding { kind, name: name.to_string(), first_input: 0, inputs: 0, first_output: 0, outputs: 0 }
 }
 
 /// Whether `binding` is the device `kind`/`name` (VASIO: the same instance,

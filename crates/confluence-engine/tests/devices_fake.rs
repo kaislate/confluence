@@ -380,3 +380,34 @@ fn a_binding_whose_channels_are_taken_stays_saved() {
     assert!(saved.contains("fake:a"), "the unplaceable binding is kept for a later run: {saved}");
     master.stop();
 }
+
+#[test]
+fn a_slow_driver_does_not_hold_up_the_manager_or_the_engine() {
+    let (quick, slow) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    let open: AsioOpener = Box::new(move |name: &str| {
+        if name == "fake:slow" {
+            // A driver whose init takes as long as the test says.
+            gate.lock().unwrap().recv().unwrap();
+            return opener(vec![("fake:slow", slow.clone())])(name);
+        }
+        opener(vec![("fake:quick", quick.clone())])(name)
+    });
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_asio_opener(open);
+    let pending = devices.begin_add(DeviceKind::Asio, "fake:slow").unwrap();
+    let loading = std::thread::spawn(move || pending.load());
+    // While the slow driver initialises, the manager and the engine keep working...
+    devices.add(&mut engine, DeviceKind::Asio, "fake:quick").unwrap();
+    engine.tick();
+    // ...and the device being opened cannot be opened a second time meanwhile.
+    let err = devices.begin_add(DeviceKind::Asio, "fake:slow").err().unwrap();
+    assert!(err.contains("being opened"), "{err}");
+    release.send(()).unwrap();
+    let loaded = loading.join().unwrap();
+    let ids = devices.finish_add(&mut engine, loaded).unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(engine.slots().len(), 4);
+    assert!(devices.begin_add(DeviceKind::Asio, "fake:slow").is_err(), "now it is open");
+}
