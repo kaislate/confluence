@@ -4,14 +4,19 @@
 
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use confluence_rt::ComApartment;
 use windows::core::{GUID, HRESULT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT,
+};
 
 use crate::convert::SampleFormat;
 use crate::io::Channel;
@@ -56,6 +61,9 @@ pub struct DriverInfo {
     /// Per channel; `None` = a format this host does not support.
     pub input_formats: Vec<Option<SampleFormat>>,
     pub output_formats: Vec<Option<SampleFormat>>,
+    /// Per channel, the ASIO sample type the driver reported (-1 if it did not say).
+    pub input_sample_types: Vec<AsioSampleType>,
+    pub output_sample_types: Vec<AsioSampleType>,
     pub min_block: i32,
     pub max_block: i32,
     pub preferred_block: i32,
@@ -127,9 +135,24 @@ enum Ctl {
     Close,
 }
 
+/// An auto-reset event that wakes the control thread when a request is sent.
+struct Wake(HANDLE);
+
+// SAFETY: kernel event handles may be signalled and waited on from any thread.
+unsafe impl Send for Wake {}
+unsafe impl Sync for Wake {}
+
+impl Drop for Wake {
+    fn drop(&mut self) {
+        // SAFETY: created by us, closed once.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
 /// A hosted ASIO driver. Dropping it stops the stream and releases the driver.
 pub struct AsioDevice {
     tx: Sender<Ctl>,
+    wake: Arc<Wake>,
     thread: Option<JoinHandle<()>>,
     info: DriverInfo,
     health: Arc<AsioHealth>,
@@ -141,14 +164,19 @@ impl AsioDevice {
     pub fn open(source: DriverSource) -> Result<Self, AsioHostError> {
         let (init_tx, init_rx) = sync_channel(1);
         let (tx, rx) = channel();
+        // SAFETY: plain unnamed auto-reset event.
+        let event = unsafe { CreateEventW(None, false, false, None) }
+            .map_err(|e| AsioHostError::Create(format!("CreateEvent: {}", e.message())))?;
+        let wake = Arc::new(Wake(event));
+        let thread_wake = wake.clone();
         let health = Arc::new(AsioHealth::default());
         let thread_health = health.clone();
         let thread = std::thread::Builder::new()
             .name("confluence-asio-control".into())
-            .spawn(move || control(source, init_tx, rx, thread_health))
+            .spawn(move || control(source, init_tx, rx, thread_wake, thread_health))
             .map_err(|e| AsioHostError::Create(e.to_string()))?;
         match init_rx.recv() {
-            Ok(Ok(info)) => Ok(Self { tx, thread: Some(thread), info, health, running: false }),
+            Ok(Ok(info)) => Ok(Self { tx, wake, thread: Some(thread), info, health, running: false }),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
@@ -195,10 +223,18 @@ impl AsioDevice {
         clock: fn() -> f64,
     ) -> Result<StreamInfo, AsioHostError> {
         let (reply, result) = sync_channel(1);
-        self.tx.send(Ctl::Start(cfg, callback, clock, reply)).map_err(|_| AsioHostError::Gone)?;
+        self.send(Ctl::Start(cfg, callback, clock, reply)).map_err(|_| AsioHostError::Gone)?;
         let info = result.recv().map_err(|_| AsioHostError::Gone)??;
         self.running = true;
         Ok(info)
+    }
+
+    /// Hands a request to the control thread and wakes it.
+    fn send(&self, ctl: Ctl) -> Result<(), ()> {
+        self.tx.send(ctl).map_err(|_| ())?;
+        // SAFETY: live event.
+        let _ = unsafe { SetEvent(self.wake.0) };
+        Ok(())
     }
 
     /// Stops streaming and disposes the driver's buffers; the callback is dropped here.
@@ -207,7 +243,7 @@ impl AsioDevice {
             return;
         }
         let (reply, done) = sync_channel(1);
-        if self.tx.send(Ctl::Stop(reply)).is_ok() {
+        if self.send(Ctl::Stop(reply)).is_ok() {
             let _ = done.recv();
         }
         self.running = false;
@@ -217,7 +253,7 @@ impl AsioDevice {
 impl Drop for AsioDevice {
     fn drop(&mut self) {
         self.stop();
-        let _ = self.tx.send(Ctl::Close);
+        let _ = self.send(Ctl::Close);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -368,6 +404,8 @@ fn init_and_query(d: &Driver) -> Result<DriverInfo, AsioHostError> {
             output_names: outputs.iter().map(|c| c.0.clone()).collect(),
             input_formats: inputs.iter().map(|c| c.1).collect(),
             output_formats: outputs.iter().map(|c| c.1).collect(),
+            input_sample_types: inputs.iter().map(|c| c.2).collect(),
+            output_sample_types: outputs.iter().map(|c| c.2).collect(),
             min_block: min,
             max_block: max,
             preferred_block: pref,
@@ -418,15 +456,16 @@ fn start_stream(
             granularity: info.granularity,
         });
     }
-    let formats = |names: &[String], fmts: &[Option<SampleFormat>]| -> Result<Vec<SampleFormat>, AsioHostError> {
+    let formats = |names: &[String], fmts: &[Option<SampleFormat>], types: &[AsioSampleType]| {
         names
             .iter()
             .zip(fmts)
-            .map(|(n, f)| f.ok_or_else(|| AsioHostError::Format { channel: n.clone(), sample_type: -1 }))
-            .collect()
+            .zip(types)
+            .map(|((n, f), &t)| f.ok_or_else(|| AsioHostError::Format { channel: n.clone(), sample_type: t }))
+            .collect::<Result<Vec<SampleFormat>, AsioHostError>>()
     };
-    let in_formats = formats(&info.input_names, &info.input_formats)?;
-    let out_formats = formats(&info.output_names, &info.output_formats)?;
+    let in_formats = formats(&info.input_names, &info.input_formats, &info.input_sample_types)?;
+    let out_formats = formats(&info.output_names, &info.output_formats, &info.output_sample_types)?;
 
     let slot = trampolines::claim().ok_or(AsioHostError::TooManyDrivers(MAX_DRIVERS))?;
     let null = [std::ptr::null_mut(); 2];
@@ -439,6 +478,7 @@ fn start_stream(
         post_output: AtomicBool::new(false),
         ready: AtomicBool::new(false),
         last_position: AtomicI64::new(i64::MIN),
+        consecutive_faults: AtomicU32::new(0),
         clock,
         health: health.clone(),
     }));
@@ -527,10 +567,34 @@ fn stop_stream(d: &Driver, s: Stream) {
     retire(s.slot, s.state);
 }
 
+/// Waits for the next request while dispatching window messages, as an STA
+/// thread must: some drivers post messages or set timers on the thread that
+/// created them and stall if nobody pumps. Returns `None` once the device is gone.
+fn next_request(rx: &Receiver<Ctl>, wake: &Wake) -> Option<Ctl> {
+    loop {
+        match rx.try_recv() {
+            Ok(msg) => return Some(msg),
+            Err(TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) => {}
+        }
+        // SAFETY: a live event handle; a timeout bounds the wait even if a wake is missed.
+        unsafe { MsgWaitForMultipleObjects(Some(&[wake.0]), false, 1_000, QS_ALLINPUT) };
+        let mut msg = MSG::default();
+        // SAFETY: standard message pump for this thread's queue.
+        unsafe {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}
+
 fn control(
     source: DriverSource,
     init: SyncSender<Result<DriverInfo, AsioHostError>>,
     rx: Receiver<Ctl>,
+    wake: Arc<Wake>,
     health: Arc<AsioHealth>,
 ) {
     let _com = match ComApartment::single_threaded() {
@@ -558,7 +622,7 @@ fn control(
         return;
     }
     let mut stream: Option<Stream> = None;
-    while let Ok(msg) = rx.recv() {
+    while let Some(msg) = next_request(&rx, &wake) {
         match msg {
             Ctl::Start(cfg, cb, clock, reply) => {
                 let result = if stream.is_some() {

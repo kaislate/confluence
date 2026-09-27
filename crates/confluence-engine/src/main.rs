@@ -67,7 +67,7 @@ mod app {
     /// Whatever drives the engine; dropping it stops the audio.
     enum Master {
         Internal(InternalClock),
-        Asio(AsioDevice),
+        Asio(Box<AsioDevice>),
     }
 
     fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -139,7 +139,7 @@ mod app {
                 }
                 devices.set_master(&name, ch)?;
                 eprintln!("confluence-engine: master asio:{name} at {rate} Hz, {block} frames");
-                Master::Asio(dev)
+                Master::Asio(Box::new(dev))
             }
             None => {
                 warnings.extend(devices.restore(&mut engine));

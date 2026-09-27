@@ -26,6 +26,11 @@ use crate::AsioCallback;
 
 pub const MAX_DRIVERS: usize = 16;
 
+/// A handler that panics this many blocks in a row is no longer called: its
+/// outputs stay silent and every block counts as a fault. This bounds how
+/// often a panic (and its hook) runs on the driver's real-time thread.
+pub const MAX_CONSECUTIVE_FAULTS: u32 = 8;
+
 /// Stream counters, readable from any thread.
 #[derive(Default, Debug)]
 pub struct AsioHealth {
@@ -52,6 +57,8 @@ pub(crate) struct SlotState {
     /// Set after buffers are recorded, cleared before they are disposed.
     pub ready: AtomicBool,
     pub last_position: AtomicI64,
+    /// Handler panics in a row (see [`MAX_CONSECUTIVE_FAULTS`]).
+    pub consecutive_faults: AtomicU32,
     pub clock: fn() -> f64,
     pub health: Arc<AsioHealth>,
 }
@@ -145,12 +152,19 @@ extern "C" fn buffer_switch_time_info<const N: usize>(
 }
 
 extern "C" fn sample_rate_did_change<const N: usize>(_rate: f64) {
-    if let Some((_inside, st)) = enter(N) {
-        st.health.rate_changes.fetch_add(1, Ordering::Relaxed);
-    }
+    // Every entry point is panic-guarded (spec §7.1): nothing may unwind into the driver.
+    let _ = catch_unwind(|| {
+        if let Some((_inside, st)) = enter(N) {
+            st.health.rate_changes.fetch_add(1, Ordering::Relaxed);
+        }
+    });
 }
 
-extern "C" fn asio_message<const N: usize>(selector: i32, value: i32, _message: *mut c_void, _opt: *mut f64) -> i32 {
+extern "C" fn asio_message<const N: usize>(selector: i32, value: i32, message: *mut c_void, opt: *mut f64) -> i32 {
+    catch_unwind(|| handle_message::<N>(selector, value, message, opt)).unwrap_or(0)
+}
+
+fn handle_message<const N: usize>(selector: i32, value: i32, _message: *mut c_void, _opt: *mut f64) -> i32 {
     let count = |f: fn(&AsioHealth) -> &AtomicU64| {
         if let Some((_inside, st)) = enter(N) {
             f(&st.health).fetch_add(1, Ordering::Relaxed);
@@ -267,7 +281,13 @@ fn run(st: &SlotState, half: usize, time: Option<*mut AsioTime>) {
         outputs,
         half,
     };
-    if catch_unwind(AssertUnwindSafe(|| callback.process(&mut io))).is_err() {
+    let faults_in_a_row = st.consecutive_faults.load(Ordering::Relaxed);
+    let ok = faults_in_a_row < MAX_CONSECUTIVE_FAULTS
+        && catch_unwind(AssertUnwindSafe(|| callback.process(&mut io))).is_ok();
+    if ok {
+        st.consecutive_faults.store(0, Ordering::Relaxed);
+    } else {
+        st.consecutive_faults.store(faults_in_a_row.saturating_add(1), Ordering::Relaxed);
         st.health.faults.fetch_add(1, Ordering::Relaxed);
         io.silence_outputs();
     }
@@ -310,6 +330,7 @@ mod tests {
             post_output: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             last_position: AtomicI64::new(i64::MIN),
+            consecutive_faults: AtomicU32::new(0),
             clock: || 0.0,
             health: Arc::default(),
         }))
