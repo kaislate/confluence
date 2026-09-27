@@ -149,8 +149,13 @@ fn without_the_engine_the_daw_keeps_running_on_silence() {
     dev.stop();
 }
 
+/// Every instance is taken by some test; the two tests on instance 6 take
+/// turns, so the stop test really runs without an engine.
+static INSTANCE_6: Mutex<()> = Mutex::new(());
+
 #[test]
 fn audio_goes_through_the_engine_and_back() {
+    let _instance = INSTANCE_6.lock().unwrap_or_else(|e| e.into_inner());
     confluence_provider_vasio::isolate_for_tests();
     let engine = Engine::start(6, 48_000.0, 256, 0.25);
     let mut dev = open(6);
@@ -299,16 +304,20 @@ fn an_engine_with_a_different_block_makes_the_daw_reset() {
 
 #[test]
 fn stopping_the_daw_is_prompt_even_while_looking_for_the_engine() {
+    let _instance = INSTANCE_6.lock().unwrap_or_else(|e| e.into_inner());
     confluence_provider_vasio::isolate_for_tests();
-    let mut worst = Duration::ZERO;
+    let mut waits = Vec::new();
     for _ in 0..5 {
-        // Instance 6's engine is not running in this test: the driver is looking for it.
+        // No engine runs on instance 6 now: the driver is looking for it.
         let mut dev = open(6);
         dev.start(StreamConfig::default(), loopback_daw(Arc::new(Seen::default()))).unwrap();
         std::thread::sleep(Duration::from_millis(250));
         let t = Instant::now();
         dev.stop();
-        worst = worst.max(t.elapsed());
+        waits.push(t.elapsed());
     }
-    assert!(worst < Duration::from_millis(40), "a DAW pressing stop waited {worst:?}");
+    // The median, so one stop delayed by a loaded machine does not fail the
+    // test; a prober that sleeps out its interval makes every stop wait ~50 ms.
+    waits.sort();
+    assert!(waits[2] < Duration::from_millis(25), "a DAW pressing stop waited {waits:?}");
 }
