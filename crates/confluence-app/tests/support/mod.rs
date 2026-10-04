@@ -1,0 +1,130 @@
+//! Helpers for UI tests: a real engine in a temp dir, and the app in a headless harness.
+#![allow(dead_code)]
+
+use std::path::PathBuf;
+use std::process::{Child, Command as Process, Stdio};
+use std::time::{Duration, Instant};
+
+use confluence_api::{Command, Response, SlotState};
+use confluence_app::app::{AppConfig, ConfluenceApp};
+use confluence_client::Client;
+use egui_kittest::Harness;
+
+/// `target/debug/confluence-engine.exe`, next to this test's `deps` folder.
+pub fn engine_exe() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let path = exe.parent().and_then(|d| d.parent()).unwrap().join("confluence-engine.exe");
+    assert!(path.is_file(), "{} is missing: run `cargo build -p confluence-engine` first", path.display());
+    path
+}
+
+/// A pipe name and a temp dir for one test's engine.
+pub struct EngineDir {
+    pub dir: tempfile::TempDir,
+    pub pipe: String,
+}
+
+impl EngineDir {
+    pub fn new(tag: &str) -> Self {
+        confluence_provider_vasio::isolate_for_tests(); // inherited by every engine started from here
+        EngineDir { dir: tempfile::tempdir().unwrap(), pipe: format!("confluence-ui-{tag}-{}", std::process::id()) }
+    }
+
+    pub fn args(&self) -> Vec<String> {
+        vec![
+            "--pipe".into(),
+            self.pipe.clone(),
+            "--journal".into(),
+            self.dir.path().join("journal.bin").display().to_string(),
+            "--devices".into(),
+            self.dir.path().join("devices.json").display().to_string(),
+        ]
+    }
+}
+
+/// An engine process, killed when dropped.
+pub struct Engine(Option<Child>);
+
+impl Engine {
+    pub fn spawn(d: &EngineDir) -> Engine {
+        let child = Process::new(engine_exe()).args(d.args()).stderr(Stdio::null()).spawn().unwrap();
+        Engine(Some(child))
+    }
+
+    pub fn kill(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Shuts down whatever engine serves the pipe (one the GUI started has no handle here).
+pub struct ShutdownOnDrop(pub String);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        if let Ok(mut c) = Client::connect(&self.0, Duration::from_millis(500)) {
+            let _ = c.call(Command::Shutdown);
+        }
+    }
+}
+
+pub fn client(d: &EngineDir) -> Client {
+    Client::connect(&d.pipe, Duration::from_secs(10)).unwrap()
+}
+
+pub fn slots(c: &mut Client) -> Vec<SlotState> {
+    match c.call(Command::ListSlots).unwrap() {
+        Response::Slots(s) => s,
+        other => panic!("{other:?}"),
+    }
+}
+
+pub fn app_for(d: &EngineDir) -> ConfluenceApp {
+    app_with_skin(d, None)
+}
+
+pub fn app_with_skin(d: &EngineDir, skin: Option<PathBuf>) -> ConfluenceApp {
+    ConfluenceApp::new(AppConfig { pipe: d.pipe.clone(), engine_exe: engine_exe(), engine_args: d.args(), skin })
+}
+
+pub fn harness(app: ConfluenceApp) -> Harness<'static, ConfluenceApp> {
+    harness_sized(app, 1200.0, 800.0)
+}
+
+/// A harness with a small window, so the grid scrolls.
+pub fn harness_sized(app: ConfluenceApp, w: f32, h: f32) -> Harness<'static, ConfluenceApp> {
+    Harness::builder().with_size([w, h]).build_ui_state(|ui, app: &mut ConfluenceApp| app.draw(ui), app)
+}
+
+/// Runs frames until `cond` holds, failing after `timeout`.
+pub fn pump_until(
+    h: &mut Harness<'static, ConfluenceApp>,
+    what: &str,
+    timeout: Duration,
+    mut cond: impl FnMut(&Harness<'static, ConfluenceApp>) -> bool,
+) {
+    let start = Instant::now();
+    loop {
+        h.step();
+        if cond(h) {
+            return;
+        }
+        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A few frames, for clicks to be processed.
+pub fn settle(h: &mut Harness<'static, ConfluenceApp>) {
+    for _ in 0..3 {
+        h.step();
+    }
+}

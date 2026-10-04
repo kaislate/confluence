@@ -1,0 +1,306 @@
+//! The inspector: the selected route, the selected slot (with clock health),
+//! or a summary when nothing is selected.
+
+use confluence_api::{ClockRole, PointState, SlotState, State};
+use confluence_client::{StoreView, HISTORY_LEN};
+use eframe::egui::{self, Button, Color32, DragValue, RichText, Slider};
+
+use crate::commands::Edit;
+use crate::graph::{plot, Series};
+use crate::matrix::{point_label, Selection};
+use crate::skin::Look;
+use crate::theme::{GAIN_MAX_DB, GAIN_MIN_DB, SHOWN_MAX_DB, SHOWN_MIN_DB};
+
+pub enum Action {
+    Edit(Edit),
+    /// Ask before removing this slot.
+    RemoveSlot(u32),
+}
+
+/// Routes with an end on one of the slot's channels.
+pub fn routes_of(state: &State, slot: &SlotState) -> usize {
+    let ins = slot.first_input..slot.first_input + slot.inputs;
+    let outs = slot.first_output..slot.first_output + slot.outputs;
+    state.points.iter().filter(|p| ins.contains(&p.input) || outs.contains(&p.output)).count()
+}
+
+fn range_text(first: u32, n: u32) -> String {
+    match n {
+        0 => "none".into(),
+        1 => format!("{}", first + 1),
+        _ => format!("{}–{}", first + 1, first + n),
+    }
+}
+
+pub fn show(
+    ui: &mut egui::Ui,
+    view: &StoreView,
+    look: &Look,
+    selection: &Selection,
+    point: Option<PointState>,
+    editable: bool,
+) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let Some(state) = &view.state else {
+        ui.label("Waiting for the engine…");
+        return actions;
+    };
+    ui.add_enabled_ui(editable, |ui| match *selection {
+        Selection::None => summary(ui, look, state),
+        Selection::Cell { input, output } => point_panel(ui, state, input, output, point, &mut actions),
+        Selection::Slot(id) => slot_panel(ui, look, view, state, id, &mut actions),
+    });
+    actions
+}
+
+fn summary(ui: &mut egui::Ui, look: &Look, state: &State) {
+    ui.heading("Engine");
+    ui.label(format!("{} slots · {} routes", state.slots.len(), state.points.len()));
+    for n in &state.notices {
+        ui.label(RichText::new(n).color(look.skin.colors.warn));
+    }
+    ui.add_space(8.0);
+    ui.label(RichText::new("Click a cell or a slot header to inspect it.").weak());
+}
+
+fn point_panel(
+    ui: &mut egui::Ui,
+    state: &State,
+    input: u32,
+    output: u32,
+    point: Option<PointState>,
+    actions: &mut Vec<Action>,
+) {
+    ui.heading(point_label(&state.slots, input, output));
+    let set =
+        |gain_db: f32, mute: bool, invert: bool| Action::Edit(Edit::SetPoint { input, output, gain_db, mute, invert });
+    match point {
+        Some(p) => {
+            // Separate values: the slider clamps what it is given to its
+            // −60…+12 range, which must not overwrite the real gain the
+            // number field shows (and edits from).
+            let mut slid = p.gain_db;
+            let mut typed = p.gain_db;
+            let slider =
+                ui.add(Slider::new(&mut slid, SHOWN_MIN_DB..=SHOWN_MAX_DB).text("Gain (dB)").show_value(false));
+            let field = ui.add(DragValue::new(&mut typed).range(GAIN_MIN_DB..=GAIN_MAX_DB).speed(0.1).suffix(" dB"));
+            let gain = if field.changed() {
+                typed
+            } else if slider.changed() {
+                slid
+            } else {
+                p.gain_db
+            };
+            if gain != p.gain_db {
+                actions.push(set(gain, p.mute, p.invert));
+            }
+            let (mut mute, mut invert) = (p.mute, p.invert);
+            if ui.checkbox(&mut mute, "Mute").changed() {
+                actions.push(set(p.gain_db, mute, p.invert));
+            }
+            if ui.checkbox(&mut invert, "Invert").changed() {
+                actions.push(set(p.gain_db, p.mute, invert));
+            }
+            if ui.button("Remove route").clicked() {
+                actions.push(Action::Edit(Edit::RemovePoint { input, output }));
+            }
+        }
+        None => {
+            ui.label("No route");
+            if ui.button("Route at 0 dB").clicked() {
+                actions.push(set(0.0, false, false));
+            }
+        }
+    }
+}
+
+fn slot_panel(ui: &mut egui::Ui, look: &Look, view: &StoreView, state: &State, id: u32, actions: &mut Vec<Action>) {
+    let c = &look.skin.colors;
+    let (accent, warn, error) = (c.accent, c.warn, c.error);
+    let Some(slot) = state.slots.iter().find(|s| s.id == id) else {
+        ui.label("Slot removed");
+        return;
+    };
+    ui.heading(&slot.name);
+    ui.label(format!("Device: {}", if slot.device.is_empty() { "—" } else { slot.device.as_str() }));
+    ui.label(format!("Role: {:?}", slot.role));
+    if slot.online {
+        ui.label("Online");
+    } else {
+        ui.label(RichText::new("OFFLINE").color(warn).strong());
+    }
+    ui.label(format!(
+        "in {} · out {}",
+        range_text(slot.first_input, slot.inputs),
+        range_text(slot.first_output, slot.outputs)
+    ));
+    if let Some(h) = view.health.iter().find(|h| h.id == id) {
+        if h.device_lost {
+            ui.label(RichText::new("Device lost: its channels are silent until it returns").color(error).strong());
+        }
+        if h.attached == Some(false) {
+            ui.label(h.idle_note.as_deref().unwrap_or("nothing attached"));
+        }
+        ui.separator();
+        ui.label(RichText::new("Clock health").strong());
+        let samples = view.history.get(&id);
+        let bridged = samples.is_some_and(|r| r.iter().flatten().any(|s| s.target > 0.0));
+        match (slot.role, bridged, samples) {
+            (ClockRole::Master, false, _) => {
+                ui.label("Master clock (no bridge)");
+            }
+            (_, true, Some(ring)) => {
+                let col = |f: fn(&confluence_client::HealthSample) -> f64| {
+                    ring.iter().map(|s| s.as_ref().map(f)).collect::<Vec<_>>()
+                };
+                plot(
+                    ui,
+                    "Fill and target graph",
+                    80.0,
+                    HISTORY_LEN,
+                    &[
+                        Series { name: "fill", color: accent, values: col(|s| s.fill) },
+                        Series { name: "target", color: Color32::GRAY, values: col(|s| s.target) },
+                    ],
+                );
+                plot(
+                    ui,
+                    "Drift and correction graph",
+                    80.0,
+                    HISTORY_LEN,
+                    &[
+                        Series { name: "device ppm", color: warn, values: col(|s| s.ppm) },
+                        Series { name: "correction ppm", color: accent, values: col(|s| s.correction) },
+                    ],
+                );
+            }
+            _ => {
+                ui.label("No clock bridge (runs on the engine clock)");
+            }
+        }
+        ui.label(format!("Underruns {} · Overruns {}", h.underruns, h.overruns));
+        if h.device_faults > 0 {
+            ui.label(RichText::new(format!("Device faults {}", h.device_faults)).color(error));
+        }
+        if h.driver_requests > 0 {
+            ui.label(RichText::new(format!("{} driver requests (re-add the device)", h.driver_requests)).color(warn));
+        }
+    }
+    ui.separator();
+    if ui.add(Button::new("Remove slot…")).clicked() {
+        actions.push(Action::RemoveSlot(id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use confluence_api::{ClockRole, EngineStatus};
+
+    fn slot(id: u32, first_input: u32, inputs: u32, first_output: u32, outputs: u32) -> SlotState {
+        SlotState {
+            id,
+            name: format!("S{id}"),
+            device: String::new(),
+            role: ClockRole::Soft,
+            online: true,
+            first_input,
+            inputs,
+            first_output,
+            outputs,
+        }
+    }
+
+    #[test]
+    fn a_slots_routes_are_those_on_its_channels() {
+        let a = slot(1, 0, 2, 0, 2);
+        let b = slot(2, 2, 2, 2, 2);
+        let p = |input, output| PointState { input, output, gain_db: 0.0, mute: false, invert: false };
+        let state = State {
+            version: 0,
+            status: EngineStatus {
+                master: "internal".into(),
+                sample_rate: 48_000.0,
+                block: 256,
+                blocks: 0,
+                dsp_load: 0.0,
+                xruns: 0,
+            },
+            slots: vec![a.clone(), b.clone()],
+            points: vec![p(0, 2), p(1, 1), p(3, 3)],
+            devices: Vec::new(),
+            notices: Vec::new(),
+        };
+        assert_eq!(routes_of(&state, &a), 2, "0→2 (its input) and 1→1 (both)");
+        assert_eq!(routes_of(&state, &b), 2, "0→2 (its output) and 3→3");
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use confluence_api::{ClockRole, EngineStatus};
+    use confluence_client::{ConnState, History};
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::Harness;
+    use std::sync::Arc;
+
+    fn view_with(point: PointState) -> StoreView {
+        let slot = SlotState {
+            id: 1,
+            name: "S".into(),
+            device: String::new(),
+            role: ClockRole::Soft,
+            online: true,
+            first_input: 0,
+            inputs: 2,
+            first_output: 0,
+            outputs: 2,
+        };
+        StoreView {
+            state: Some(State {
+                version: 1,
+                status: EngineStatus {
+                    master: "internal".into(),
+                    sample_rate: 48_000.0,
+                    block: 256,
+                    blocks: 0,
+                    dsp_load: 0.0,
+                    xruns: 0,
+                },
+                slots: vec![slot],
+                points: vec![point],
+                devices: Vec::new(),
+                notices: Vec::new(),
+            }),
+            conn: ConnState::Live,
+            status: None,
+            health: Vec::new(),
+            history: Arc::new(History::new()),
+            last_event: None,
+        }
+    }
+
+    /// A route quieter than the slider's range must still show its real gain
+    /// in the number field (and nudging it must start from that value).
+    #[test]
+    fn a_gain_outside_the_slider_range_is_shown_as_it_is() {
+        let pt = PointState { input: 0, output: 0, gain_db: -80.0, mute: false, invert: false };
+        let view = view_with(pt.clone());
+        let look = Look::builtin();
+        let sel = Selection::Cell { input: 0, output: 0 };
+        let mut sent = Vec::new();
+        let mut h = Harness::new_ui(|ui| {
+            for a in show(ui, &view, &look, &sel, Some(pt.clone()), true) {
+                if let Action::Edit(e) = a {
+                    sent.push(e);
+                }
+            }
+        });
+        h.run();
+        let field = h.get_by_role(eframe::egui::accesskit::Role::SpinButton).value();
+        assert_eq!(field.as_deref(), Some("-80.0 dB"), "the number field shows the real gain");
+        drop(h);
+        assert!(sent.is_empty(), "showing the panel sends nothing: {sent:?}");
+    }
+}

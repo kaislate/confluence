@@ -1,0 +1,27 @@
+[package]
+name = "confluence-app"
+version = "0.1.0"
+description = "Confluence desktop GUI"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "confluence"
+path = "src/main.rs"
+
+[dependencies]
+confluence-api = { path = "../confluence-api" }
+confluence-client = { path = "../confluence-client" }
+eframe = { version = "0.36", features = ["persistence"] }
+serde.workspace = true
+toml = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+egui_kittest = "0.36"
+tempfile = "3"
+confluence-provider-vasio = { path = "../confluence-provider-vasio" }
+
+[lints]
+workspace = true
