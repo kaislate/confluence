@@ -26,6 +26,33 @@ pub const SLOT_COLORS: [Color32; 8] = [
     Color32::from_rgb(120, 144, 230),
 ];
 
+/// The fader's knee: below this position the travel is compressed.
+pub const FADER_KNEE: f32 = 0.25;
+/// The gain at the knee.
+pub const FADER_KNEE_DB: f32 = -30.0;
+
+/// The gain at fader position `pos` (0..=1), like a mixing desk's fader: the
+/// upper three quarters cover −30…+12 dB (fine steps around 0 dB), the bottom
+/// quarter −60…−30 dB.
+pub fn fader_db(pos: f32) -> f32 {
+    let pos = pos.clamp(0.0, 1.0);
+    if pos >= FADER_KNEE {
+        FADER_KNEE_DB + (pos - FADER_KNEE) / (1.0 - FADER_KNEE) * (SHOWN_MAX_DB - FADER_KNEE_DB)
+    } else {
+        SHOWN_MIN_DB + pos / FADER_KNEE * (FADER_KNEE_DB - SHOWN_MIN_DB)
+    }
+}
+
+/// The fader position of `db` (the inverse of [`fader_db`]; clamped to the travel).
+pub fn fader_pos(db: f32) -> f32 {
+    let db = if db.is_finite() { db.clamp(SHOWN_MIN_DB, SHOWN_MAX_DB) } else { 0.0 };
+    if db >= FADER_KNEE_DB {
+        FADER_KNEE + (db - FADER_KNEE_DB) / (SHOWN_MAX_DB - FADER_KNEE_DB) * (1.0 - FADER_KNEE)
+    } else {
+        (db - SHOWN_MIN_DB) / (FADER_KNEE_DB - SHOWN_MIN_DB) * FADER_KNEE
+    }
+}
+
 /// Clamps to the engine's range; a non-number becomes 0 dB.
 pub fn clamp_gain(db: f32) -> f32 {
     if db.is_finite() {
@@ -104,6 +131,23 @@ mod tests {
         assert_eq!(dsp_color(0.5), None);
         assert_eq!(dsp_color(0.7), Some(WARN));
         assert_eq!(dsp_color(0.95), Some(ERROR));
+    }
+
+    #[test]
+    fn the_fader_is_fine_near_zero_db_and_coarse_at_the_bottom() {
+        assert_eq!(fader_db(0.0), SHOWN_MIN_DB);
+        assert_eq!(fader_db(1.0), SHOWN_MAX_DB);
+        assert_eq!(fader_db(FADER_KNEE), FADER_KNEE_DB);
+        let zero = fader_pos(0.0);
+        assert!((0.75..0.85).contains(&zero), "0 dB sits high on the travel: {zero}");
+        for i in 0..=100 {
+            let pos = i as f32 / 100.0;
+            assert!((fader_pos(fader_db(pos)) - pos).abs() < 1e-4, "round trip at {pos}");
+        }
+        let near_top = fader_db(0.81) - fader_db(0.80);
+        let near_bottom = fader_db(0.11) - fader_db(0.10);
+        assert!(near_top > 0.0 && near_top < near_bottom / 2.0, "{near_top} vs {near_bottom} dB per step");
+        assert_eq!(fader_pos(-100.0), 0.0, "below the travel: the bottom");
     }
 
     #[test]

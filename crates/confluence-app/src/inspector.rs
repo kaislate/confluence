@@ -9,7 +9,7 @@ use crate::commands::Edit;
 use crate::graph::{plot, Series};
 use crate::matrix::{point_label, Selection};
 use crate::skin::Look;
-use crate::theme::{GAIN_MAX_DB, GAIN_MIN_DB, SHOWN_MAX_DB, SHOWN_MIN_DB};
+use crate::theme::{fader_db, fader_pos, GAIN_MAX_DB, GAIN_MIN_DB};
 
 pub enum Action {
     Edit(Edit),
@@ -76,18 +76,17 @@ fn point_panel(
         |gain_db: f32, mute: bool, invert: bool| Action::Edit(Edit::SetPoint { input, output, gain_db, mute, invert });
     match point {
         Some(p) => {
-            // Separate values: the slider clamps what it is given to its
-            // −60…+12 range, which must not overwrite the real gain the
-            // number field shows (and edits from).
-            let mut slid = p.gain_db;
+            // The slider moves a fader position (fine steps near 0 dB, see
+            // `fader_db`); the number field shows and edits the real gain, so
+            // the slider's range never overwrites a gain outside it.
+            let mut pos = fader_pos(p.gain_db);
             let mut typed = p.gain_db;
-            let slider =
-                ui.add(Slider::new(&mut slid, SHOWN_MIN_DB..=SHOWN_MAX_DB).text("Gain (dB)").show_value(false));
+            let slider = ui.add(Slider::new(&mut pos, 0.0..=1.0).text("Gain (dB)").show_value(false));
             let field = ui.add(DragValue::new(&mut typed).range(GAIN_MIN_DB..=GAIN_MAX_DB).speed(0.1).suffix(" dB"));
             let gain = if field.changed() {
                 typed
             } else if slider.changed() {
-                slid
+                (fader_db(pos) * 10.0).round() / 10.0 // 0.1 dB steps
             } else {
                 p.gain_db
             };

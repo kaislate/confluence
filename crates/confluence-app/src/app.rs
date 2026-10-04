@@ -24,6 +24,9 @@ pub const INSPECTOR_KEY: &str = "inspector_open";
 const QUIET: Duration = Duration::from_secs(2);
 /// Reconnecting for this long: offer Start engine too.
 const OFFER_START_AFTER: Duration = Duration::from_secs(3);
+/// A press that moves further than this before release is a drag, not a
+/// click (spec §4.1; egui's default is 6 px).
+const CLICK_DIST: f32 = 3.0;
 /// The xrun count flashes for this long after it rises.
 const XRUN_FLASH: Duration = Duration::from_secs(1);
 
@@ -268,6 +271,7 @@ impl ConfluenceApp {
                     }
                 }
                 self.look.apply(&ctx);
+                ctx.options_mut(|o| o.input_options.max_click_dist = CLICK_DIST);
                 *r = Some(ctx.clone());
             }
         }
