@@ -2,7 +2,9 @@
 //! or a summary when nothing is selected.
 
 use confluence_api::{ClockRole, PointState, SlotState, State};
-use confluence_client::{StoreView, HISTORY_LEN};
+use std::collections::VecDeque;
+
+use confluence_client::{HealthSample, StoreView, HISTORY_LEN};
 use eframe::egui::{self, Button, Color32, DragValue, RichText, Slider};
 
 use crate::commands::Edit;
@@ -38,6 +40,7 @@ pub fn show(
     look: &Look,
     selection: &Selection,
     point: Option<PointState>,
+    history: Option<&VecDeque<Option<HealthSample>>>,
     editable: bool,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
@@ -48,7 +51,7 @@ pub fn show(
     ui.add_enabled_ui(editable, |ui| match *selection {
         Selection::None => summary(ui, look, state),
         Selection::Cell { input, output } => point_panel(ui, state, input, output, point, &mut actions),
-        Selection::Slot(id) => slot_panel(ui, look, view, state, id, &mut actions),
+        Selection::Slot(id) => slot_panel(ui, look, view, history, state, id, &mut actions),
     });
     actions
 }
@@ -113,7 +116,15 @@ fn point_panel(
     }
 }
 
-fn slot_panel(ui: &mut egui::Ui, look: &Look, view: &StoreView, state: &State, id: u32, actions: &mut Vec<Action>) {
+fn slot_panel(
+    ui: &mut egui::Ui,
+    look: &Look,
+    view: &StoreView,
+    history: Option<&VecDeque<Option<HealthSample>>>,
+    state: &State,
+    id: u32,
+    actions: &mut Vec<Action>,
+) {
     let c = &look.skin.colors;
     let (accent, warn, error) = (c.accent, c.warn, c.error);
     let Some(slot) = state.slots.iter().find(|s| s.id == id) else {
@@ -142,7 +153,7 @@ fn slot_panel(ui: &mut egui::Ui, look: &Look, view: &StoreView, state: &State, i
         }
         ui.separator();
         ui.label(RichText::new("Clock health").strong());
-        let samples = view.history.get(&id);
+        let samples = history;
         let bridged = samples.is_some_and(|r| r.iter().flatten().any(|s| s.target > 0.0));
         match (slot.role, bridged, samples) {
             (ClockRole::Master, false, _) => {
@@ -239,10 +250,9 @@ mod tests {
 mod display_tests {
     use super::*;
     use confluence_api::{ClockRole, EngineStatus};
-    use confluence_client::{ConnState, History};
+    use confluence_client::ConnState;
     use egui_kittest::kittest::Queryable;
     use egui_kittest::Harness;
-    use std::sync::Arc;
 
     fn view_with(point: PointState) -> StoreView {
         let slot = SlotState {
@@ -275,7 +285,6 @@ mod display_tests {
             conn: ConnState::Live,
             status: None,
             health: Vec::new(),
-            history: Arc::new(History::new()),
             last_event: None,
             snapshots: 1,
         }
@@ -291,7 +300,7 @@ mod display_tests {
         let sel = Selection::Cell { input: 0, output: 0 };
         let mut sent = Vec::new();
         let mut h = Harness::new_ui(|ui| {
-            for a in show(ui, &view, &look, &sel, Some(pt.clone()), true) {
+            for a in show(ui, &view, &look, &sel, Some(pt.clone()), None, true) {
                 if let Action::Edit(e) = a {
                     sent.push(e);
                 }

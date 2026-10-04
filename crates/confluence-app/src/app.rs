@@ -427,6 +427,11 @@ impl ConfluenceApp {
             _ => None,
         };
         let selection = self.selection;
+        // Only the inspected slot's history is copied, once per frame.
+        let history = match selection {
+            Selection::Slot(id) => self.store.history_of(id),
+            _ => None,
+        };
         let look = &self.look;
         let actions = egui::Panel::right("inspector")
             .resizable(true)
@@ -434,7 +439,9 @@ impl ConfluenceApp {
             .show(ui, |ui| {
                 look.paint_surface(ui.painter(), ui.max_rect(), "panel", look.skin.colors.panel);
                 egui::ScrollArea::vertical()
-                    .show(ui, |ui| crate::inspector::show(ui, view, look, &selection, point, editable))
+                    .show(ui, |ui| {
+                        crate::inspector::show(ui, view, look, &selection, point, history.as_ref(), editable)
+                    })
                     .inner
             })
             .inner;
