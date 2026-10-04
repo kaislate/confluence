@@ -3,11 +3,12 @@
 //! that subscribes, applies, and reconnects with a fresh snapshot after any
 //! error or version gap.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use confluence_api::{EngineStatus, Event, SlotHealth, State};
+use confluence_api::{Change, EngineStatus, Event, SlotHealth, State};
 
 use crate::Subscription;
 
@@ -17,12 +18,18 @@ pub const HISTORY_LEN: usize = 600;
 /// First and longest wait between reconnect attempts.
 const BACKOFF_MIN: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// How long one connection attempt waits for the pipe.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub enum ConnState {
+    /// No engine reached yet.
     Connecting,
     Live,
-    Reconnecting { since: Instant },
+    /// A live connection was lost.
+    Reconnecting {
+        since: Instant,
+    },
 }
 
 /// One slot's telemetry at one moment.
@@ -36,6 +43,9 @@ pub struct HealthSample {
     pub overruns: u64,
 }
 
+/// Per slot, oldest first; `None` is a gap (disconnected).
+pub type History = BTreeMap<u32, VecDeque<Option<HealthSample>>>;
+
 /// Everything a front end draws from, consistent for one frame.
 #[derive(Clone, Debug)]
 pub struct StoreView {
@@ -46,8 +56,10 @@ pub struct StoreView {
     pub status: Option<EngineStatus>,
     /// The latest per-slot health.
     pub health: Vec<SlotHealth>,
-    /// Per slot, oldest first; `None` is a gap (disconnected).
-    pub history: BTreeMap<u32, VecDeque<Option<HealthSample>>>,
+    /// Shared between views, so cloning a view is cheap; replaced only by telemetry.
+    pub history: Arc<History>,
+    /// When anything (snapshot or event) last arrived from the engine.
+    pub last_event: Option<Instant>,
 }
 
 /// A versioned event that did not follow the last version.
@@ -58,6 +70,7 @@ pub struct Gap;
 pub struct Store {
     view: StoreView,
     gap_pending: bool,
+    ever_live: bool,
 }
 
 impl Default for Store {
@@ -74,20 +87,29 @@ impl Store {
                 conn: ConnState::Connecting,
                 status: None,
                 health: Vec::new(),
-                history: BTreeMap::new(),
+                history: Arc::new(History::new()),
+                last_event: None,
             },
             gap_pending: false,
+            ever_live: false,
         }
     }
 
-    /// A (re)subscription's snapshot: replaces the state entirely.
-    pub fn snapshot(&mut self, s: State) {
+    /// A (re)subscription's snapshot: replaces the state entirely and drops
+    /// the history of slots it no longer has.
+    pub fn snapshot(&mut self, s: State, now: Instant) {
+        let ids: BTreeSet<u32> = s.slots.iter().map(|slot| slot.id).collect();
+        if self.view.history.keys().any(|id| !ids.contains(id)) {
+            Arc::make_mut(&mut self.view.history).retain(|id, _| ids.contains(id));
+        }
         self.view.status = Some(s.status.clone());
         self.view.state = Some(s);
         self.view.conn = ConnState::Live;
+        self.view.last_event = Some(now);
+        self.ever_live = true;
     }
 
-    pub fn event(&mut self, e: Event) -> Result<(), Gap> {
+    pub fn event(&mut self, e: Event, now: Instant) -> Result<(), Gap> {
         match e {
             Event::Changed { version, changes } => {
                 let state = self.view.state.as_mut().ok_or(Gap)?;
@@ -96,10 +118,24 @@ impl Store {
                 }
                 state.apply(&changes);
                 state.version = version;
+                let removed: Vec<u32> = changes
+                    .iter()
+                    .filter_map(|c| match c {
+                        Change::SlotRemoved { id } => Some(*id),
+                        _ => None,
+                    })
+                    .collect();
+                if removed.iter().any(|id| self.view.history.contains_key(id)) {
+                    let history = Arc::make_mut(&mut self.view.history);
+                    for id in removed {
+                        history.remove(&id);
+                    }
+                }
             }
             Event::Telemetry { status, health } => {
+                let history = Arc::make_mut(&mut self.view.history);
                 for h in &health {
-                    let ring = self.view.history.entry(h.id).or_default();
+                    let ring = history.entry(h.id).or_default();
                     if self.gap_pending {
                         ring.push_back(None);
                     }
@@ -120,11 +156,17 @@ impl Store {
                 self.view.health = health;
             }
         }
+        self.view.last_event = Some(now);
         Ok(())
     }
 
-    /// The connection ended; the state stays (stale) until the next snapshot.
+    /// The connection ended (or an attempt failed). The state stays, stale,
+    /// until the next snapshot. Before any engine was reached this stays
+    /// `Connecting`.
     pub fn disconnected(&mut self, now: Instant) {
+        if !self.ever_live {
+            return;
+        }
         if !matches!(self.view.conn, ConnState::Reconnecting { .. }) {
             self.view.conn = ConnState::Reconnecting { since: now };
         }
@@ -136,17 +178,20 @@ impl Store {
     }
 }
 
-/// [`Store`] on a thread that keeps it connected to the engine. The thread
-/// runs for the rest of the process (a front end keeps one store).
+/// [`Store`] on a thread that keeps it connected to the engine. Dropping it
+/// stops the thread: at once while it is waiting to reconnect, otherwise at
+/// the next event (telemetry arrives every 100 ms from a live engine).
 pub struct StateStore {
     shared: Arc<Mutex<Arc<StoreView>>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl StateStore {
     /// Starts following the engine on `pipe`; `on_change` runs after every update.
     pub fn spawn(pipe: String, on_change: Box<dyn Fn() + Send + Sync>) -> StateStore {
         let shared = Arc::new(Mutex::new(Arc::new(Store::new().view())));
-        let out = shared.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (out, stopping) = (shared.clone(), stop.clone());
         let _ = std::thread::Builder::new().name("confluence-state-store".into()).spawn(move || {
             let mut store = Store::new();
             let mut backoff = BACKOFF_MIN;
@@ -156,27 +201,31 @@ impl StateStore {
                 }
                 on_change();
             };
-            loop {
-                match Subscription::connect(&pipe, Duration::from_millis(500)) {
-                    Ok((snapshot, mut sub)) => {
-                        backoff = BACKOFF_MIN;
-                        store.snapshot(snapshot);
-                        update(&store);
-                        while let Ok(e) = sub.recv() {
-                            if store.event(e).is_err() {
-                                break; // gap: resubscribe for a fresh snapshot
-                            }
-                            update(&store);
+            while !stopping.load(Ordering::SeqCst) {
+                if let Ok((snapshot, mut sub)) = Subscription::connect(&pipe, CONNECT_TIMEOUT) {
+                    backoff = BACKOFF_MIN;
+                    store.snapshot(snapshot, Instant::now());
+                    update(&store);
+                    while let Ok(e) = sub.recv() {
+                        if stopping.load(Ordering::SeqCst) {
+                            return;
                         }
+                        if store.event(e, Instant::now()).is_err() {
+                            break; // gap: resubscribe (after the backoff) for a fresh snapshot
+                        }
+                        update(&store);
                     }
-                    Err(_) => std::thread::sleep(backoff),
+                }
+                if stopping.load(Ordering::SeqCst) {
+                    return;
                 }
                 store.disconnected(Instant::now());
                 update(&store);
+                std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         });
-        StateStore { shared }
+        StateStore { shared, stop }
     }
 
     /// A consistent view for one UI frame.
@@ -188,10 +237,16 @@ impl StateStore {
     }
 }
 
+impl Drop for StateStore {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use confluence_api::{Change, PointState};
+    use confluence_api::{Change, ClockRole, PointState, SlotState};
 
     fn status() -> EngineStatus {
         EngineStatus {
@@ -204,11 +259,25 @@ mod tests {
         }
     }
 
-    fn state(version: u64) -> State {
+    fn slot(id: u32) -> SlotState {
+        SlotState {
+            id,
+            name: format!("slot {id}"),
+            device: String::new(),
+            role: ClockRole::Soft,
+            online: true,
+            first_input: 0,
+            inputs: 2,
+            first_output: 0,
+            outputs: 2,
+        }
+    }
+
+    fn state(version: u64, slots: &[u32]) -> State {
         State {
             version,
             status: status(),
-            slots: Vec::new(),
+            slots: slots.iter().map(|&id| slot(id)).collect(),
             points: Vec::new(),
             devices: Vec::new(),
             notices: Vec::new(),
@@ -236,12 +305,17 @@ mod tests {
         Change::PointSet(PointState { input: i, output: 0, gain_db: 0.0, mute: false, invert: false })
     }
 
+    fn telemetry(ids: &[u32], fill: f64) -> Event {
+        Event::Telemetry { status: status(), health: ids.iter().map(|&id| health(id, fill)).collect() }
+    }
+
     #[test]
     fn events_apply_on_top_of_the_snapshot() {
         let mut s = Store::new();
+        let now = Instant::now();
         assert!(matches!(s.view().conn, ConnState::Connecting));
-        s.snapshot(state(4));
-        s.event(Event::Changed { version: 5, changes: vec![set(1)] }).unwrap();
+        s.snapshot(state(4, &[]), now);
+        s.event(Event::Changed { version: 5, changes: vec![set(1)] }, now).unwrap();
         let v = s.view();
         assert!(matches!(v.conn, ConnState::Live));
         assert_eq!(v.state.as_ref().unwrap().version, 5);
@@ -251,22 +325,23 @@ mod tests {
     #[test]
     fn a_version_gap_is_reported() {
         let mut s = Store::new();
-        s.snapshot(state(4));
-        assert!(s.event(Event::Changed { version: 6, changes: vec![set(1)] }).is_err());
+        s.snapshot(state(4, &[]), Instant::now());
+        assert!(s.event(Event::Changed { version: 6, changes: vec![set(1)] }, Instant::now()).is_err());
     }
 
     #[test]
     fn telemetry_builds_bounded_history_with_gaps_for_disconnects() {
         let mut s = Store::new();
-        s.snapshot(state(0));
+        let now = Instant::now();
+        s.snapshot(state(0, &[1]), now);
         for i in 0..(HISTORY_LEN + 5) {
-            s.event(Event::Telemetry { status: status(), health: vec![health(1, i as f64)] }).unwrap();
+            s.event(telemetry(&[1], i as f64), now).unwrap();
         }
         assert_eq!(s.view().history[&1].len(), HISTORY_LEN);
-        s.disconnected(Instant::now());
+        s.disconnected(now);
         assert!(matches!(s.view().conn, ConnState::Reconnecting { .. }));
-        s.snapshot(state(0));
-        s.event(Event::Telemetry { status: status(), health: vec![health(1, 7.0)] }).unwrap();
+        s.snapshot(state(0, &[1]), now);
+        s.event(telemetry(&[1], 7.0), now).unwrap();
         let v = s.view();
         let h = &v.history[&1];
         assert_eq!(h.len(), HISTORY_LEN, "still bounded with the gap");
@@ -277,10 +352,82 @@ mod tests {
     #[test]
     fn a_fresh_snapshot_replaces_stale_state() {
         let mut s = Store::new();
-        s.snapshot(state(0));
-        s.event(Event::Changed { version: 1, changes: vec![set(9)] }).unwrap();
-        s.disconnected(Instant::now());
-        s.snapshot(state(0)); // a restarted engine starts again at 0
+        let now = Instant::now();
+        s.snapshot(state(0, &[]), now);
+        s.event(Event::Changed { version: 1, changes: vec![set(9)] }, now).unwrap();
+        s.disconnected(now);
+        s.snapshot(state(0, &[]), now); // a restarted engine starts again at 0
         assert!(s.view().state.unwrap().points.is_empty(), "no stale point survives");
+    }
+
+    #[test]
+    fn it_stays_connecting_until_the_first_snapshot() {
+        let mut s = Store::new();
+        let now = Instant::now();
+        s.disconnected(now);
+        s.disconnected(now);
+        assert!(matches!(s.view().conn, ConnState::Connecting), "never reached an engine");
+        s.snapshot(state(0, &[]), now);
+        s.disconnected(now);
+        assert!(matches!(s.view().conn, ConnState::Reconnecting { .. }));
+    }
+
+    #[test]
+    fn last_event_tracks_snapshots_and_events() {
+        let mut s = Store::new();
+        assert!(s.view().last_event.is_none());
+        let t0 = Instant::now();
+        s.snapshot(state(0, &[1]), t0);
+        assert_eq!(s.view().last_event, Some(t0));
+        let t1 = t0 + Duration::from_millis(100);
+        s.event(telemetry(&[1], 1.0), t1).unwrap();
+        assert_eq!(s.view().last_event, Some(t1));
+    }
+
+    #[test]
+    fn removed_slots_lose_their_history() {
+        let mut s = Store::new();
+        let now = Instant::now();
+        s.snapshot(state(0, &[1, 2]), now);
+        s.event(telemetry(&[1, 2], 1.0), now).unwrap();
+        s.event(Event::Changed { version: 1, changes: vec![Change::SlotRemoved { id: 2 }] }, now).unwrap();
+        assert!(!s.view().history.contains_key(&2), "removed by the event");
+        s.disconnected(now);
+        s.snapshot(state(0, &[]), now);
+        assert!(s.view().history.is_empty(), "pruned by a snapshot without the slot");
+    }
+
+    #[test]
+    fn views_share_history_until_telemetry_changes_it() {
+        let mut s = Store::new();
+        let now = Instant::now();
+        s.snapshot(state(0, &[1]), now);
+        s.event(telemetry(&[1], 1.0), now).unwrap();
+        let a = s.view();
+        s.event(Event::Changed { version: 1, changes: vec![set(3)] }, now).unwrap();
+        let b = s.view();
+        assert!(Arc::ptr_eq(&a.history, &b.history), "a change event does not copy the history");
+        s.event(telemetry(&[1], 2.0), now).unwrap();
+        assert!(!Arc::ptr_eq(&b.history, &s.view().history));
+    }
+
+    #[test]
+    fn dropping_the_store_stops_its_thread() {
+        let guard = Arc::new(());
+        let held = guard.clone();
+        let store = StateStore::spawn(
+            format!("confluence-no-engine-{}", std::process::id()),
+            Box::new(move || {
+                let _ = &held;
+            }),
+        );
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(matches!(store.view().conn, ConnState::Connecting), "no engine was ever reached");
+        drop(store);
+        let start = Instant::now();
+        while Arc::strong_count(&guard) > 1 {
+            assert!(start.elapsed() < Duration::from_secs(5), "the store's thread is still running");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
