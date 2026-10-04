@@ -81,6 +81,8 @@ pub struct ConfluenceApp {
     skin_dir: Option<PathBuf>,
     /// A slot waiting for "Remove ‹name›?" to be confirmed.
     confirm_remove: Option<u32>,
+    devices_open: bool,
+    devices: crate::devices::DevicesState,
 }
 
 impl ConfluenceApp {
@@ -117,6 +119,8 @@ impl ConfluenceApp {
             look: Look::builtin(),
             skin_dir: config.skin,
             confirm_remove: None,
+            devices_open: false,
+            devices: crate::devices::DevicesState::default(),
         }
     }
 
@@ -153,11 +157,22 @@ impl ConfluenceApp {
         }
     }
 
-    /// Extended by the devices panel (Task 9).
-    fn on_done(&mut self, _edit: &Edit, _ids: &[u32], _now: Instant) {}
+    fn on_done(&mut self, edit: &Edit, ids: &[u32], now: Instant) {
+        if let Edit::AddDevice { kind, name } = edit {
+            let base = crate::devices::base_name(*kind, name);
+            self.devices.adding.remove(&(*kind, base.clone()));
+            self.notes.info(format!("Added {} {}", crate::devices::kind_title(*kind), base), now);
+            if let Some(id) = ids.first() {
+                self.selection = Selection::Slot(*id);
+            }
+        }
+    }
 
-    /// Extended by the devices panel (Task 9).
-    fn on_failed(&mut self, _edit: &Edit, _now: Instant) {}
+    fn on_failed(&mut self, edit: &Edit, _now: Instant) {
+        if let Edit::AddDevice { kind, name } = edit {
+            self.devices.adding.remove(&(*kind, crate::devices::base_name(*kind, name)));
+        }
+    }
 
     fn live(&self) -> bool {
         matches!(self.view.conn, ConnState::Live)
@@ -288,9 +303,29 @@ impl ConfluenceApp {
 
     fn top_bar_buttons(&mut self, ui: &mut egui::Ui) {
         ui.toggle_value(&mut self.inspector_open, "Inspector");
+        ui.toggle_value(&mut self.devices_open, "Devices…");
     }
 
     fn side_panels(&mut self, ui: &mut egui::Ui, view: &StoreView, _now: Instant) {
+        if self.devices_open {
+            let editable = self.live();
+            let (list, slots) = match &view.state {
+                Some(s) => (s.devices.clone(), s.slots.clone()),
+                None => (Vec::new(), Vec::new()),
+            };
+            let devices = &mut self.devices;
+            let look = &self.look;
+            let edits = egui::Panel::left("devices")
+                .resizable(true)
+                .show(ui, |ui| {
+                    look.paint_surface(ui.painter(), ui.max_rect(), "panel", look.skin.colors.panel);
+                    crate::devices::show(ui, &list, &slots, devices, editable)
+                })
+                .inner;
+            for e in edits {
+                self.send(e);
+            }
+        }
         if !self.inspector_open {
             return;
         }

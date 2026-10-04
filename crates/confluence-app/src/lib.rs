@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod commands;
+pub mod devices;
 pub mod engine_launch;
 pub mod graph;
 pub mod grid_view;

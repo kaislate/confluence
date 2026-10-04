@@ -204,3 +204,24 @@ fn a_selection_removed_elsewhere_is_cleared() {
     });
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_device_can_be_added_from_the_devices_panel() {
+    let d = EngineDir::new("devices");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices…").click();
+    pump_until(&mut h, "the VASIO entries", LONG, |h| h.query_by_label("Add VASIO 3").is_some());
+    // The list also holds this PC's real devices, so VASIO 3 may be scrolled out of
+    // view: bring it into view and make sure the click lands on it, never elsewhere.
+    h.get_by_label("Add VASIO 3").scroll_to_me();
+    settle(&mut h);
+    let r = h.get_by_label("Add VASIO 3").rect();
+    assert!(r.min.y >= 0.0 && r.max.y <= 800.0, "the button is on screen: {r:?}");
+    h.get_by_label("Add VASIO 3").click();
+    pump_until(&mut h, "the new slot", LONG, |_| slots(&mut client(&d)).iter().any(|s| s.name == "VASIO 3"));
+    pump_until(&mut h, "the notification", LONG, |h| h.query_by_label_contains("Added VASIO 3").is_some());
+    pump_until(&mut h, "in use", LONG, |h| h.query_by_label("Add VASIO 3").is_none());
+    client(&d).call(Command::Shutdown).unwrap();
+}
