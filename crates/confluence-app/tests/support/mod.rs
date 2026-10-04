@@ -96,7 +96,12 @@ pub fn app_with_skin(d: &EngineDir, skin: Option<PathBuf>) -> ConfluenceApp {
 }
 
 pub fn harness(app: ConfluenceApp) -> Harness<'static, ConfluenceApp> {
-    Harness::builder().with_size([1200.0, 800.0]).build_ui_state(|ui, app: &mut ConfluenceApp| app.draw(ui), app)
+    harness_sized(app, 1200.0, 800.0)
+}
+
+/// A harness with a small window, so the grid scrolls.
+pub fn harness_sized(app: ConfluenceApp, w: f32, h: f32) -> Harness<'static, ConfluenceApp> {
+    Harness::builder().with_size([w, h]).build_ui_state(|ui, app: &mut ConfluenceApp| app.draw(ui), app)
 }
 
 /// Runs frames until `cond` holds, failing after `timeout`.

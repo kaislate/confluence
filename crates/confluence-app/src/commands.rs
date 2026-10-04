@@ -193,23 +193,35 @@ fn queue(outbox: &mut Outbox, edit: Edit, pipe: &str, out: &Sender<Outcome>, wak
     });
 }
 
-fn send(client: &mut Option<Client>, pipe: &str, edit: Edit) -> Outcome {
+/// One call, connecting first if needed; a failed call drops the connection.
+fn call(client: &mut Option<Client>, pipe: &str, edit: &Edit) -> Result<Response, String> {
     let c = match client {
         Some(c) => c,
         None => match Client::connect(pipe, CONNECT_TIMEOUT) {
             Ok(c) => client.insert(c),
-            Err(e) => return Outcome::Failed { edit, reason: format!("not connected to the engine ({e})") },
+            Err(e) => return Err(format!("not connected to the engine ({e})")),
         },
     };
-    match c.call(edit.command()) {
+    c.call(edit.command()).map_err(|e| {
+        *client = None;
+        format!("lost the engine ({e})")
+    })
+}
+
+fn send(client: &mut Option<Client>, pipe: &str, edit: Edit) -> Outcome {
+    let reused = client.is_some();
+    let mut result = call(client, pipe, &edit);
+    if reused && result.is_err() {
+        // The connection may be from before an engine restart: try once more
+        // on a fresh one. Every edit sent this way is safe to repeat.
+        result = call(client, pipe, &edit);
+    }
+    match result {
         Ok(Response::Applied { version }) => Outcome::Done { edit, version: Some(version), ids: Vec::new() },
         Ok(Response::Added { ids, version }) => Outcome::Done { edit, version: Some(version), ids },
         Ok(Response::Error(reason)) => Outcome::Failed { edit, reason },
         Ok(_) => Outcome::Done { edit, version: None, ids: Vec::new() },
-        Err(e) => {
-            *client = None;
-            Outcome::Failed { edit, reason: format!("lost the engine ({e})") }
-        }
+        Err(reason) => Outcome::Failed { edit, reason },
     }
 }
 

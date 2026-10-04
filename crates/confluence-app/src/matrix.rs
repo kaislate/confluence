@@ -223,6 +223,54 @@ pub fn cell_edit(p: (u32, u32), current: Option<&PointState>, input: &CellInput)
     regain(p, cur, delta)
 }
 
+/// A single click on a routed cell unroutes it only once the double-click
+/// window has passed, so a double-click (reset to 0 dB) never drops the route,
+/// not even for a moment.
+#[derive(Default)]
+pub struct DeferredUnroute {
+    pending: Option<((u32, u32), f64)>,
+}
+
+impl DeferredUnroute {
+    /// egui's double-click window, in seconds.
+    pub const WINDOW: f64 = 0.3;
+
+    /// A single click on routed point `p` at `now` (seconds). Returns a point
+    /// clicked earlier that must be unrouted now (another cell was clicked).
+    pub fn click(&mut self, p: (u32, u32), now: f64) -> Option<(u32, u32)> {
+        let earlier = self.pending.take().map(|(q, _)| q).filter(|q| *q != p);
+        self.pending = Some((p, now));
+        earlier
+    }
+
+    /// The second click of a double-click on `p`: keep the route.
+    pub fn double(&mut self, p: (u32, u32)) {
+        if self.pending.is_some_and(|(q, _)| q == p) {
+            self.pending = None;
+        }
+    }
+
+    /// The point to unroute now, once its window has passed.
+    pub fn due(&mut self, now: f64) -> Option<(u32, u32)> {
+        match self.pending {
+            Some((p, at)) if now - at >= Self::WINDOW => {
+                self.pending = None;
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+
+    /// Seconds until the pending unroute is due.
+    pub fn waiting(&self, now: f64) -> Option<f64> {
+        self.pending.map(|(_, at)| (Self::WINDOW - (now - at)).max(0.0))
+    }
+
+    pub fn is_pending(&self, p: (u32, u32)) -> bool {
+        self.pending.is_some_and(|(q, _)| q == p)
+    }
+}
+
 /// Keys that act on the selected cell.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CellKey {
@@ -423,6 +471,32 @@ mod tests {
         assert_eq!(move_selection(&l, (0, 0), -1, -1), Some((0, 0)), "clamped at the top left");
         assert_eq!(move_selection(&l, (2, 3), 5, 5), Some((2, 3)), "clamped at the bottom right");
         assert_eq!(move_selection(&GridLayout::new(&[], CELL_DEFAULT), (0, 0), 1, 0), None);
+    }
+
+    #[test]
+    fn a_single_click_unroutes_once_the_double_click_window_has_passed() {
+        let mut u = DeferredUnroute::default();
+        assert_eq!(u.click((1, 2), 10.0), None);
+        assert!(u.is_pending((1, 2)));
+        assert_eq!(u.due(10.1), None, "a second click may still come");
+        assert_eq!(u.due(10.0 + DeferredUnroute::WINDOW), Some((1, 2)));
+        assert_eq!(u.due(11.0), None, "only once");
+    }
+
+    #[test]
+    fn a_double_click_never_drops_the_route() {
+        let mut u = DeferredUnroute::default();
+        u.click((1, 2), 10.0);
+        u.double((1, 2));
+        assert_eq!(u.due(20.0), None);
+    }
+
+    #[test]
+    fn clicking_another_routed_cell_unroutes_the_first_at_once() {
+        let mut u = DeferredUnroute::default();
+        u.click((1, 2), 10.0);
+        assert_eq!(u.click((3, 4), 10.1), Some((1, 2)));
+        assert_eq!(u.waiting(10.1).map(|w| (w * 100.0).round() / 100.0), Some(DeferredUnroute::WINDOW));
     }
 
     #[test]

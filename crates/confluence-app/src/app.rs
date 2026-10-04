@@ -13,7 +13,7 @@ use eframe::egui::{self, Align, Align2, Button, Id, Key, Layout, RichText};
 use crate::commands::{Edit, Outcome, Worker};
 use crate::engine_launch::Launcher;
 use crate::grid_view;
-use crate::matrix::{key_edit, move_selection, selection_valid, CellKey, GridLayout, Selection};
+use crate::matrix::{key_edit, move_selection, selection_valid, CellKey, DeferredUnroute, GridLayout, Selection};
 use crate::notify::Notes;
 use crate::pending::Pending;
 use crate::skin::Look;
@@ -49,6 +49,20 @@ pub fn badge(conn: &ConnState, last_event: Option<Instant>, now: Instant) -> Str
     }
 }
 
+/// When the window must look again even if nothing arrives: while not
+/// connected (timers in the banner), or when a live engine would cross the
+/// "Not responding" threshold.
+pub fn next_check(conn: &ConnState, last_event: Option<Instant>, now: Instant) -> Option<Duration> {
+    const TICK: Duration = Duration::from_millis(500);
+    match (conn, last_event) {
+        (ConnState::Live, Some(t)) => {
+            let silent = now.saturating_duration_since(t);
+            Some(if silent >= QUIET { TICK } else { QUIET - silent + Duration::from_millis(100) })
+        }
+        _ => Some(TICK),
+    }
+}
+
 /// The value of `name` in `args`: `--name VALUE` or `--name=VALUE`.
 pub fn flag(args: &[String], name: &str) -> Option<String> {
     let prefix = format!("{name}=");
@@ -81,6 +95,8 @@ pub struct ConfluenceApp {
     skin_dir: Option<PathBuf>,
     /// A slot waiting for "Remove ‹name›?" to be confirmed.
     confirm_remove: Option<u32>,
+    /// A clicked route waiting out the double-click window before it is removed.
+    unroute: DeferredUnroute,
     devices_open: bool,
     devices: crate::devices::DevicesState,
 }
@@ -119,6 +135,7 @@ impl ConfluenceApp {
             look: Look::builtin(),
             skin_dir: config.skin,
             confirm_remove: None,
+            unroute: DeferredUnroute::default(),
             devices_open: false,
             devices: crate::devices::DevicesState::default(),
         }
@@ -211,6 +228,13 @@ impl ConfluenceApp {
             }
         }
         self.notes.prune(now);
+        let t = ctx.input(|i| i.time);
+        if let Some((input, output)) = self.unroute.due(t) {
+            self.send(Edit::RemovePoint { input, output });
+        }
+        if let Some(wait) = self.unroute.waiting(t) {
+            ctx.request_repaint_after(Duration::from_secs_f64(wait));
+        }
 
         self.top_bar(ui, &view, now);
         self.side_panels(ui, &view, now);
@@ -219,7 +243,10 @@ impl ConfluenceApp {
         self.notifications(&ctx, &view);
         self.dialogs(&ctx, &view);
 
-        if !self.live() || self.notes.has_info() || self.xruns.1.is_some() {
+        if let Some(wait) = next_check(&view.conn, view.last_event, now) {
+            ctx.request_repaint_after(wait);
+        }
+        if self.notes.has_info() || self.xruns.1.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
@@ -402,13 +429,13 @@ impl ConfluenceApp {
             let layout = GridLayout::new(&state.slots, self.cell);
             let by_point: HashMap<(u32, u32), &PointState> =
                 state.points.iter().map(|p| ((p.input, p.output), p)).collect();
-            let pending = &self.pending;
+            let (pending, unroute) = (&self.pending, &mut self.unroute);
             let lookup = |p: (u32, u32)| (pending.effective(p, by_point.get(&p).copied()), pending.is_pending(p));
             let selected = match self.selection {
                 Selection::Cell { input, output } => Some((input, output)),
                 _ => None,
             };
-            let actions = grid_view::show(ui, &layout, &self.look, &lookup, selected, editable);
+            let actions = grid_view::show(ui, &layout, &self.look, &lookup, selected, editable, unroute);
             if let Some(z) = actions.zoom {
                 self.cell = z.clamp(crate::matrix::CELL_MIN, crate::matrix::CELL_MAX);
             }
@@ -540,6 +567,22 @@ mod tests {
         let quiet = now - Duration::from_millis(2500);
         assert_eq!(badge(&ConnState::Live, Some(quiet), now), "Not responding");
         assert_eq!(badge(&ConnState::Live, Some(now - Duration::from_millis(500)), now), "Live");
+    }
+
+    /// Without a repaint nothing would notice an engine going quiet: the window
+    /// must look again when "Not responding" could become true.
+    #[test]
+    fn a_live_engine_is_rechecked_when_it_could_go_quiet() {
+        let now = Instant::now();
+        let heard = now - Duration::from_millis(500);
+        let wait = next_check(&ConnState::Live, Some(heard), now).unwrap();
+        assert!(wait >= Duration::from_millis(1500) && wait <= Duration::from_millis(1700), "{wait:?}");
+        let quiet = now - Duration::from_secs(5);
+        assert!(
+            next_check(&ConnState::Live, Some(quiet), now).unwrap() <= Duration::from_millis(500),
+            "keeps the badge's timer moving"
+        );
+        assert_eq!(next_check(&ConnState::Connecting, None, now), Some(Duration::from_millis(500)));
     }
 
     #[test]

@@ -76,10 +76,22 @@ fn point_panel(
         |gain_db: f32, mute: bool, invert: bool| Action::Edit(Edit::SetPoint { input, output, gain_db, mute, invert });
     match point {
         Some(p) => {
-            let mut gain = p.gain_db;
-            let slider = ui.add(Slider::new(&mut gain, SHOWN_MIN_DB..=SHOWN_MAX_DB).text("Gain (dB)"));
-            let field = ui.add(DragValue::new(&mut gain).range(GAIN_MIN_DB..=GAIN_MAX_DB).speed(0.1).suffix(" dB"));
-            if (slider.changed() || field.changed()) && gain != p.gain_db {
+            // Separate values: the slider clamps what it is given to its
+            // −60…+12 range, which must not overwrite the real gain the
+            // number field shows (and edits from).
+            let mut slid = p.gain_db;
+            let mut typed = p.gain_db;
+            let slider =
+                ui.add(Slider::new(&mut slid, SHOWN_MIN_DB..=SHOWN_MAX_DB).text("Gain (dB)").show_value(false));
+            let field = ui.add(DragValue::new(&mut typed).range(GAIN_MIN_DB..=GAIN_MAX_DB).speed(0.1).suffix(" dB"));
+            let gain = if field.changed() {
+                typed
+            } else if slider.changed() {
+                slid
+            } else {
+                p.gain_db
+            };
+            if gain != p.gain_db {
                 actions.push(set(gain, p.mute, p.invert));
             }
             let (mut mute, mut invert) = (p.mute, p.invert);
@@ -221,5 +233,74 @@ mod tests {
         };
         assert_eq!(routes_of(&state, &a), 2, "0→2 (its input) and 1→1 (both)");
         assert_eq!(routes_of(&state, &b), 2, "0→2 (its output) and 3→3");
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use confluence_api::{ClockRole, EngineStatus};
+    use confluence_client::{ConnState, History};
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::Harness;
+    use std::sync::Arc;
+
+    fn view_with(point: PointState) -> StoreView {
+        let slot = SlotState {
+            id: 1,
+            name: "S".into(),
+            device: String::new(),
+            role: ClockRole::Soft,
+            online: true,
+            first_input: 0,
+            inputs: 2,
+            first_output: 0,
+            outputs: 2,
+        };
+        StoreView {
+            state: Some(State {
+                version: 1,
+                status: EngineStatus {
+                    master: "internal".into(),
+                    sample_rate: 48_000.0,
+                    block: 256,
+                    blocks: 0,
+                    dsp_load: 0.0,
+                    xruns: 0,
+                },
+                slots: vec![slot],
+                points: vec![point],
+                devices: Vec::new(),
+                notices: Vec::new(),
+            }),
+            conn: ConnState::Live,
+            status: None,
+            health: Vec::new(),
+            history: Arc::new(History::new()),
+            last_event: None,
+        }
+    }
+
+    /// A route quieter than the slider's range must still show its real gain
+    /// in the number field (and nudging it must start from that value).
+    #[test]
+    fn a_gain_outside_the_slider_range_is_shown_as_it_is() {
+        let pt = PointState { input: 0, output: 0, gain_db: -80.0, mute: false, invert: false };
+        let view = view_with(pt.clone());
+        let look = Look::builtin();
+        let sel = Selection::Cell { input: 0, output: 0 };
+        let mut sent = Vec::new();
+        let mut h = Harness::new_ui(|ui| {
+            for a in show(ui, &view, &look, &sel, Some(pt.clone()), true) {
+                if let Action::Edit(e) = a {
+                    sent.push(e);
+                }
+            }
+        });
+        h.run();
+        let field = h.get_by_role(eframe::egui::accesskit::Role::SpinButton).value();
+        assert_eq!(field.as_deref(), Some("-80.0 dB"), "the number field shows the real gain");
+        drop(h);
+        assert!(sent.is_empty(), "showing the panel sends nothing: {sent:?}");
     }
 }

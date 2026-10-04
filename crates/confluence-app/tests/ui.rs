@@ -225,3 +225,112 @@ fn a_device_can_be_added_from_the_devices_panel() {
     pump_until(&mut h, "in use", LONG, |h| h.query_by_label("Add VASIO 3").is_none());
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+/// Adds VASIO 1 with 16 channels each way (a grid larger than a small window).
+fn add_big_vasio(c: &mut confluence_client::Client) -> (u32, u32) {
+    let r = c.call(Command::AddDevice { kind: DeviceKind::Vasio, name: "1:16x16".into() }).unwrap();
+    assert!(matches!(r, Response::Added { .. }), "{r:?}");
+    let s = slots(c).into_iter().find(|s| s.name == "VASIO 1").unwrap();
+    (s.first_input, s.first_output)
+}
+
+#[test]
+fn the_wheel_on_a_route_changes_gain_without_scrolling() {
+    let d = EngineDir::new("wheel");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_big_vasio(&mut c);
+    c.call(Command::SetPoint { input: i, output: o, gain_db: -6.0, mute: false, invert: false }).unwrap();
+    let mut h = harness_sized(app_for(&d), 520.0, 300.0);
+    let cell = "VASIO 1 in 1 → VASIO 1 out 1";
+    pump_until(&mut h, "the routed cell", LONG, |h| {
+        h.state().point(i, o).is_some() && h.query_by_role_and_label(Role::Button, cell).is_some()
+    });
+    settle(&mut h);
+    let before = h.get_by_role_and_label(Role::Button, cell).rect();
+    h.hover_at(before.center());
+    h.step();
+    h.event(eframe::egui::Event::MouseWheel {
+        unit: eframe::egui::MouseWheelUnit::Line,
+        delta: eframe::egui::vec2(0.0, -1.0),
+        modifiers: Default::default(),
+        phase: eframe::egui::TouchPhase::Move,
+    });
+    for _ in 0..20 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let after = h.get_by_role_and_label(Role::Button, cell).rect();
+    assert_eq!(before, after, "the grid did not scroll");
+    pump_until(&mut h, "one step down in the engine", LONG, |_| match c.call(Command::ListPoints).unwrap() {
+        Response::Points(p) => p.iter().any(|p| (p.input, p.output) == (i, o) && (p.gain_db - -7.0).abs() < 1e-4),
+        _ => false,
+    });
+    c.call(Command::Shutdown).unwrap();
+}
+
+/// A cell scrolled partly under the sticky headers must not take clicks (or
+/// hovers) there: the header's channel numbers would otherwise toggle a route
+/// the user cannot see.
+#[test]
+fn cells_under_the_sticky_headers_cannot_be_hit() {
+    let d = EngineDir::new("headers");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_big_vasio(&mut c);
+    let mut h = harness_sized(app_for(&d), 520.0, 300.0);
+    pump_until(&mut h, "the grid", LONG, |h| h.query_by_label("VASIO 1 inputs").is_some());
+    settle(&mut h);
+    // Scroll by a part of a cell, with the pointer on the row header (not a cell).
+    h.hover_at(h.get_by_label("VASIO 1 inputs").rect().center());
+    h.step();
+    h.event(eframe::egui::Event::MouseWheel {
+        unit: eframe::egui::MouseWheelUnit::Point,
+        delta: eframe::egui::vec2(-25.0, -25.0),
+        modifiers: Default::default(),
+        phase: eframe::egui::TouchPhase::Move,
+    });
+    for _ in 0..20 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let header_bottom = h.get_by_label("VASIO 1 outputs").rect().min.y + confluence_app::grid_view::HEADER_H;
+    let header_right = h.get_by_label("VASIO 1 inputs").rect().max.x;
+    let cells: Vec<_> = h.query_all_by_label_contains(" → ").map(|n| n.rect()).collect();
+    assert!(!cells.is_empty());
+    for r in cells {
+        assert!(
+            r.min.y >= header_bottom - 0.5 && r.min.x >= header_right - 0.5,
+            "a cell reaches under a header: {r:?}"
+        );
+    }
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn the_first_edit_after_an_engine_restart_works() {
+    let d = EngineDir::new("restart-edit");
+    let mut engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_vasio(&mut c, 1);
+    drop(c);
+    let mut h = harness(app_for(&d));
+    let first = "VASIO 1 in 1 → VASIO 1 out 1";
+    let second = "VASIO 1 in 2 → VASIO 1 out 2";
+    pump_until(&mut h, "the grid", LONG, |h| h.query_by_role_and_label(Role::Button, first).is_some());
+    settle(&mut h);
+    h.get_by_role_and_label(Role::Button, first).click(); // the worker now holds a connection
+    pump_until(&mut h, "the first route", LONG, |_| engine_points(&mut client(&d)).contains(&(i, o)));
+    engine.kill();
+    pump_until(&mut h, "Reconnecting", LONG, |h| h.query_all_by_label_contains("Reconnecting").next().is_some());
+    let _engine2 = Engine::spawn(&d);
+    pump_until(&mut h, "Live again", LONG, |h| h.query_by_label("Live").is_some());
+    settle(&mut h);
+    h.get_by_role_and_label(Role::Button, second).click();
+    pump_until(&mut h, "the edit's outcome", LONG, |h| {
+        h.query_by_label_contains("lost the engine").is_some()
+            || engine_points(&mut client(&d)).contains(&(i + 1, o + 1))
+    });
+    assert!(h.query_by_label_contains("lost the engine").is_none(), "the edit failed on the old connection");
+    client(&d).call(Command::Shutdown).unwrap();
+}

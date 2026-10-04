@@ -214,8 +214,14 @@ impl Look {
     pub fn load(ctx: &egui::Context, dir: &Path) -> (Look, Vec<String>) {
         let (skin, mut warnings) = read(dir);
         let mut textures = BTreeMap::new();
+        // egui panics on a texture larger than the GPU accepts.
+        let max_side = ctx.input(|i| i.max_texture_side);
         for (key, path) in &skin.images {
             match decode_png(path) {
+                Ok(img) if img.size[0] > max_side || img.size[1] > max_side => warnings.push(format!(
+                    "image '{key}': {}×{} is too large (this GPU allows {max_side}×{max_side})",
+                    img.size[0], img.size[1]
+                )),
                 Ok(img) => {
                     textures.insert(key.clone(), ctx.load_texture(format!("skin-{key}"), img, TextureOptions::LINEAR));
                 }
@@ -442,6 +448,28 @@ mod tests {
         assert!(!look.has_image("band"));
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].starts_with("Skin: ") && warnings[0].contains("band"), "{warnings:?}");
+    }
+
+    /// An image larger than the GPU accepts would bring the window down when
+    /// uploaded: it must be a warning instead.
+    #[test]
+    fn an_image_too_large_for_the_gpu_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let max = ctx.input(|i| i.max_texture_side) as u32;
+        image::RgbaImage::from_pixel(max + 1, 1, image::Rgba([0, 0, 0, 255]))
+            .save_with_format(dir.path().join("wide.png"), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("skin.toml"),
+            "[images]
+background = \"wide.png\"
+",
+        )
+        .unwrap();
+        let (look, warnings) = Look::load(&ctx, dir.path());
+        assert!(!look.has_image("background"));
+        assert!(warnings.iter().any(|w| w.contains("background") && w.contains("too large")), "{warnings:?}");
     }
 
     #[test]

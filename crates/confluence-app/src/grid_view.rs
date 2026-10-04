@@ -6,7 +6,7 @@ use confluence_api::PointState;
 use eframe::egui::{self, Align2, Color32, FontId, Id, Pos2, Rect, ScrollArea, Sense, Vec2, WidgetInfo, WidgetType};
 
 use crate::commands::Edit;
-use crate::matrix::{cell_edit, CellInput, GridLayout, Selection};
+use crate::matrix::{cell_edit, CellInput, DeferredUnroute, GridLayout, Selection};
 use crate::skin::Look;
 
 /// Width of the row headers and height of the column headers.
@@ -22,12 +22,25 @@ pub struct GridActions {
     pub zoom: Option<f32>,
 }
 
+/// Pixels of touchpad (point-unit) scrolling per gain step.
+pub const POINTS_PER_NOTCH: f32 = 50.0;
+
+/// Gain steps for one wheel event: a mouse notch is one step, a touchpad
+/// moves in fractions of one, a page is three.
+pub fn notches(unit: egui::MouseWheelUnit, dy: f32) -> f32 {
+    match unit {
+        egui::MouseWheelUnit::Line => dy,
+        egui::MouseWheelUnit::Point => dy / POINTS_PER_NOTCH,
+        egui::MouseWheelUnit::Page => dy * 3.0,
+    }
+}
+
 fn wheel_notches(ui: &egui::Ui) -> f32 {
     ui.input(|i| {
         i.events
             .iter()
             .map(|e| match e {
-                egui::Event::MouseWheel { delta, .. } => delta.y,
+                egui::Event::MouseWheel { unit, delta, .. } => notches(*unit, delta.y),
                 _ => 0.0,
             })
             .sum()
@@ -54,7 +67,9 @@ pub fn show(
     lookup: &dyn Fn((u32, u32)) -> (Option<PointState>, bool),
     selected: Option<(u32, u32)>,
     editable: bool,
+    unroute: &mut DeferredUnroute,
 ) -> GridActions {
+    let now = ui.input(|i| i.time);
     let mut actions = GridActions::default();
     let (ctrl, fine) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
     if ctrl && ui.ui_contains_pointer() {
@@ -71,13 +86,24 @@ pub fn show(
         let origin = outer.min + Vec2::new(HEADER_W, HEADER_H);
         let (rows, cols) =
             layout.visible(viewport.min.x, viewport.min.y, viewport.max.x - HEADER_W, viewport.max.y - HEADER_H);
+        // The part of the screen where cells show: below and right of the sticky headers.
+        let cell_area = Rect::from_min_max(
+            outer.min + viewport.min.to_vec2() + Vec2::new(HEADER_W, HEADER_H),
+            outer.min + viewport.max.to_vec2(),
+        );
 
         for r in rows.clone() {
             for c in cols.clone() {
                 let (Some(p), Some(label)) = (layout.point(r, c), layout.label(r, c)) else { continue };
                 let rect = Rect::from_min_size(origin + Vec2::new(c as f32 * cell, r as f32 * cell), Vec2::splat(cell));
+                // Only the visible part of a cell takes the pointer: a cell scrolled
+                // under a header must not take clicks meant for the header.
+                let hit = rect.intersect(cell_area);
+                if !hit.is_positive() {
+                    continue;
+                }
                 let sense = if editable { Sense::click_and_drag() } else { Sense::hover() };
-                let resp = ui.interact(rect, Id::new(("cell", p)), sense);
+                let resp = ui.interact(hit, Id::new(("cell", p)), sense);
                 resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, editable, &label));
                 let (cur, pending) = lookup(p);
                 let online = layout.rows.at(r).is_some_and(|(b, _)| b.online)
@@ -90,9 +116,10 @@ pub fn show(
                 let mut wheel = 0.0;
                 if resp.hovered() && cur.is_some() && !ctrl {
                     wheel = wheel_notches(ui);
-                    if wheel != 0.0 {
-                        ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
-                    }
+                    // egui spreads a wheel notch's scrolling over several frames:
+                    // absorb it on every frame the pointer stays on the route, so
+                    // the grid never moves another cell under the pointer.
+                    ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
                 }
                 let input = CellInput {
                     clicked: resp.clicked(),
@@ -101,7 +128,15 @@ pub fn show(
                     wheel_notches: wheel,
                     fine,
                 };
-                if let Some(e) = cell_edit(p, cur.as_ref(), &input) {
+                if input.double_clicked {
+                    unroute.double(p); // the first click's unroute must not happen
+                    actions.edits.extend(cell_edit(p, cur.as_ref(), &input));
+                } else if input.clicked && cur.is_some() {
+                    // Unrouted once the double-click window passes (DeferredUnroute).
+                    if let Some(q) = unroute.click(p, now) {
+                        actions.edits.push(Edit::RemovePoint { input: q.0, output: q.1 });
+                    }
+                } else if let Some(e) = cell_edit(p, cur.as_ref(), &input) {
                     actions.edits.push(e);
                 }
                 if resp.clicked() || resp.drag_started() {
@@ -239,4 +274,19 @@ pub fn show(
         ui.painter_at(corner).rect_filled(corner, 0.0, bg);
     });
     actions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::MouseWheelUnit;
+
+    #[test]
+    fn wheel_units_become_gain_steps() {
+        assert_eq!(notches(MouseWheelUnit::Line, -1.0), -1.0, "a mouse notch is one step");
+        assert_eq!(notches(MouseWheelUnit::Point, 25.0), 0.5, "a touchpad moves in fractions");
+        let swipe: f32 = (0..10).map(|_| notches(MouseWheelUnit::Point, 5.0)).sum();
+        assert!((swipe - 1.0).abs() < 1e-6, "50 px of touchpad is one step: {swipe}");
+        assert_eq!(notches(MouseWheelUnit::Page, 1.0), 3.0);
+    }
 }
