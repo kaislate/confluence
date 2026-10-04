@@ -895,6 +895,7 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
+ "windows",
 ]
 
 [[package]]
