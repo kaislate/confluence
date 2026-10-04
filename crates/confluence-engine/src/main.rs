@@ -29,7 +29,7 @@ mod app {
     use confluence_api::{Command, Response};
     use confluence_engine::clock::InternalClock;
     use confluence_engine::devices::{start_asio_master, DeviceManager};
-    use confluence_engine::ipc::{default_pipe_name, pipe_path, Handler, PipeServer};
+    use confluence_engine::ipc::{default_pipe_name, pipe_path, service_fn, Handler, PipeServer};
     use confluence_engine::journal::Journal;
     use confluence_engine::rt::disable_power_throttling;
     use confluence_engine::{Engine, EngineConfig};
@@ -154,7 +154,7 @@ mod app {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handler: Handler = {
             let (state, shutdown) = (state.clone(), shutdown.clone());
-            Arc::new(move |cmd: &Command| {
+            service_fn(move |cmd: &Command| {
                 if *cmd == Command::Shutdown {
                     shutdown.store(true, Ordering::SeqCst);
                     return Response::Ok;

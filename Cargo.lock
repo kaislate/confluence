@@ -263,6 +263,7 @@ name = "confluence-api"
 version = "0.1.0"
 dependencies = [
  "postcard",
+ "proptest",
  "serde",
  "thiserror",
 ]
@@ -273,7 +274,15 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "confluence-api",
- "confluence-engine",
+ "confluence-client",
+]
+
+[[package]]
+name = "confluence-client"
+version = "0.1.0"
+dependencies = [
+ "confluence-api",
+ "thiserror",
 ]
 
 [[package]]
@@ -295,6 +304,7 @@ dependencies = [
  "assert_no_alloc",
  "clap",
  "confluence-api",
+ "confluence-client",
  "confluence-core",
  "confluence-provider-asio",
  "confluence-provider-vaio",

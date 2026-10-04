@@ -5,11 +5,13 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use confluence_api::{read_envelope, write_frame, Command, Envelope, FrameError, Response};
+use confluence_api::{read_envelope, write_frame, Command, Envelope, Event, FrameError, Response, State};
+pub use confluence_client::{default_pipe_name, pipe_path};
 use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::{
@@ -25,19 +27,34 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-/// Handles one command; called concurrently from connection threads.
-pub type Handler = Arc<dyn Fn(&Command) -> Response + Send + Sync>;
+/// What a pipe server offers: commands, and optionally subscriptions. Called
+/// concurrently from connection threads.
+pub trait Service: Send + Sync {
+    fn handle(&self, cmd: &Command) -> Response;
+    /// A snapshot and its event stream, or `None` if this server has none.
+    fn subscribe(&self) -> Option<(State, Receiver<Event>)>;
+}
+
+pub type Handler = Arc<dyn Service>;
+
+struct FnService<F>(F);
+
+impl<F: Fn(&Command) -> Response + Send + Sync> Service for FnService<F> {
+    fn handle(&self, cmd: &Command) -> Response {
+        (self.0)(cmd)
+    }
+
+    fn subscribe(&self) -> Option<(State, Receiver<Event>)> {
+        None
+    }
+}
+
+/// A command-only service from a closure.
+pub fn service_fn<F: Fn(&Command) -> Response + Send + Sync + 'static>(f: F) -> Handler {
+    Arc::new(FnService(f))
+}
 
 const BUFFER_BYTES: u32 = 64 * 1024;
-
-pub fn pipe_path(name: &str) -> String {
-    format!(r"\\.\pipe\{name}")
-}
-
-/// Default pipe name for the current user.
-pub fn default_pipe_name() -> String {
-    format!("confluence-{}", std::env::var("USERNAME").unwrap_or_else(|_| "user".into()))
-}
 
 /// Owned security descriptor granting full access to SYSTEM and the current user only.
 struct UserOnlySecurity(PSECURITY_DESCRIPTOR);
@@ -243,8 +260,12 @@ fn accept_loop(path: &str, first: OwnedPipe, security: UserOnlySecurity, stop: &
 fn serve(mut file: File, handler: Handler) {
     loop {
         match read_envelope::<_, Command>(&mut file) {
+            Ok(Some(env)) if env.body == Command::Subscribe => {
+                stream(file, env.id, &handler);
+                return;
+            }
             Ok(Some(env)) => {
-                let resp = handler(&env.body);
+                let resp = handler.handle(&env.body);
                 if write_frame(&mut file, &Envelope::new(env.id, resp)).is_err() {
                     return;
                 }
@@ -259,35 +280,22 @@ fn serve(mut file: File, handler: Handler) {
     }
 }
 
-/// Blocking Control API client.
-pub struct PipeClient {
-    file: File,
-    next_id: u32,
-}
-
-impl PipeClient {
-    /// Connects, retrying for up to `timeout` while the pipe is missing or busy.
-    pub fn connect(name: &str, timeout: Duration) -> io::Result<Self> {
-        let path = pipe_path(name);
-        let deadline = Instant::now() + timeout;
-        loop {
-            match OpenOptions::new().read(true).write(true).open(&path) {
-                Ok(file) => return Ok(Self { file, next_id: 1 }),
-                Err(e) if Instant::now() < deadline && matches!(e.raw_os_error(), Some(2) | Some(231)) => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => return Err(e),
-            }
-        }
+/// Writes the snapshot, then every event, until the client or the engine goes
+/// away. After `Subscribe` nothing more is read from the connection.
+fn stream(mut file: File, id: u32, handler: &Handler) {
+    let Some((snapshot, events)) = handler.subscribe() else {
+        let msg = Response::Error("subscriptions are not available".into());
+        let _ = write_frame(&mut file, &Envelope::new(id, msg));
+        return;
+    };
+    if write_frame(&mut file, &Envelope::new(id, Response::Snapshot(snapshot))).is_err() {
+        return;
     }
-
-    pub fn call(&mut self, cmd: Command) -> Result<Response, FrameError> {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        write_frame(&mut self.file, &Envelope::new(id, cmd))?;
-        match read_envelope::<_, Response>(&mut self.file)? {
-            Some(env) => Ok(env.body),
-            None => Err(FrameError::Io(io::Error::from(io::ErrorKind::UnexpectedEof))),
+    // The receiver ends when the publisher drops this subscriber (queue full)
+    // or the engine shuts down; a write fails when the client has gone.
+    while let Ok(event) = events.recv() {
+        if write_frame(&mut file, &Envelope::new(0, Response::Event(event))).is_err() {
+            return;
         }
     }
 }
@@ -306,15 +314,15 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let handler: Handler = {
             let seen = seen.clone();
-            Arc::new(move |cmd: &Command| {
+            service_fn(move |cmd: &Command| {
                 seen.lock().unwrap().push(cmd.clone());
                 Response::Ok
             })
         };
         let name = unique_name("roundtrip");
         let server = PipeServer::start(&name, handler).unwrap();
-        let mut a = PipeClient::connect(&name, Duration::from_secs(2)).unwrap();
-        let mut b = PipeClient::connect(&name, Duration::from_secs(2)).unwrap();
+        let mut a = confluence_client::Client::connect(&name, Duration::from_secs(2)).unwrap();
+        let mut b = confluence_client::Client::connect(&name, Duration::from_secs(2)).unwrap();
         assert_eq!(a.call(Command::ListPoints).unwrap(), Response::Ok);
         assert_eq!(b.call(Command::Health).unwrap(), Response::Ok);
         assert_eq!(a.call(Command::ListSlots).unwrap(), Response::Ok);
@@ -325,7 +333,7 @@ mod tests {
     #[test]
     fn second_server_on_same_name_is_refused() {
         let name = unique_name("clash");
-        let handler: Handler = Arc::new(|_: &Command| Response::Ok);
+        let handler = service_fn(|_: &Command| Response::Ok);
         let _server = PipeServer::start(&name, handler.clone()).unwrap();
         let err = PipeServer::start(&name, handler).err().expect("name is taken");
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
@@ -338,7 +346,7 @@ mod tests {
         let listener = PipeServer::bind(&name).unwrap();
         assert!(PipeServer::bind(&name).is_err(), "claimed before serving");
         drop(listener);
-        let handler: Handler = Arc::new(|_: &Command| Response::Ok);
+        let handler = service_fn(|_: &Command| Response::Ok);
         let _server = PipeServer::start(&name, handler).unwrap();
     }
 
@@ -346,13 +354,76 @@ mod tests {
     fn hostile_client_is_dropped_and_others_keep_working() {
         use std::io::{Read, Write};
         let name = unique_name("hostile");
-        let handler: Handler = Arc::new(|_: &Command| Response::Ok);
+        let handler = service_fn(|_: &Command| Response::Ok);
         let _server = PipeServer::start(&name, handler).unwrap();
         let mut raw = OpenOptions::new().read(true).write(true).open(pipe_path(&name)).unwrap();
         raw.write_all(&u32::MAX.to_le_bytes()).unwrap();
         let mut byte = [0u8; 1];
         assert!(!matches!(raw.read(&mut byte), Ok(1)), "server hung up instead of answering");
-        let mut good = PipeClient::connect(&name, Duration::from_secs(2)).unwrap();
+        let mut good = confluence_client::Client::connect(&name, Duration::from_secs(2)).unwrap();
         assert_eq!(good.call(Command::Health).unwrap(), Response::Ok);
+    }
+
+    struct Streaming {
+        publisher: Mutex<crate::publish::Publisher>,
+    }
+
+    impl Service for Streaming {
+        fn handle(&self, cmd: &Command) -> Response {
+            match cmd {
+                Command::ListPoints => Response::Points(Vec::new()),
+                _ => Response::Error("unsupported".into()),
+            }
+        }
+
+        fn subscribe(&self) -> Option<(State, Receiver<Event>)> {
+            Some(self.publisher.lock().unwrap().subscribe())
+        }
+    }
+
+    fn empty_state() -> State {
+        State {
+            version: 0,
+            status: confluence_api::EngineStatus {
+                master: "internal".into(),
+                sample_rate: 48_000.0,
+                block: 256,
+                blocks: 0,
+                dsp_load: 0.0,
+                xruns: 0,
+            },
+            slots: Vec::new(),
+            points: Vec::new(),
+            devices: Vec::new(),
+            notices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_subscription_streams_events_while_commands_still_work() {
+        let name = unique_name("sub");
+        let svc = Arc::new(Streaming { publisher: Mutex::new(crate::publish::Publisher::new(empty_state())) });
+        let server = PipeServer::start(&name, svc.clone()).unwrap();
+        let (snap, mut sub) = confluence_client::Subscription::connect(&name, Duration::from_secs(5)).unwrap();
+        assert_eq!(snap.version, 0);
+        let mut next = empty_state();
+        next.notices = vec!["hello".into()];
+        svc.publisher.lock().unwrap().publish(next);
+        match sub.recv().unwrap() {
+            Event::Changed { version: 1, changes } => assert_eq!(changes.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        let mut c = confluence_client::Client::connect(&name, Duration::from_secs(5)).unwrap();
+        assert_eq!(c.call(Command::ListPoints).unwrap(), Response::Points(Vec::new()));
+        server.stop();
+    }
+
+    #[test]
+    fn a_server_without_subscriptions_refuses_them() {
+        let name = unique_name("nosub");
+        let server = PipeServer::start(&name, service_fn(|_| Response::Ok)).unwrap();
+        let err = confluence_client::Subscription::connect(&name, Duration::from_secs(5)).err().unwrap();
+        assert!(matches!(err, confluence_client::ClientError::Refused(_)), "{err:?}");
+        server.stop();
     }
 }

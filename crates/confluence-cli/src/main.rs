@@ -164,11 +164,11 @@ fn render(resp: &Response) -> String {
 fn main() -> ExitCode {
     use std::time::Duration;
 
-    use confluence_engine::ipc::{default_pipe_name, PipeClient};
+    use confluence_client::{default_pipe_name, Client};
 
     let cli = Cli::parse();
     let pipe = cli.pipe.clone().unwrap_or_else(default_pipe_name);
-    let mut client = match PipeClient::connect(&pipe, Duration::from_secs(2)) {
+    let mut client = match Client::connect(&pipe, Duration::from_secs(2)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("cannot reach engine on pipe '{pipe}': {e}");
