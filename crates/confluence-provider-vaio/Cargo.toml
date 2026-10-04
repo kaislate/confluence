@@ -1,0 +1,27 @@
+[package]
+name = "confluence-provider-vaio"
+version = "0.1.0"
+description = "Engine side of the Confluence VAIO virtual Windows playback endpoint"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+confluence-core = { path = "../confluence-core" }
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+confluence-provider-wasapi = { path = "../confluence-provider-wasapi" }
+
+[lints]
+workspace = true

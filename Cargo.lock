@@ -319,6 +319,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "confluence-provider-vaio"
+version = "0.1.0"
+dependencies = [
+ "confluence-core",
+ "confluence-provider-wasapi",
+ "thiserror",
+ "windows",
+]
+
+[[package]]
 name = "confluence-provider-vasio"
 version = "0.1.0"
 dependencies = [
