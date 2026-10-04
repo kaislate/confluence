@@ -1,0 +1,13 @@
+<Project>
+  <!-- Confluence VAIO: the WDK and SDK come from NuGet (packages.config, restored by build.ps1). -->
+  <PropertyGroup>
+    <VaioPackages>$(MSBuildThisFileDirectory)packages\</VaioPackages>
+    <VaioWdkVersion>10.0.26100.6584</VaioWdkVersion>
+  </PropertyGroup>
+  <Import Project="$(VaioPackages)Microsoft.Windows.WDK.x64.$(VaioWdkVersion)\build\native\Microsoft.Windows.WDK.x64.props"
+          Condition="Exists('$(VaioPackages)Microsoft.Windows.WDK.x64.$(VaioWdkVersion)\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="$(VaioPackages)Microsoft.Windows.SDK.CPP.x64.$(VaioWdkVersion)\build\native\Microsoft.Windows.SDK.cpp.x64.props"
+          Condition="Exists('$(VaioPackages)Microsoft.Windows.SDK.CPP.x64.$(VaioWdkVersion)\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="$(VaioPackages)Microsoft.Windows.SDK.CPP.$(VaioWdkVersion)\build\native\Microsoft.Windows.SDK.cpp.props"
+          Condition="Exists('$(VaioPackages)Microsoft.Windows.SDK.CPP.$(VaioWdkVersion)\build\native\Microsoft.Windows.SDK.cpp.props')" />
+</Project>

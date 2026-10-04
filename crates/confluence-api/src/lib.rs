@@ -118,6 +118,9 @@ pub enum DeviceKind {
     /// (instance N, 2 channels each way), `N:C` (C each way) or `N:IxO`
     /// (I DAW inputs, O DAW outputs).
     Vasio,
+    /// The Confluence VAIO virtual Windows playback endpoint. `name` is `1`
+    /// (Milestone 0 has one endpoint). What apps play to it becomes two engine inputs.
+    Vaio,
 }
 
 impl DeviceKind {
@@ -129,6 +132,7 @@ impl DeviceKind {
             DeviceKind::WasapiCapture => "wasapi-in",
             DeviceKind::AppCapture => "app",
             DeviceKind::Vasio => "vasio",
+            DeviceKind::Vaio => "vaio",
         }
     }
 
@@ -140,6 +144,7 @@ impl DeviceKind {
             DeviceKind::WasapiCapture,
             DeviceKind::AppCapture,
             DeviceKind::Vasio,
+            DeviceKind::Vaio,
         ]
         .into_iter()
         .find(|k| k.prefix() == p)
