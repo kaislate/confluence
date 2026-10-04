@@ -173,3 +173,63 @@ fn shutting_down_with_a_subscriber_ends_its_stream_and_exits() {
     assert!(start.elapsed() < Duration::from_secs(3), "exited promptly: {:?}", start.elapsed());
     while sub.recv().is_ok() {}
 }
+
+fn wait_for(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !cond() {
+        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn is_live(store: &confluence_client::StateStore) -> bool {
+    matches!(store.view().conn, confluence_client::ConnState::Live)
+}
+
+#[test]
+fn a_store_follows_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = format!("confluence-store-a-{}", std::process::id());
+    let _engine = spawn(&pipe, dir.path());
+    let store = confluence_client::StateStore::spawn(pipe.clone(), Box::new(|| {}));
+    wait_for("live", Duration::from_secs(10), || is_live(&store));
+    let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    c.call(Command::SetPoint { input: 3, output: 4, gain_db: -3.0, mute: true, invert: false }).unwrap();
+    wait_for("the point", Duration::from_secs(2), || {
+        store
+            .view()
+            .state
+            .as_ref()
+            .is_some_and(|s| s.points.iter().any(|p| (p.input, p.output, p.mute) == (3, 4, true)))
+    });
+    wait_for("telemetry history", Duration::from_secs(2), || {
+        store.view().status.as_ref().is_some_and(|s| s.blocks > 0)
+    });
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_store_resyncs_after_the_engine_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = format!("confluence-store-b-{}", std::process::id());
+    let mut engine = spawn(&pipe, dir.path());
+    let store = confluence_client::StateStore::spawn(pipe.clone(), Box::new(|| {}));
+    wait_for("live", Duration::from_secs(10), || is_live(&store));
+    let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    c.call(Command::SetPoint { input: 1, output: 1, gain_db: 0.0, mute: false, invert: false }).unwrap();
+    wait_for("the point", Duration::from_secs(2), || store.view().state.as_ref().is_some_and(|s| s.points.len() == 1));
+    // Kill it, and restart it with a fresh journal: the point must disappear.
+    drop(c);
+    drop(std::mem::replace(&mut engine, Engine(None)));
+    wait_for("reconnecting", Duration::from_secs(5), || {
+        matches!(store.view().conn, confluence_client::ConnState::Reconnecting { .. })
+    });
+    std::fs::remove_file(dir.path().join("journal.bin")).unwrap();
+    let _engine2 = spawn(&pipe, dir.path());
+    wait_for("a fresh snapshot", Duration::from_secs(15), || {
+        let v = store.view();
+        matches!(v.conn, confluence_client::ConnState::Live) && v.state.as_ref().is_some_and(|s| s.points.is_empty())
+    });
+    let mut c2 = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    c2.call(Command::Shutdown).unwrap();
+}

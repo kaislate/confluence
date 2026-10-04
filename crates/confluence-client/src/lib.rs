@@ -10,6 +10,9 @@ use confluence_api::{read_envelope, write_frame, Command, Envelope, FrameError, 
 mod subscription;
 pub use subscription::Subscription;
 
+mod store;
+pub use store::{ConnState, Gap, HealthSample, StateStore, Store, StoreView, HISTORY_LEN};
+
 pub fn pipe_path(name: &str) -> String {
     format!(r"\\.\pipe\{name}")
 }
