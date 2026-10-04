@@ -50,6 +50,11 @@ impl Publisher {
         (self.last.clone(), rx)
     }
 
+    /// Ends every subscription (at shutdown).
+    pub fn close(&mut self) {
+        self.subscribers.clear();
+    }
+
     pub fn telemetry(&mut self, status: EngineStatus, health: Vec<SlotHealth>) {
         self.send(&Event::Telemetry { status, health });
     }
@@ -164,6 +169,15 @@ mod tests {
         drop(stalled);
         p.publish(state(vec![]));
         assert!(live.try_recv().is_ok(), "the live one still gets events");
+    }
+
+    #[test]
+    fn closing_ends_every_subscription() {
+        let mut p = Publisher::new(state(vec![]));
+        let (_, rx) = p.subscribe();
+        p.close();
+        assert_eq!(p.subscriber_count(), 0);
+        assert!(rx.recv().is_err(), "the stream ended");
     }
 
     #[test]
