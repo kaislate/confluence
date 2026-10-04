@@ -9,6 +9,7 @@
 #pragma once
 
 #include <intrin.h>
+#include <string.h>
 #include "confluence_vaio_abi.h"
 
 namespace vaio {
@@ -42,7 +43,9 @@ struct Link
 // Validates an engine region of `bytes` bytes and takes it over.
 inline bool attach(Link& l, void* region, unsigned long long bytes, long long now_ms)
 {
-    if (region == nullptr || bytes < CONFLUENCE_VAIO_HEADER_BYTES)
+    // The interlocked accesses to the header need natural alignment; a
+    // misaligned region would make every one of them a split lock.
+    if (region == nullptr || bytes < CONFLUENCE_VAIO_HEADER_BYTES || ((size_t)region & 7) != 0)
     {
         return false;
     }
@@ -147,17 +150,28 @@ inline void copy(Link& l, const unsigned char* src, unsigned int src_size, unsig
     }
     unsigned int allowed = plan(l, bytes);
     unsigned int frames = allowed / CONFLUENCE_VAIO_BYTES_PER_FRAME;
+    unsigned int ring_bytes = l.capacity * CONFLUENCE_VAIO_BYTES_PER_FRAME;
     unsigned int from = src_offset % src_size;
-    for (unsigned int n = 0; n < frames; ++n)
+    unsigned int to = (unsigned int)(l.written % l.capacity) * CONFLUENCE_VAIO_BYTES_PER_FRAME;
+    unsigned int left = frames * CONFLUENCE_VAIO_BYTES_PER_FRAME;
+    // Contiguous runs: each ends where the cyclic buffer or the ring wraps.
+    while (left > 0)
     {
-        unsigned int to = (unsigned int)(l.written % l.capacity) * CONFLUENCE_VAIO_BYTES_PER_FRAME;
-        for (unsigned int b = 0; b < CONFLUENCE_VAIO_BYTES_PER_FRAME; ++b)
+        unsigned int run = left;
+        if (run > src_size - from)
         {
-            l.ring[to + b] = src[(from + b) % src_size];
+            run = src_size - from;
         }
-        from = (from + CONFLUENCE_VAIO_BYTES_PER_FRAME) % src_size;
-        ++l.written;
+        if (run > ring_bytes - to)
+        {
+            run = ring_bytes - to;
+        }
+        memcpy(l.ring + to, src + from, run);
+        from = (from + run) % src_size;
+        to = (to + run) % ring_bytes;
+        left -= run;
     }
+    l.written += frames;
     store64(&l.header->WriteFrames, l.written);
     store64(&l.header->DriverTicks, load64(&l.header->DriverTicks) + 1);
 }

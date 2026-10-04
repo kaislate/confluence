@@ -129,7 +129,7 @@ fn render(resp: &Response) -> String {
                     line.push_str(&format!("  {} faults", h.device_faults));
                 }
                 if h.attached == Some(false) {
-                    line.push_str("  no DAW attached (a DAW open on another rate or block needs a reset)");
+                    line.push_str(&format!("  {}", h.idle_note.as_deref().unwrap_or("nothing attached")));
                 }
                 if h.driver_requests > 0 {
                     line.push_str(&format!("  {} driver requests (re-add the device)", h.driver_requests));
@@ -245,6 +245,7 @@ mod tests {
             device_faults,
             driver_requests,
             attached: None,
+            idle_note: None,
         };
         let text = render(&Response::Health {
             blocks: 9,
@@ -257,8 +258,13 @@ mod tests {
         assert!(lines[3].contains("4 faults") && lines[3].contains("2 driver requests"), "{text}");
         let mut waiting = h(4, false, 0, 0);
         waiting.attached = Some(false);
+        waiting.idle_note = Some("no app playing".into());
         let text = render(&Response::Health { blocks: 9, slots: vec![waiting], notices: vec!["x is odd".into()] });
-        assert!(text.contains("no DAW attached"), "{text}");
+        assert!(text.contains("no app playing") && !text.contains("DAW"), "the slot's own note: {text}");
         assert!(text.contains("note: x is odd"), "{text}");
+        let mut unexplained = h(5, false, 0, 0);
+        unexplained.attached = Some(false);
+        let text = render(&Response::Health { blocks: 9, slots: vec![unexplained], notices: Vec::new() });
+        assert!(text.contains("nothing attached"), "{text}");
     }
 }

@@ -41,7 +41,7 @@ pub enum VaioError {
     Block(usize),
     #[error("the Confluence VAIO driver is not installed")]
     NotInstalled,
-    #[error("Confluence VAIO is already in use by another engine")]
+    #[error("Confluence VAIO is already in use by another engine (or this account may not open it)")]
     InUse,
     #[error("the Confluence VAIO driver refused the engine's ring")]
     Rejected,

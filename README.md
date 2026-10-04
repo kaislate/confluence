@@ -57,6 +57,8 @@ VASIO runs on the engine's clock at the engine's sample rate and block size (the
 
 brings that audio into the engine as two inputs, on the engine's clock (no resampling). The engine must run at 48 kHz. Without an engine the device keeps playing into silence, so apps never stall.
 
+Any interactive user of the PC (including over Remote Desktop) can open the driver's control device and receive what is played to Confluence VAIO, so on a shared PC treat it like an open audio cable.
+
 Until signed builds exist, the driver only loads with test signing on. Build, sign and test it in the throwaway VM from `tools/vaio-vm`, never on your own PC:
 
     pwsh drivers/vaio/build.ps1; pwsh drivers/vaio/sign.ps1

@@ -980,6 +980,10 @@ impl StrictStats for VasioStats {
     fn attached(&self) -> Option<bool> {
         Some(self.connected.load(Ordering::Relaxed))
     }
+
+    fn idle_note(&self) -> Option<&'static str> {
+        Some("no DAW attached (a DAW open on another rate or block needs a reset)")
+    }
 }
 
 /// The VAIO endpoint as a strict slot on the audio thread (inputs only).
@@ -1004,6 +1008,10 @@ impl StrictStats for VaioStats {
     /// Whether an app is playing to the endpoint.
     fn attached(&self) -> Option<bool> {
         Some(self.streaming.load(Ordering::Relaxed))
+    }
+
+    fn idle_note(&self) -> Option<&'static str> {
+        Some("no app playing")
     }
 }
 
@@ -1065,7 +1073,6 @@ fn same_device(binding: &Binding, kind: DeviceKind, name: &str) -> bool {
     }
 }
 
-/// Parses a VASIO device name: `N`, `N:C` or `N:IxO` (DAW inputs x outputs).
 /// Milestone 0 has one VAIO endpoint, "1".
 pub fn parse_vaio(name: &str) -> Result<u32, String> {
     match name.trim() {
@@ -1074,6 +1081,7 @@ pub fn parse_vaio(name: &str) -> Result<u32, String> {
     }
 }
 
+/// Parses a VASIO device name: `N`, `N:C` or `N:IxO` (DAW inputs x outputs).
 pub fn parse_vasio(name: &str) -> Result<(u32, usize, usize), String> {
     let bad = || format!("'{name}' is not a VASIO device: use N, N:channels or N:INxOUT (e.g. 1, 1:8, 1:8x2)");
     let (n, shape) = name.trim().split_once(':').unwrap_or((name.trim(), "2"));
@@ -1105,6 +1113,14 @@ mod tests {
         assert_eq!(serde_json::from_str::<Binding>(&text).unwrap(), with_id);
         let asio = binding_of(DeviceKind::Asio, "x");
         assert!(!serde_json::to_string(&asio).unwrap().contains("endpoint_id"), "only written when known");
+    }
+
+    #[test]
+    fn idle_strict_slots_say_why_in_their_own_terms() {
+        let vaio = VaioStats::default();
+        assert_eq!(StrictStats::idle_note(&vaio), Some("no app playing"));
+        let vasio = VasioStats::default();
+        assert!(StrictStats::idle_note(&vasio).is_some_and(|n| n.contains("no DAW attached")));
     }
 
     #[test]

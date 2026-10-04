@@ -6,9 +6,15 @@ Import-Module (Join-Path $PSScriptRoot 'VaioVm.psm1') -Force
 $repo = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 # A clean Windows has no Visual C++ runtime: link the CRT statically, in a
 # separate target directory so the normal build cache is not invalidated.
-$env:RUSTFLAGS = '-C target-feature=+crt-static'
-$env:CARGO_TARGET_DIR = Join-Path $repo 'target\vm'
-$json = cargo test --release -p confluence-provider-vaio --test vm --no-run --message-format=json --manifest-path (Join-Path $repo 'Cargo.toml')
+$saved = $env:RUSTFLAGS, $env:CARGO_TARGET_DIR
+try {
+    $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    $env:CARGO_TARGET_DIR = Join-Path $repo 'target\vm'
+    $json = cargo test --release -p confluence-provider-vaio --test vm --no-run --message-format=json --manifest-path (Join-Path $repo 'Cargo.toml')
+} finally {
+    # Leave the caller's session as it was (later cargo runs use the normal build).
+    $env:RUSTFLAGS, $env:CARGO_TARGET_DIR = $saved
+}
 $exe = ($json | ForEach-Object { $_ | ConvertFrom-Json -ErrorAction SilentlyContinue } |
     Where-Object { $_.reason -eq 'compiler-artifact' -and $_.executable } | Select-Object -Last 1).executable
 if (-not $exe) { throw "no test executable" }
