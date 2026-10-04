@@ -98,6 +98,8 @@ protected:
     ULONG                       m_ulLastOsReadPacket;
     ULONG                       m_ulLastOsWritePacket;
     LONGLONG                    m_llPacketCounter;
+    ULONGLONG                   m_ullNotifiedPackets;   // Confluence VAIO: packets signalled while engine-driven
+    BOOLEAN                     m_bVaioDriven;          // Confluence VAIO: the last UpdatePosition was engine-driven
     ULONGLONG                   m_ullDmaTimeStamp;
     LARGE_INTEGER               m_ullPerformanceCounterFrequency;
     ULONGLONG                   m_hnsElapsedTimeCarryForward;

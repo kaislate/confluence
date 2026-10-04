@@ -4,6 +4,7 @@
 #include "endpoints.h"
 #include "minwavert.h"
 #include "minwavertstream.h"
+#include "vaiocontrol.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
 
 #pragma warning (disable : 4127)
@@ -204,6 +205,8 @@ Return Value:
     m_pTimer = NULL;
     m_pDpc = NULL;
     m_llPacketCounter = 0;
+    m_ullNotifiedPackets = 0;
+    m_bVaioDriven = FALSE;
     m_ullPlayPosition = 0;
     m_ullWritePosition = 0;
     m_ullDmaTimeStamp = 0;
@@ -1184,6 +1187,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
             KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
             // Reset DMA
             m_llPacketCounter = 0;
+            m_ullNotifiedPackets = 0;
             m_ullPlayPosition = 0;
             m_ullWritePosition = 0;
             m_ullLinearPosition = 0;
@@ -1197,6 +1201,11 @@ NTSTATUS CMiniportWaveRTStream::SetState
             m_bLastBufferRendered = FALSE;
 
             KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
+
+            if (!m_bCapture)
+            {
+                VaioSetStreaming(FALSE);   // Confluence VAIO
+            }
 
             // Wait until all work items are completed.
             if (!m_bCapture && !g_DoNotCreateDataFiles)
@@ -1221,7 +1230,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 //
 
                 // Pause DMA
-                if (m_ulNotificationIntervalMs > 0)
+                if (m_ulNotificationIntervalMs > 0 || !m_bCapture)
                 {
                     ExCancelTimer(m_pNotificationTimer, NULL);
                     KeFlushQueuedDpcs(); 
@@ -1242,6 +1251,10 @@ NTSTATUS CMiniportWaveRTStream::SetState
                     }
                 }
             }
+            if (!m_bCapture)
+            {
+                VaioSetStreaming(FALSE);   // Confluence VAIO
+            }
             // This call updates the linear buffer and presentation positions.
             GetPositions(NULL, NULL, NULL);
             break;
@@ -1252,7 +1265,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
             ullPerfCounterTemp = KeQueryPerformanceCounter(&m_ullPerformanceCounterFrequency);
             m_ullLastDPCTimeStamp = m_ullDmaTimeStamp = KSCONVERT_PERFORMANCE_TIME(m_ullPerformanceCounterFrequency.QuadPart, ullPerfCounterTemp);
 
-            if (m_ulNotificationIntervalMs > 0)
+            if (m_ulNotificationIntervalMs > 0 || !m_bCapture)
             {
                 // Set timer for 1 ms. This will cause DPC to run every 1 ms but driver will send out 
                 // notification events only after notification interval. This timer is used by Simple Audio Sample to 
@@ -1266,6 +1279,13 @@ NTSTATUS CMiniportWaveRTStream::SetState
                     NULL
                  );
 
+            }
+
+            if (!m_bCapture)
+            {
+                // Confluence VAIO: a render stream always needs the 1 ms timer to
+                // fill the engine's ring.
+                VaioSetStreaming(TRUE);
             }
 
             break;
@@ -1326,6 +1346,27 @@ VOID CMiniportWaveRTStream::UpdatePosition
 
     ULONG ByteDisplacement = ((m_ulDmaMovementRate * TimeElapsedInMS) + m_byteDisplacementCarryForward) / 1000 ;
     m_byteDisplacementCarryForward = ((m_ulDmaMovementRate * TimeElapsedInMS) + m_byteDisplacementCarryForward) % 1000;
+
+    // Confluence VAIO: while an engine is attached and alive, the stream moves
+    // by what was copied into its ring, which follows the engine's clock,
+    // instead of by elapsed time.
+    m_bVaioDriven = FALSE;
+    if (!m_bCapture && m_pDmaBuffer != NULL && m_ulDmaBufferSize != 0)
+    {
+        ULONG limit = m_ulDmaBufferSize;
+        if (m_bEoSReceived)
+        {
+            // Never past the end of stream the app announced.
+            limit = (m_ulCurrentWritePosition + m_ulDmaBufferSize - (ULONG)m_ullWritePosition) % m_ulDmaBufferSize;
+        }
+        ULONG pumped = 0;
+        if (VaioAdvance(ByteDisplacement, limit, m_pDmaBuffer, m_ulDmaBufferSize,
+                        (ULONG)(m_ullLinearPosition % m_ulDmaBufferSize), &pumped))
+        {
+            ByteDisplacement = pumped;
+            m_bVaioDriven = TRUE;
+        }
+    }
 
     // Increment presentation position even after last buffer is rendered.
     m_ullPresentationPosition += ByteDisplacement;
@@ -1577,26 +1618,65 @@ TimerNotifyRT
     // to convert to milliseconds may cause us to lose some of the time, so we will carry the remainder forward.
 
     ULONG TimeElapsedInMS = (ULONG)(hnsCurrentTime - _this->m_ullLastDPCTimeStamp + _this->m_hnsDPCTimeCarryForward)/10000;
+    ULONG packetBytes = (ULONG)(((ULONGLONG)_this->m_ulNotificationIntervalMs * _this->m_ulDmaMovementRate) / 1000);
 
-    if (TimeElapsedInMS >= _this->m_ulNotificationIntervalMs)
+    // Confluence VAIO: with an engine attached, refill its ring every tick.
+    BOOLEAN vaio = !_this->m_bCapture && VaioIsAttached();
+    if (vaio)
     {
-        // Carry forward the time greater than notification interval to adjust time to signal next buffer completion event accordingly.
-        _this->m_hnsDPCTimeCarryForward = hnsCurrentTime - _this->m_ullLastDPCTimeStamp + _this->m_hnsDPCTimeCarryForward - (_this->m_ulNotificationIntervalMs * 10000);
-        // Save the last time DPC ran at notification interval
+        _this->UpdatePosition(qpc);
+    }
+
+    if (vaio && _this->m_bVaioDriven)
+    {
+        // Engine-driven: a packet completes when the position crosses a
+        // packet boundary, not when time says so.
+        if (packetBytes > 0)
+        {
+            ULONGLONG packets = _this->m_ullLinearPosition / packetBytes;
+            if (packets != _this->m_ullNotifiedPackets)
+            {
+                _this->m_ullNotifiedPackets = packets;
+                bufferCompleted = TRUE;
+                if (!_this->m_bEoSReceived)
+                {
+                    _this->m_llPacketCounter++;
+                }
+            }
+        }
+        // Free-running resumes from now, without a burst, if the engine goes quiet.
         _this->m_ullLastDPCTimeStamp = hnsCurrentTime;
-        bufferCompleted = TRUE;
+        _this->m_hnsDPCTimeCarryForward = 0;
+        if (!bufferCompleted && !_this->m_bEoSReceived)
+        {
+            goto End;
+        }
     }
-
-    if (!bufferCompleted && !_this->m_bEoSReceived)
+    else
     {
-        goto End;
-    }
+        if (TimeElapsedInMS >= _this->m_ulNotificationIntervalMs && _this->m_ulNotificationIntervalMs > 0)
+        {
+            _this->m_hnsDPCTimeCarryForward = hnsCurrentTime - _this->m_ullLastDPCTimeStamp + _this->m_hnsDPCTimeCarryForward - (_this->m_ulNotificationIntervalMs * 10000);
+            _this->m_ullLastDPCTimeStamp = hnsCurrentTime;
+            bufferCompleted = TRUE;
+        }
 
-    _this->UpdatePosition(qpc);
+        if (!bufferCompleted && !_this->m_bEoSReceived)
+        {
+            goto End;
+        }
 
-    if (!_this->m_bEoSReceived)
-    {
-        _this->m_llPacketCounter++;
+        if (!vaio)
+        {
+            _this->UpdatePosition(qpc);
+        }
+
+        if (!_this->m_bEoSReceived)
+        {
+            _this->m_llPacketCounter++;
+        }
+        // Where the engine-driven path starts counting from, should it take over.
+        _this->m_ullNotifiedPackets = packetBytes > 0 ? _this->m_ullLinearPosition / packetBytes : 0;
     }
 
     if (_this->m_KsState != KSSTATE_RUN)

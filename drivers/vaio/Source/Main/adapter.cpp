@@ -22,6 +22,7 @@ Abstract:
 #include "definitions.h"
 #include "endpoints.h"
 #include "minipairs.h"
+#include "vaiocontrol.h"
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -104,6 +105,8 @@ Environment:
         goto Done;
     }
     
+    VaioControlDelete();   // Confluence VAIO
+
     //
     // Invoke first the port unload.
     //
@@ -347,6 +350,12 @@ Return Value:
     DriverObject->DriverUnload = DriverUnload;
 
     //
+    // Confluence VAIO: route IRPs for our control device to us, all others to
+    // portcls (and PnpHandler). Must come after every other override above.
+    //
+    VaioInstallDispatch(DriverObject);
+
+    //
     // All done.
     //
     ntStatus = STATUS_SUCCESS;
@@ -424,6 +433,17 @@ Return Value:
             maxObjects,
             0
         );
+
+    if (NT_SUCCESS(ntStatus))
+    {
+        // Confluence VAIO: without the control device the endpoint still
+        // plays (free-running); the engine just cannot attach.
+        NTSTATUS control = VaioControlCreate(DriverObject);
+        if (!NT_SUCCESS(control))
+        {
+            DPF(D_ERROR, ("VaioControlCreate failed, 0x%x", control));
+        }
+    }
 
     return ntStatus;
 } // AddDevice
@@ -825,6 +845,12 @@ Return Value:
     case IRP_MN_REMOVE_DEVICE:
     case IRP_MN_SURPRISE_REMOVAL:
     case IRP_MN_STOP_DEVICE:
+        if (stack->MinorFunction != IRP_MN_STOP_DEVICE)
+        {
+            // Confluence VAIO: the device is going away; release the engine's
+            // memory and the control device (it would keep the driver loaded).
+            VaioControlDelete();
+        }
         ext = static_cast<PortClassDeviceContext*>(_DeviceObject->DeviceExtension);
 
         if (ext->m_pCommon != NULL)

@@ -318,6 +318,7 @@
     <ClCompile Include="minwavert.cpp" />
     <ClCompile Include="minwavertstream.cpp" />
     <ClCompile Include="newdelete.cpp" />
+    <ClCompile Include="vaiocontrol.cpp" />
     <ResourceCompile Include="SimpleAudioSample.rc" />
   </ItemGroup>
   <ItemGroup>
