@@ -195,6 +195,9 @@ pub fn decode_png(path: &Path) -> Result<ColorImage, String> {
     Ok(ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
 }
 
+/// The dark edge under every white state mark (mute, invert, pending).
+const MARK_OUTLINE: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 200);
+
 fn full_uv() -> Rect {
     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
 }
@@ -334,21 +337,25 @@ impl Look {
                 if !self.image(p, "cell_routed", r, tint) {
                     p.rect_filled(r, rounding, dimmed(self.routed(pt.gain_db)));
                 }
+                // White marks over a dark outline: visible on any skin image.
                 if pt.mute {
-                    p.line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.5, Color32::WHITE));
+                    let slash = [r.left_bottom(), r.right_top()];
+                    p.line_segment(slash, Stroke::new(3.5, MARK_OUTLINE));
+                    p.line_segment(slash, Stroke::new(1.5, Color32::WHITE));
                 }
                 if pt.invert {
-                    p.text(
-                        r.center(),
-                        Align2::CENTER_CENTER,
-                        "Ø",
-                        FontId::proportional(r.height() * 0.7),
-                        Color32::WHITE,
-                    );
+                    let font = FontId::proportional(r.height() * 0.7);
+                    for d in
+                        [egui::vec2(1.0, 1.0), egui::vec2(-1.0, -1.0), egui::vec2(1.0, -1.0), egui::vec2(-1.0, 1.0)]
+                    {
+                        p.text(r.center() + d, Align2::CENTER_CENTER, "Ø", font.clone(), MARK_OUTLINE);
+                    }
+                    p.text(r.center(), Align2::CENTER_CENTER, "Ø", font, Color32::WHITE);
                 }
             }
         }
         if pending && !self.image(p, "cell_pending", r, Color32::WHITE) {
+            p.rect_stroke(r, rounding, Stroke::new(3.0, MARK_OUTLINE), StrokeKind::Inside);
             p.rect_stroke(r, rounding, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
         }
         if selected && !self.image(p, "cell_selected", rect, Color32::WHITE) {
@@ -470,6 +477,34 @@ background = \"wide.png\"
         let (look, warnings) = Look::load(&ctx, dir.path());
         assert!(!look.has_image("background"));
         assert!(warnings.iter().any(|w| w.contains("background") && w.contains("too large")), "{warnings:?}");
+    }
+
+    /// Mute, invert and pending must stay visible on any skin image, including
+    /// a light one: each white mark gets a dark outline under it.
+    #[test]
+    fn state_marks_have_a_dark_outline_for_any_background() {
+        use eframe::egui::Shape;
+        let look = Look::builtin();
+        let ctx = egui::Context::default();
+        let pt = PointState { input: 0, output: 0, gain_db: 0.0, mute: true, invert: true };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), egui::vec2(20.0, 20.0));
+            look.paint_cell(ui.painter(), rect, Some(&pt), true, false, false);
+        });
+        out.textures_delta.clear(); // egui requires a frame's texture changes to be handled
+        let dark = |c: Color32| c.a() > 0 && c.r() < 64 && c.g() < 64 && c.b() < 64;
+        let (mut dark_line, mut texts, mut dark_outline) = (false, 0, false);
+        for clipped in &out.shapes {
+            match &clipped.shape {
+                Shape::LineSegment { stroke, .. } if dark(stroke.color) => dark_line = true,
+                Shape::Text(_) => texts += 1,
+                Shape::Rect(r) if r.stroke.width > 0.0 && dark(r.stroke.color) => dark_outline = true,
+                _ => {}
+            }
+        }
+        assert!(dark_line, "the mute slash has a dark outline");
+        assert!(texts >= 2, "the invert glyph has a dark shadow under it ({texts} text shapes)");
+        assert!(dark_outline, "the pending outline has a dark edge");
     }
 
     #[test]
