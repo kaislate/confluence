@@ -8,6 +8,7 @@ Status: Milestone 0 in progress. Done so far:
 - the headless engine;
 - ASIO (several drivers in one process), WASAPI and per-application capture;
 - VASIO, a virtual ASIO driver that connects DAWs to the engine.
+- VAIO, a virtual Windows playback device whose audio goes to the engine (test-signed for now).
 
 ## Build and test
 
@@ -47,6 +48,21 @@ Then serve an instance from the engine and route to and from it like any other d
     cargo run -p confluence-cli -- add-device vasio 2:8x2     # 8 DAW inputs, 2 DAW outputs
 
 VASIO runs on the engine's clock at the engine's sample rate and block size (the DAW cannot change them), and adds two blocks of round-trip latency. If the engine is not running, the DAW keeps running on silence and reconnects by itself when the engine starts.
+
+## VAIO (virtual Windows playback device)
+
+`drivers/vaio` is a separate program (MS-PL/MIT; see its README). It is a kernel driver that adds a playback device, "Confluence VAIO". Apps play to it, and
+
+    cargo run -p confluence-cli -- add-device vaio 1
+
+brings that audio into the engine as two inputs, on the engine's clock (no resampling). The engine must run at 48 kHz. Without an engine the device keeps playing into silence, so apps never stall.
+
+Until signed builds exist, the driver only loads with test signing on. Build, sign and test it in the throwaway VM from `tools/vaio-vm`, never on your own PC:
+
+    pwsh drivers/vaio/build.ps1; pwsh drivers/vaio/sign.ps1
+    pwsh tools/vaio-vm/New-VaioTestVm.ps1        # once: Hyper-V VM, Windows installed unattended
+    pwsh tools/vaio-vm/Install-VaioInVm.ps1      # driver + Driver Verifier
+    pwsh tools/vaio-vm/Invoke-VaioVmTests.ps1    # end-to-end tests inside the VM
 
 ## Hardware tests
 
