@@ -49,6 +49,33 @@ pub fn badge(conn: &ConnState, last_event: Option<Instant>, now: Instant) -> Str
     }
 }
 
+/// Keys that act on the selected cell.
+const CELL_KEYS: [(Key, CellKey); 7] = [
+    (Key::Space, CellKey::Toggle),
+    (Key::Plus, CellKey::Up),
+    (Key::Equals, CellKey::Up),
+    (Key::Minus, CellKey::Down),
+    (Key::M, CellKey::Mute),
+    (Key::I, CellKey::Invert),
+    (Key::Delete, CellKey::Remove),
+];
+
+/// The cell actions for the keys pressed this frame, and whether they step
+/// finely. Fine is Alt, not Shift: typing `+` already needs Shift on many
+/// layouts. Ctrl/Cmd combinations are left to other shortcuts (e.g. zoom).
+pub fn cell_keys(pressed: &[Key], mods: egui::Modifiers) -> (Vec<CellKey>, bool) {
+    if mods.ctrl || mods.command {
+        return (Vec::new(), false);
+    }
+    let mut keys: Vec<CellKey> = Vec::new();
+    for (k, action) in CELL_KEYS {
+        if pressed.contains(&k) && !keys.contains(&action) {
+            keys.push(action);
+        }
+    }
+    (keys, mods.alt)
+}
+
 /// When the window must look again even if nothing arrives: while not
 /// connected (timers in the banner), or when a live engine would cross the
 /// "Not responding" threshold.
@@ -461,19 +488,8 @@ impl ConfluenceApp {
         };
         let layout = GridLayout::new(&state.slots, self.cell);
         let (fine, keys, moves) = ui.input(|i| {
-            let keys: Vec<CellKey> = [
-                (Key::Space, CellKey::Toggle),
-                (Key::Plus, CellKey::Up),
-                (Key::Equals, CellKey::Up),
-                (Key::Minus, CellKey::Down),
-                (Key::M, CellKey::Mute),
-                (Key::I, CellKey::Invert),
-                (Key::Delete, CellKey::Remove),
-            ]
-            .into_iter()
-            .filter(|(k, _)| i.key_pressed(*k))
-            .map(|(_, c)| c)
-            .collect();
+            let pressed: Vec<Key> = CELL_KEYS.iter().map(|(k, _)| *k).filter(|k| i.key_pressed(*k)).collect();
+            let (keys, fine) = cell_keys(&pressed, i.modifiers);
             let moves: Vec<(i32, i32)> = [
                 (Key::ArrowUp, (-1, 0)),
                 (Key::ArrowDown, (1, 0)),
@@ -484,7 +500,7 @@ impl ConfluenceApp {
             .filter(|(k, _)| i.key_pressed(*k))
             .map(|(_, d)| d)
             .collect();
-            (i.modifiers.shift, keys, moves)
+            (fine, keys, moves)
         });
         for key in keys {
             let cur = self.point(input, output);
@@ -583,6 +599,20 @@ mod tests {
             "keeps the badge's timer moving"
         );
         assert_eq!(next_check(&ConnState::Connecting, None, now), Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn gain_keys_step_by_one_db_and_alt_makes_them_fine() {
+        use egui::Modifiers;
+        let shift = Modifiers { shift: true, ..Default::default() };
+        let alt = Modifiers { alt: true, ..Default::default() };
+        let ctrl = Modifiers { ctrl: true, command: true, ..Default::default() };
+        assert_eq!(cell_keys(&[Key::Plus], shift), (vec![CellKey::Up], false), "typing + needs Shift: still 1 dB");
+        assert_eq!(cell_keys(&[Key::Equals], Modifiers::NONE), (vec![CellKey::Up], false));
+        assert_eq!(cell_keys(&[Key::Plus, Key::Equals], shift), (vec![CellKey::Up], false), "one step, not two");
+        assert_eq!(cell_keys(&[Key::Minus], alt), (vec![CellKey::Down], true));
+        assert_eq!(cell_keys(&[Key::Equals], ctrl), (vec![], false), "Ctrl+= is zoom, not gain");
+        assert_eq!(cell_keys(&[Key::M, Key::Space], Modifiers::NONE), (vec![CellKey::Toggle, CellKey::Mute], false));
     }
 
     #[test]
