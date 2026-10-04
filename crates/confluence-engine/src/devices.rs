@@ -590,16 +590,23 @@ impl DeviceManager {
         self.master_health = Some((id, health));
     }
 
-    /// Adds each open device's own health (loss, faults, driver requests) to
-    /// the engine's `Health` response for that device's slots.
-    pub fn annotate(&self, resp: &mut Response) {
-        let Response::Health { slots, notices, .. } = resp else { return };
+    /// Engine-wide conditions a user should know about (also in Health).
+    pub fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
         if let Some(why) = self.save_blocked {
-            notices.push(match &self.path {
+            out.push(match &self.path {
                 Some(p) => format!("device changes are not being saved: {} {why}", p.display()),
                 None => "device changes are not being saved".into(),
             });
         }
+        out
+    }
+
+    /// Adds each open device's own health (loss, faults, driver requests) to
+    /// the engine's `Health` response for that device's slots.
+    pub fn annotate(&self, resp: &mut Response) {
+        let Response::Health { slots, notices, .. } = resp else { return };
+        notices.extend(self.notices());
         if let Some((id, hl)) = &self.master_health {
             for h in slots.iter_mut().filter(|h| h.id == *id) {
                 h.device_faults = hl.faults.load(Ordering::Relaxed);
