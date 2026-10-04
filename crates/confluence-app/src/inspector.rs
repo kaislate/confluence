@@ -278,6 +278,7 @@ mod display_tests {
             health: Vec::new(),
             history: Arc::new(History::new()),
             last_event: None,
+            snapshots: 1,
         }
     }
 

@@ -102,7 +102,8 @@ pub fn show(
                 if !hit.is_positive() {
                     continue;
                 }
-                let sense = if editable { Sense::click_and_drag() } else { Sense::hover() };
+                // Read-only (no engine): a click still selects, to inspect the cell.
+                let sense = if editable { Sense::click_and_drag() } else { Sense::click() };
                 let resp = ui.interact(hit, Id::new(("cell", p)), sense);
                 resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, editable, &label));
                 let (cur, pending) = lookup(p);
@@ -111,6 +112,9 @@ pub fn show(
                 look.paint_cell(ui.painter(), rect, cur.as_ref(), pending, selected == Some(p), !online || !editable);
                 let resp = resp.on_hover_text(tooltip(&label, cur.as_ref()));
                 if !editable {
+                    if resp.clicked() {
+                        actions.select = Some(Selection::Cell { input: p.0, output: p.1 });
+                    }
                     continue;
                 }
                 let mut wheel = 0.0;

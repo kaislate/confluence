@@ -58,9 +58,9 @@ pub fn base_name(kind: DeviceKind, name: &str) -> String {
     }
 }
 
-fn add_button(ui: &mut egui::Ui, accessible: String) -> bool {
-    let b = ui.button("Add");
-    b.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &accessible));
+fn add_button(ui: &mut egui::Ui, accessible: String, enabled: bool) -> bool {
+    let b = ui.add_enabled(enabled, egui::Button::new("Add"));
+    b.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &accessible));
     b.clicked()
 }
 
@@ -99,7 +99,7 @@ pub fn show(
                                 ui.add(TextEdit::singleline(spec).hint_text("2x2").desired_width(48.0));
                                 name = vasio_name(&d.name, spec);
                             }
-                            if add_button(ui, format!("Add {} {}", kind_title(kind), d.name)) {
+                            if add_button(ui, format!("Add {} {}", kind_title(kind), d.name), true) {
                                 st.adding.insert((kind, d.name.clone()));
                                 edits.push(Edit::AddDevice { kind, name });
                             }
@@ -112,7 +112,9 @@ pub fn show(
             ui.horizontal(|ui| {
                 ui.add(TextEdit::singleline(&mut st.app_name).hint_text("process name or PID").desired_width(140.0));
                 let name = st.app_name.trim().to_string();
-                if add_button(ui, "Add app capture".into()) && !name.is_empty() {
+                if st.adding.iter().any(|(kind, _)| *kind == DeviceKind::AppCapture) {
+                    ui.add(Spinner::new());
+                } else if add_button(ui, "Add app capture".into(), !name.is_empty()) {
                     st.adding.insert((DeviceKind::AppCapture, name.clone()));
                     edits.push(Edit::AddDevice { kind: DeviceKind::AppCapture, name });
                 }
@@ -160,6 +162,28 @@ mod tests {
         assert_eq!(vasio_name("2", " 8x2 "), "2:8x2");
         assert_eq!(base_name(DeviceKind::Vasio, "2:8x2"), "2");
         assert_eq!(base_name(DeviceKind::Asio, "A:B"), "A:B");
+    }
+
+    #[test]
+    fn app_capture_needs_a_name_and_shows_progress() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        use egui_kittest::Harness;
+        let mut h = Harness::new_ui_state(
+            |ui, (st, edits): &mut (DevicesState, Vec<Edit>)| {
+                edits.extend(show(ui, &[], &[], st, true));
+            },
+            (DevicesState::default(), Vec::new()),
+        );
+        h.run();
+        assert!(h.get_by_label("Add app capture").accesskit_node().is_disabled(), "no name: nothing to add");
+        h.state_mut().0.app_name = "Discord".into();
+        h.run();
+        assert!(!h.get_by_label("Add app capture").accesskit_node().is_disabled());
+        h.get_by_label("Add app capture").click();
+        h.step(); // the spinner keeps animating: one frame, not run-until-idle
+        h.step();
+        assert_eq!(h.state().1, vec![Edit::AddDevice { kind: DeviceKind::AppCapture, name: "Discord".into() }]);
+        assert!(h.query_by_label("Add app capture").is_none(), "a spinner while it is being added");
     }
 
     #[test]

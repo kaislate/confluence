@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use confluence_app::app::{flag, AppConfig, ConfluenceApp, INSPECTOR_KEY};
+use confluence_app::app::{flag, startup_error_text, AppConfig, ConfluenceApp, INSPECTOR_KEY};
 use confluence_app::engine_launch::{engine_args, engine_next_to, ENGINE_EXE};
 use confluence_client::default_pipe_name;
 use eframe::egui;
@@ -20,7 +20,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_title("Confluence").with_inner_size([1100.0, 700.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "Confluence",
         options,
         Box::new(move |cc| {
@@ -30,5 +30,25 @@ fn main() -> eframe::Result {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+    if let Err(e) = &result {
+        show_error(&startup_error_text(e));
+    }
+    result
+}
+
+/// A message box: a release build has no console to print to.
+#[cfg(windows)]
+fn show_error(text: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    // SAFETY: valid strings that outlive the call; no owner window.
+    unsafe {
+        MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("Confluence"), MB_OK | MB_ICONERROR);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_error(text: &str) {
+    eprintln!("{text}");
 }
