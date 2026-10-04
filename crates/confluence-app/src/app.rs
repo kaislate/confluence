@@ -79,6 +79,8 @@ pub struct ConfluenceApp {
     xruns: (u64, Option<Instant>),
     look: Look,
     skin_dir: Option<PathBuf>,
+    /// A slot waiting for "Remove ‹name›?" to be confirmed.
+    confirm_remove: Option<u32>,
 }
 
 impl ConfluenceApp {
@@ -114,6 +116,7 @@ impl ConfluenceApp {
             xruns: (0, None),
             look: Look::builtin(),
             skin_dir: config.skin,
+            confirm_remove: None,
         }
     }
 
@@ -250,9 +253,6 @@ impl ConfluenceApp {
         });
     }
 
-    /// Extended by the inspector (Task 8) and devices panel (Task 9).
-    fn top_bar_buttons(&mut self, _ui: &mut egui::Ui) {}
-
     fn banner(&mut self, ui: &mut egui::Ui, view: &StoreView, now: Instant) {
         let (warn, error) = (self.look.skin.colors.warn, self.look.skin.colors.error);
         match view.conn {
@@ -286,11 +286,71 @@ impl ConfluenceApp {
         }
     }
 
-    /// Extended by the inspector (Task 8) and devices panel (Task 9).
-    fn side_panels(&mut self, _ui: &mut egui::Ui, _view: &StoreView, _now: Instant) {}
+    fn top_bar_buttons(&mut self, ui: &mut egui::Ui) {
+        ui.toggle_value(&mut self.inspector_open, "Inspector");
+    }
 
-    /// Extended by the inspector (Task 8).
-    fn dialogs(&mut self, _ctx: &egui::Context, _view: &StoreView) {}
+    fn side_panels(&mut self, ui: &mut egui::Ui, view: &StoreView, _now: Instant) {
+        if !self.inspector_open {
+            return;
+        }
+        let editable = self.live();
+        let point = match self.selection {
+            Selection::Cell { input, output } => self.point(input, output),
+            _ => None,
+        };
+        let selection = self.selection;
+        let look = &self.look;
+        let actions = egui::Panel::right("inspector")
+            .resizable(true)
+            .default_size(300.0)
+            .show(ui, |ui| {
+                look.paint_surface(ui.painter(), ui.max_rect(), "panel", look.skin.colors.panel);
+                egui::ScrollArea::vertical()
+                    .show(ui, |ui| crate::inspector::show(ui, view, look, &selection, point, editable))
+                    .inner
+            })
+            .inner;
+        for a in actions {
+            match a {
+                crate::inspector::Action::Edit(e) => self.send(e),
+                crate::inspector::Action::RemoveSlot(id) => self.confirm_remove = Some(id),
+            }
+        }
+    }
+
+    fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
+        let Some(id) = self.confirm_remove else { return };
+        let Some(state) = &view.state else { return };
+        let Some(slot) = state.slots.iter().find(|s| s.id == id) else {
+            self.confirm_remove = None;
+            return;
+        };
+        let routes = crate::inspector::routes_of(state, slot);
+        let mut choice = None;
+        let modal = egui::Modal::new(Id::new("confirm-remove")).show(ctx, |ui| {
+            ui.label(format!("Remove {}? Its {routes} routes are removed too.", slot.name));
+            ui.horizontal(|ui| {
+                if ui.button("Remove").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        if modal.should_close() && choice.is_none() {
+            choice = Some(false);
+        }
+        match choice {
+            Some(true) => {
+                self.confirm_remove = None;
+                self.send(Edit::RemoveSlot { id });
+            }
+            Some(false) => self.confirm_remove = None,
+            None => {}
+        }
+    }
 
     fn matrix(&mut self, ui: &mut egui::Ui, view: &StoreView) {
         let editable = self.live();
