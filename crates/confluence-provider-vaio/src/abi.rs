@@ -19,7 +19,7 @@ pub const MIN_TARGET: u32 = 64;
 /// `CTL_CODE(FILE_DEVICE_SOUND, 0x900, METHOD_OUT_DIRECT, FILE_READ_ACCESS | FILE_WRITE_ACCESS)`.
 pub const IOCTL_ATTACH: u32 = 0x001D_E402;
 /// Path the engine opens.
-pub const USER_PATH: &str = r"\.\ConfluenceVaio";
+pub const USER_PATH: &str = r"\\.\ConfluenceVaio";
 /// DOS device name, for checking that the driver is installed.
 pub const DOS_NAME: &str = "ConfluenceVaio";
 
@@ -70,5 +70,13 @@ mod tests {
         assert_eq!(IOCTL_ATTACH, (0x1D << 16) | (3 << 14) | (0x900 << 2) | 2);
         assert_eq!(IOCTL_ATTACH, 0x001D_E402);
         assert_eq!(BYTES_PER_FRAME, CHANNELS * 4);
+    }
+
+    /// The driver's symbolic link is \DosDevices\Global\ConfluenceVaio, which a
+    /// process opens as \\.\ConfluenceVaio (two leading backslashes).
+    #[test]
+    fn the_control_device_path_is_the_dos_device_namespace() {
+        assert_eq!(USER_PATH, "\\\\.\\ConfluenceVaio");
+        assert_eq!(USER_PATH.strip_prefix("\\\\.\\"), Some(DOS_NAME));
     }
 }
