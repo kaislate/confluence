@@ -74,6 +74,27 @@ inline void detach(Link& l)
     l = Link{};
 }
 
+// How long the engine may stay silent before the stream free-runs: the base
+// timeout, or three ring targets' worth for long engine blocks (the engine's
+// heartbeat moves once per block).
+inline long long engine_timeout_ms(const Link& l)
+{
+    long long ring_ms = (long long)l.target * 3 * 1000 / CONFLUENCE_VAIO_SAMPLE_RATE;
+    return ring_ms > CONFLUENCE_VAIO_ENGINE_TIMEOUT_MS ? ring_ms : CONFLUENCE_VAIO_ENGINE_TIMEOUT_MS;
+}
+
+// While the engine drives, the stream may run at most 33/32 of real time
+// (whole frames). The ring's room decides how far it actually goes, so a slow
+// engine still throttles it, and the ~3% headroom covers an engine clock that
+// runs fast. It never jumps a whole engine block at once, and never gets far
+// ahead of what the app has written: both read stale audio and miscount
+// packets (a 2048-frame block refilled at 1.25x still clicked).
+inline unsigned int pace(unsigned int time_bytes)
+{
+    unsigned int frames = time_bytes / CONFLUENCE_VAIO_BYTES_PER_FRAME;
+    return frames * 33 / 32 * CONFLUENCE_VAIO_BYTES_PER_FRAME;
+}
+
 // True while the engine's heartbeat moved within the timeout.
 inline bool engine_alive(Link& l, long long now_ms)
 {
@@ -87,7 +108,7 @@ inline bool engine_alive(Link& l, long long now_ms)
         l.last_heartbeat = hb;
         l.heartbeat_changed_ms = now_ms;
     }
-    return now_ms - l.heartbeat_changed_ms <= CONFLUENCE_VAIO_ENGINE_TIMEOUT_MS;
+    return now_ms - l.heartbeat_changed_ms <= engine_timeout_ms(l);
 }
 
 // Frames queued for the engine, or `capacity` when its counter makes no sense.

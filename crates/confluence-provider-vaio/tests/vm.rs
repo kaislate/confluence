@@ -59,25 +59,53 @@ fn run_engine(slot: &mut VaioSlot, block: usize, rate: f64, secs: f64, mut each:
     }
 }
 
+/// Plays a 997 Hz tone to VAIO and checks what an engine with `block`-frame
+/// blocks receives: level, pitch, no clicks (stale or skipped audio), no underruns.
+fn tone_arrives_cleanly(block: usize) {
+    let mut slot = VaioSlot::open(48_000.0, block).unwrap();
+    let (_stream, _) = play_tone();
+    let mut samples = Vec::new();
+    run_engine(&mut slot, block, 48_000.0, 3.0, |b| samples.extend_from_slice(b));
+    let tail = &samples[samples.len() / 2..]; // after start-up
+    let rms = (tail.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
+    assert!((rms - 0.5 / 2f64.sqrt()).abs() < 0.05, "block {block}: rms {rms}");
+    let crossings = tail.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count() as f64;
+    let hz = crossings / (tail.len() as f64 / 48_000.0);
+    assert!((hz - 997.0).abs() < 10.0, "block {block}: frequency {hz}");
+    let jump = tail.windows(3).map(|w| (w[2] - 2.0 * w[1] + w[0]).abs()).fold(0.0f32, f32::max);
+    assert!(jump < 0.02, "block {block}: a click in the audio (second difference {jump})");
+    assert_eq!(slot.stats().underruns.load(Ordering::Relaxed), 0, "block {block}");
+}
+
 #[test]
 #[ignore = "needs the VAIO driver (VM only)"]
 fn a_tone_played_to_vaio_arrives_in_the_engine() {
     if !enabled() {
         return;
     }
-    let mut slot = VaioSlot::open(48_000.0, 256).unwrap();
-    let (_stream, _) = play_tone();
-    let mut samples = Vec::new();
-    run_engine(&mut slot, 256, 48_000.0, 3.0, |b| samples.extend_from_slice(b));
-    let tail = &samples[samples.len() / 2..]; // after start-up
-    let rms = (tail.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
-    assert!((rms - 0.5 / 2f64.sqrt()).abs() < 0.05, "rms {rms}");
-    let crossings = tail.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count() as f64;
-    let hz = crossings / (tail.len() as f64 / 48_000.0);
-    assert!((hz - 997.0).abs() < 10.0, "frequency {hz}");
-    let jump = tail.windows(3).map(|w| (w[2] - 2.0 * w[1] + w[0]).abs()).fold(0.0f32, f32::max);
-    assert!(jump < 0.02, "a click in the audio (second difference {jump})");
-    assert_eq!(slot.stats().underruns.load(Ordering::Relaxed), 0);
+    tone_arrives_cleanly(256);
+}
+
+/// 512 is a common ASIO block: one block plus margin is more than a 10 ms
+/// WaveRT packet (480 frames).
+#[test]
+#[ignore = "needs the VAIO driver (VM only)"]
+fn a_tone_arrives_cleanly_with_512_frame_blocks() {
+    if !enabled() {
+        return;
+    }
+    tone_arrives_cleanly(512);
+}
+
+/// A 2048-frame block lasts 42.7 ms, longer than the driver's base 40 ms
+/// engine timeout.
+#[test]
+#[ignore = "needs the VAIO driver (VM only)"]
+fn a_tone_arrives_cleanly_with_2048_frame_blocks() {
+    if !enabled() {
+        return;
+    }
+    tone_arrives_cleanly(2048);
 }
 
 #[test]
@@ -146,4 +174,110 @@ fn a_crashed_engine_releases_the_driver() {
     let _slot = VaioSlot::open(48_000.0, 256).expect("the driver let go of the dead engine");
     std::thread::sleep(Duration::from_millis(500));
     assert!(played.load(Ordering::Relaxed) > before, "the app kept playing");
+}
+
+/// Disables or re-enables the Confluence VAIO device (needs admin, as in the VM).
+fn set_device_enabled(enabled: bool) {
+    let verb = if enabled { "Enable-PnpDevice" } else { "Disable-PnpDevice" };
+    let script = format!("Get-PnpDevice -Class MEDIA -FriendlyName 'Confluence VAIO' | {verb} -Confirm:$false");
+    let status = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).status().unwrap();
+    assert!(status.success(), "{verb} failed");
+}
+
+/// Re-enables the device even if the test fails half way.
+struct EnableOnDrop;
+
+impl Drop for EnableOnDrop {
+    fn drop(&mut self) {
+        set_device_enabled(true);
+        // Back to normal before the next test: control device and endpoint.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(30) {
+            let endpoint = endpoints(Direction::Render)
+                .map(|e| e.iter().any(|e| e.name.contains("Confluence VAIO")))
+                .unwrap_or(false);
+            if endpoint && confluence_provider_vaio::installed() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn wait_for(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !cond() {
+        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+#[ignore = "needs the VAIO driver (VM only)"]
+fn removing_the_device_while_attached_is_survived() {
+    if !enabled() {
+        return;
+    }
+    let _restore = EnableOnDrop;
+    let mut slot = VaioSlot::open(48_000.0, 256).unwrap();
+    let stats = slot.stats();
+    {
+        let (_stream, _) = play_tone();
+        run_engine(&mut slot, 256, 48_000.0, 0.5, |_| {});
+    }
+    // Device Manager "Disable" (or a driver update) while the engine is attached.
+    set_device_enabled(false);
+    wait_for("the driver to let go", Duration::from_secs(10), || !stats.attached.load(Ordering::Relaxed));
+    // The engine closes its handle to the now-deleted control device.
+    drop(slot);
+    set_device_enabled(true);
+    wait_for("the control device to come back", Duration::from_secs(20), confluence_provider_vaio::installed);
+    let _again = VaioSlot::open(48_000.0, 256).expect("the engine can attach again");
+}
+
+#[test]
+#[ignore = "needs the VAIO driver (VM only)"]
+fn a_stale_handle_after_removal_is_refused_cleanly() {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::IO::DeviceIoControl;
+    if !enabled() {
+        return;
+    }
+    let _restore = EnableOnDrop;
+    // SAFETY: plain open of the control device; closed below.
+    let handle = unsafe {
+        CreateFileW(
+            &HSTRING::from(confluence_provider_vaio::abi::USER_PATH),
+            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .unwrap();
+    set_device_enabled(false);
+    // The control device is gone, but this handle still points at it.
+    let mut buf = vec![0u8; 4096 + 1024 * 8];
+    // SAFETY: valid handle and buffer; synchronous call.
+    let sent = unsafe {
+        DeviceIoControl(
+            handle,
+            confluence_provider_vaio::abi::IOCTL_ATTACH,
+            None,
+            0,
+            Some(buf.as_mut_ptr().cast()),
+            buf.len() as u32,
+            None,
+            None,
+        )
+    };
+    assert!(sent.is_err(), "a request to a removed device is refused");
+    // SAFETY: opened above.
+    unsafe { CloseHandle(handle) }.unwrap();
 }

@@ -124,22 +124,21 @@ fn run(
     if let Err(e) = result {
         let _ = tx.send(Err(e));
     }
-    // SAFETY: opened in `start` and used only here.
-    let _ = unsafe { CloseHandle(device.0) };
+    // The device handle is closed by `Drop`, after the join: closing it here
+    // would let `Drop`'s CancelIoEx hit an unrelated handle that reused the value.
     drop(region);
 }
 
 impl Drop for Attachment {
     fn drop(&mut self) {
-        // If the request already completed for another reason (e.g. device
-        // removal), the thread may have closed the handle: the call then fails
-        // harmlessly and the join returns at once. The value cannot have been
-        // reused by anything else, since nothing else opens handles for us.
-        // SAFETY: the handle stays open until the thread exits (it closes it
-        // after the request completes), and we join below.
+        // SAFETY: the handle stays open until after the join below (the thread
+        // never closes it). If the request already completed (e.g. the device
+        // was removed), the cancel finds nothing and the join returns at once.
         let _ = unsafe { CancelIoEx(self.device.0, None) };
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        // SAFETY: opened in `start`; the thread has exited.
+        let _ = unsafe { CloseHandle(self.device.0) };
     }
 }

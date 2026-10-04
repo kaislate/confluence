@@ -1636,12 +1636,14 @@ TimerNotifyRT
             ULONGLONG packets = _this->m_ullLinearPosition / packetBytes;
             if (packets != _this->m_ullNotifiedPackets)
             {
-                _this->m_ullNotifiedPackets = packets;
-                bufferCompleted = TRUE;
+                // Count every boundary crossed (audiodg reads the count to find
+                // the packet to write); one event wakes it for all of them.
                 if (!_this->m_bEoSReceived)
                 {
-                    _this->m_llPacketCounter++;
+                    _this->m_llPacketCounter += (LONGLONG)(packets - _this->m_ullNotifiedPackets);
                 }
+                _this->m_ullNotifiedPackets = packets;
+                bufferCompleted = TRUE;
             }
         }
         // Free-running resumes from now, without a burst, if the engine goes quiet.

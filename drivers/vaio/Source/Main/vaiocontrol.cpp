@@ -25,6 +25,29 @@ static DRIVER_DISPATCH VaioDispatch;
 
 static PDRIVER_DISPATCH g_PcDispatch[IRP_MJ_MAXIMUM_FUNCTION + 1];
 static PDEVICE_OBJECT   g_ControlDevice = NULL;
+
+// The control device carries this tagged extension, so its IRPs are recognised
+// even after it was deleted while a handle was still open (they must never
+// reach portcls, whose dispatch expects its own device objects).
+#define VAIO_CONTROL_MAGIC 0x4F494156434F4E54ULL   /* "TNOCVAIO" */
+typedef struct VAIO_CONTROL_EXTENSION
+{
+    ULONGLONG     Magic;
+    volatile LONG Deleted;   // removed; only CLEANUP and CLOSE still succeed
+} VAIO_CONTROL_EXTENSION;
+
+static VAIO_CONTROL_EXTENSION* ControlExtension(PDEVICE_OBJECT DeviceObject)
+{
+    // Only two kinds of device object reach this driver's dispatch: portcls's
+    // (whose extension is far larger than ours, so reading its first bytes is
+    // safe) and our control device. Only ours holds the tag.
+    if (DeviceObject->DeviceType != FILE_DEVICE_SOUND || DeviceObject->DeviceExtension == NULL)
+    {
+        return NULL;
+    }
+    VAIO_CONTROL_EXTENSION* ext = (VAIO_CONTROL_EXTENSION*)DeviceObject->DeviceExtension;
+    return ext->Magic == VAIO_CONTROL_MAGIC ? ext : NULL;
+}
 static KSPIN_LOCK       g_Lock;
 static vaio::Link       g_Link = {};
 static PIRP             g_AttachIrp = NULL;
@@ -137,21 +160,29 @@ _Use_decl_annotations_
 static NTSTATUS VaioDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UCHAR major = IoGetCurrentIrpStackLocation(Irp)->MajorFunction;
-    if (DeviceObject != g_ControlDevice || g_ControlDevice == NULL)
+    VAIO_CONTROL_EXTENSION* ext = ControlExtension(DeviceObject);
+    if (ext == NULL)
     {
         return g_PcDispatch[major](DeviceObject, Irp);
     }
+    BOOLEAN deleted = ext->Deleted != 0;
     switch (major)
     {
     case IRP_MJ_CREATE:
+        return Complete(Irp, deleted ? STATUS_DELETE_PENDING : STATUS_SUCCESS);
     case IRP_MJ_CLOSE:
         return Complete(Irp, STATUS_SUCCESS);
     case IRP_MJ_CLEANUP:
-        // The engine closed its handle (or exited): let go of its memory.
-        Detach();
+        // The engine closed its handle (or exited): let go of its memory. A
+        // deleted control device already let go (VaioControlDelete), and the
+        // link may by now belong to a new one.
+        if (!deleted)
+        {
+            Detach();
+        }
         return Complete(Irp, STATUS_SUCCESS);
     case IRP_MJ_DEVICE_CONTROL:
-        return Attach(Irp);
+        return deleted ? Complete(Irp, STATUS_DELETE_PENDING) : Attach(Irp);
     default:
         return Complete(Irp, STATUS_INVALID_DEVICE_REQUEST);
     }
@@ -187,7 +218,8 @@ NTSTATUS VaioControlCreate(PDRIVER_OBJECT DriverObject)
     // SYSTEM and Administrators: all; interactive users: read/write.
     UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
     PDEVICE_OBJECT device = NULL;
-    NTSTATUS status = IoCreateDeviceSecure(DriverObject, 0, &name, FILE_DEVICE_SOUND, FILE_DEVICE_SECURE_OPEN,
+    NTSTATUS status = IoCreateDeviceSecure(DriverObject, sizeof(VAIO_CONTROL_EXTENSION), &name, FILE_DEVICE_SOUND,
+                                           FILE_DEVICE_SECURE_OPEN,
                                            TRUE /* exclusive: one engine */, &sddl, &GUID_CONFLUENCE_VAIO_CONTROL,
                                            &device);
     if (!NT_SUCCESS(status))
@@ -200,8 +232,11 @@ NTSTATUS VaioControlCreate(PDRIVER_OBJECT DriverObject)
         IoDeleteDevice(device);
         return status;
     }
-    device->Flags &= ~DO_DEVICE_INITIALIZING;
+    VAIO_CONTROL_EXTENSION* ext = (VAIO_CONTROL_EXTENSION*)device->DeviceExtension;
+    ext->Magic = VAIO_CONTROL_MAGIC;
+    ext->Deleted = 0;
     g_ControlDevice = device;
+    device->Flags &= ~DO_DEVICE_INITIALIZING;   // only now can it be opened
     return STATUS_SUCCESS;
 }
 
@@ -214,6 +249,8 @@ void VaioControlDelete()
         IoDeleteSymbolicLink(&link);
         PDEVICE_OBJECT device = g_ControlDevice;
         g_ControlDevice = NULL;
+        // A handle may stay open past the delete: its IRPs keep coming to us.
+        InterlockedExchange(&((VAIO_CONTROL_EXTENSION*)device->DeviceExtension)->Deleted, 1);
         IoDeleteDevice(device);
     }
 }
@@ -231,6 +268,8 @@ BOOLEAN VaioAdvance(ULONG timeBytes, ULONG limitBytes, const UCHAR* src, ULONG s
         if (vaio::engine_alive(g_Link, NowMs()))
         {
             ULONG limit = limitBytes < srcSize ? limitBytes : srcSize;
+            ULONG paced = vaio::pace(timeBytes);
+            limit = paced < limit ? paced : limit;
             ULONG bytes = vaio::plan(g_Link, limit);
             vaio::copy(g_Link, src, srcSize, srcOffset, bytes);
             *advanced = bytes;

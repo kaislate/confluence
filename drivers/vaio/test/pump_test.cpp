@@ -142,7 +142,36 @@ static void detached_links_do_nothing() {
     CHECK(l.header == nullptr && vaio::plan(l, 4096) == 0);
 }
 
+// Engine-driven, the stream may run at most 33/32 of real time: never a
+// whole engine block in one tick, and never far ahead of what the app wrote
+// (a long engine block refilled at 1.25x read stale audio).
+static void the_engine_driven_pace_is_close_to_real_time() {
+    CHECK(vaio::pace(480 * 8) == 495 * 8);         // 10 ms of time: at most ~10.3 ms of audio
+    CHECK(vaio::pace(48 * 8) == 49 * 8);           // one 1 ms tick: 49 frames, so it can catch up
+    CHECK(vaio::pace(8) == 8);                     // whole frames only
+    CHECK(vaio::pace(7) == 0);
+    CHECK(vaio::pace(0) == 0);
+}
+
+// Long engine blocks: the engine's heartbeat moves once per block, so the
+// timeout must outlast a block (three ring targets, never below the base).
+static void the_engine_timeout_outlasts_long_blocks() {
+    Region small(1024, 448);                       // block 256 + 192
+    vaio::Link l{};
+    CHECK(vaio::attach(l, small.bytes.data(), small.bytes.size(), 0));
+    CHECK(vaio::engine_timeout_ms(l) == CONFLUENCE_VAIO_ENGINE_TIMEOUT_MS);
+    Region big(8192, 2240);                        // block 2048 + 192 (46.7 ms)
+    vaio::Link b{};
+    CHECK(vaio::attach(b, big.bytes.data(), big.bytes.size(), 1000));
+    CHECK(vaio::engine_timeout_ms(b) == 140);      // 3 x 2240 frames at 48 kHz
+    CHECK(vaio::engine_alive(b, 1000 + 100));
+    CHECK(vaio::engine_alive(b, 1000 + 140));
+    CHECK(!vaio::engine_alive(b, 1000 + 141));
+}
+
 int main() {
+    the_engine_driven_pace_is_close_to_real_time();
+    the_engine_timeout_outlasts_long_blocks();
     rejects_regions_it_cannot_trust();
     fills_the_ring_up_to_target_and_no_further();
     wraps_in_both_buffers();
