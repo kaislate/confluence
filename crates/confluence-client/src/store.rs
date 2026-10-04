@@ -50,6 +50,15 @@ impl Backoff {
     }
 }
 
+/// What a store update changed, for a front end deciding when to redraw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Update {
+    /// The state or the connection changed: show it now.
+    State,
+    /// Only telemetry (status, health, history): it may be drawn less often.
+    Telemetry,
+}
+
 /// How a subscription ended.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SessionEnd {
@@ -96,8 +105,6 @@ pub struct StoreView {
     pub status: Option<EngineStatus>,
     /// The latest per-slot health.
     pub health: Vec<SlotHealth>,
-    /// Shared between views, so cloning a view is cheap; replaced only by telemetry.
-    pub history: Arc<History>,
     /// When anything (snapshot or event) last arrived from the engine.
     pub last_event: Option<Instant>,
     /// Snapshots taken so far: a new one replaced the state wholesale.
@@ -111,6 +118,9 @@ pub struct Gap;
 /// The pure core of [`StateStore`].
 pub struct Store {
     view: StoreView,
+    /// Telemetry history, outside the view: grown in place under its lock,
+    /// read one slot at a time (see [`Store::history_of`]).
+    history: Arc<Mutex<History>>,
     gap_pending: bool,
     ever_live: bool,
 }
@@ -129,10 +139,10 @@ impl Store {
                 conn: ConnState::Connecting,
                 status: None,
                 health: Vec::new(),
-                history: Arc::new(History::new()),
                 last_event: None,
                 snapshots: 0,
             },
+            history: Arc::default(),
             gap_pending: false,
             ever_live: false,
         }
@@ -142,9 +152,7 @@ impl Store {
     /// the history of slots it no longer has.
     pub fn snapshot(&mut self, s: State, now: Instant) {
         let ids: BTreeSet<u32> = s.slots.iter().map(|slot| slot.id).collect();
-        if self.view.history.keys().any(|id| !ids.contains(id)) {
-            Arc::make_mut(&mut self.view.history).retain(|id, _| ids.contains(id));
-        }
+        self.with_history(|h| h.retain(|id, _| ids.contains(id)));
         self.view.status = Some(s.status.clone());
         self.view.state = Some(s);
         self.view.conn = ConnState::Live;
@@ -169,32 +177,35 @@ impl Store {
                         _ => None,
                     })
                     .collect();
-                if removed.iter().any(|id| self.view.history.contains_key(id)) {
-                    let history = Arc::make_mut(&mut self.view.history);
-                    for id in removed {
-                        history.remove(&id);
-                    }
+                if !removed.is_empty() {
+                    self.with_history(|h| {
+                        for id in &removed {
+                            h.remove(id);
+                        }
+                    });
                 }
             }
             Event::Telemetry { status, health } => {
-                let history = Arc::make_mut(&mut self.view.history);
-                for h in &health {
-                    let ring = history.entry(h.id).or_default();
-                    if self.gap_pending {
-                        ring.push_back(None);
+                let gap_pending = self.gap_pending;
+                self.with_history(|history| {
+                    for h in &health {
+                        let ring = history.entry(h.id).or_default();
+                        if gap_pending {
+                            ring.push_back(None);
+                        }
+                        ring.push_back(Some(HealthSample {
+                            fill: h.fill_frames,
+                            target: h.target_frames,
+                            ppm: h.device_ppm,
+                            correction: h.correction_ppm,
+                            underruns: h.underruns,
+                            overruns: h.overruns,
+                        }));
+                        while ring.len() > HISTORY_LEN {
+                            ring.pop_front();
+                        }
                     }
-                    ring.push_back(Some(HealthSample {
-                        fill: h.fill_frames,
-                        target: h.target_frames,
-                        ppm: h.device_ppm,
-                        correction: h.correction_ppm,
-                        underruns: h.underruns,
-                        overruns: h.overruns,
-                    }));
-                    while ring.len() > HISTORY_LEN {
-                        ring.pop_front();
-                    }
-                }
+                });
                 self.gap_pending = false;
                 self.view.status = Some(status);
                 self.view.health = health;
@@ -228,6 +239,25 @@ impl Store {
     pub fn view(&self) -> StoreView {
         self.view.clone()
     }
+
+    /// One slot's telemetry history, oldest first (`None` entries are gaps).
+    pub fn history_of(&self, id: u32) -> Option<VecDeque<Option<HealthSample>>> {
+        read_history(&self.history, id)
+    }
+
+    /// The shared history, for a reader on another thread.
+    pub fn history_handle(&self) -> Arc<Mutex<History>> {
+        self.history.clone()
+    }
+
+    fn with_history(&self, f: impl FnOnce(&mut History)) {
+        let mut h = self.history.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut h);
+    }
+}
+
+fn read_history(history: &Mutex<History>, id: u32) -> Option<VecDeque<Option<HealthSample>>> {
+    history.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned()
 }
 
 /// [`Store`] on a thread that keeps it connected to the engine. Dropping it
@@ -236,39 +266,47 @@ impl Store {
 /// the next event (telemetry arrives every 100 ms from a live engine).
 pub struct StateStore {
     shared: Arc<Mutex<Arc<StoreView>>>,
+    history: Arc<Mutex<History>>,
     stop: Arc<AtomicBool>,
 }
 
 impl StateStore {
     /// Starts following the engine on `pipe`; `on_change` runs after every update.
-    pub fn spawn(pipe: String, on_change: Box<dyn Fn() + Send + Sync>) -> StateStore {
+    pub fn spawn(pipe: String, on_change: Box<dyn Fn(Update) + Send + Sync>) -> StateStore {
         let shared = Arc::new(Mutex::new(Arc::new(Store::new().view())));
         let stop = Arc::new(AtomicBool::new(false));
+        let store = Store::new();
+        let history = store.history_handle();
         let (out, stopping) = (shared.clone(), stop.clone());
         let _ = std::thread::Builder::new().name("confluence-state-store".into()).spawn(move || {
-            let mut store = Store::new();
+            let mut store = store;
             let mut backoff = Backoff::default();
-            let update = |store: &Store| {
+            let update = |store: &Store, what: Update| {
+                let view = Arc::new(store.view()); // built before taking the lock
                 if let Ok(mut v) = out.lock() {
-                    *v = Arc::new(store.view());
+                    *v = view;
                 }
-                on_change();
+                on_change(what);
             };
             while !stopping.load(Ordering::SeqCst) {
                 let mut how = SessionEnd::Lost;
                 if let Ok((snapshot, mut sub)) = Subscription::connect(&pipe, CONNECT_TIMEOUT) {
                     let began = Instant::now();
                     store.snapshot(snapshot, began);
-                    update(&store);
+                    update(&store, Update::State);
                     while let Ok(e) = sub.recv() {
                         if stopping.load(Ordering::SeqCst) {
                             return;
                         }
+                        let what = match e {
+                            Event::Telemetry { .. } => Update::Telemetry,
+                            Event::Changed { .. } => Update::State,
+                        };
                         if store.event(e, Instant::now()).is_err() {
                             how = SessionEnd::Gap; // resubscribe for a fresh snapshot
                             break;
                         }
-                        update(&store);
+                        update(&store, what);
                     }
                     backoff.ended_after(began.elapsed());
                 }
@@ -276,11 +314,16 @@ impl StateStore {
                     return;
                 }
                 store.ended(how, Instant::now());
-                update(&store);
+                update(&store, Update::State);
                 std::thread::sleep(backoff.next());
             }
         });
-        StateStore { shared, stop }
+        StateStore { shared, history, stop }
+    }
+
+    /// One slot's telemetry history, oldest first (`None` entries are gaps).
+    pub fn history_of(&self, id: u32) -> Option<VecDeque<Option<HealthSample>>> {
+        read_history(&self.history, id)
     }
 
     /// A consistent view for one UI frame.
@@ -392,13 +435,12 @@ mod tests {
         for i in 0..(HISTORY_LEN + 5) {
             s.event(telemetry(&[1], i as f64), now).unwrap();
         }
-        assert_eq!(s.view().history[&1].len(), HISTORY_LEN);
+        assert_eq!(s.history_of(1).unwrap().len(), HISTORY_LEN);
         s.disconnected(now);
         assert!(matches!(s.view().conn, ConnState::Reconnecting { .. }));
         s.snapshot(state(0, &[1]), now);
         s.event(telemetry(&[1], 7.0), now).unwrap();
-        let v = s.view();
-        let h = &v.history[&1];
+        let h = s.history_of(1).unwrap();
         assert_eq!(h.len(), HISTORY_LEN, "still bounded with the gap");
         assert!(h.iter().rev().nth(1).unwrap().is_none(), "a gap marks the disconnect");
         assert_eq!(h.back().unwrap().as_ref().unwrap().fill, 7.0);
@@ -478,24 +520,25 @@ mod tests {
         s.snapshot(state(0, &[1, 2]), now);
         s.event(telemetry(&[1, 2], 1.0), now).unwrap();
         s.event(Event::Changed { version: 1, changes: vec![Change::SlotRemoved { id: 2 }] }, now).unwrap();
-        assert!(!s.view().history.contains_key(&2), "removed by the event");
+        assert!(s.history_of(2).is_none(), "removed by the event");
         s.disconnected(now);
         s.snapshot(state(0, &[]), now);
-        assert!(s.view().history.is_empty(), "pruned by a snapshot without the slot");
+        assert!(s.history_of(1).is_none(), "pruned by a snapshot without the slot");
     }
 
+    /// The history is shared and grown in place: telemetry never copies it,
+    /// and readers take one slot's ring when they need it.
     #[test]
-    fn views_share_history_until_telemetry_changes_it() {
+    fn telemetry_grows_the_shared_history_in_place() {
         let mut s = Store::new();
         let now = Instant::now();
+        let shared = s.history_handle();
         s.snapshot(state(0, &[1]), now);
         s.event(telemetry(&[1], 1.0), now).unwrap();
-        let a = s.view();
-        s.event(Event::Changed { version: 1, changes: vec![set(3)] }, now).unwrap();
-        let b = s.view();
-        assert!(Arc::ptr_eq(&a.history, &b.history), "a change event does not copy the history");
         s.event(telemetry(&[1], 2.0), now).unwrap();
-        assert!(!Arc::ptr_eq(&b.history, &s.view().history));
+        assert_eq!(shared.lock().unwrap()[&1].len(), 2, "the same history, grown in place");
+        assert_eq!(s.history_of(1).unwrap().back().unwrap().as_ref().unwrap().fill, 2.0);
+        assert!(s.history_of(9).is_none());
     }
 
     #[test]
@@ -504,7 +547,7 @@ mod tests {
         let held = guard.clone();
         let store = StateStore::spawn(
             format!("confluence-no-engine-{}", std::process::id()),
-            Box::new(move || {
+            Box::new(move |_| {
                 let _ = &held;
             }),
         );

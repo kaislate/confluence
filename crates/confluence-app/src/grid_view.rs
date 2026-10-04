@@ -94,7 +94,10 @@ pub fn show(
 
         for r in rows.clone() {
             for c in cols.clone() {
-                let (Some(p), Some(label)) = (layout.point(r, c), layout.label(r, c)) else { continue };
+                let Some(p) = layout.point(r, c) else { continue };
+                // Strings are built only when asked for: the label when the
+                // accessibility tree is active, the tooltip on hover.
+                let label = || layout.label(r, c).unwrap_or_default();
                 let rect = Rect::from_min_size(origin + Vec2::new(c as f32 * cell, r as f32 * cell), Vec2::splat(cell));
                 // Only the visible part of a cell takes the pointer: a cell scrolled
                 // under a header must not take clicks meant for the header.
@@ -105,12 +108,14 @@ pub fn show(
                 // Read-only (no engine): a click still selects, to inspect the cell.
                 let sense = if editable { Sense::click_and_drag() } else { Sense::click() };
                 let resp = ui.interact(hit, Id::new(("cell", p)), sense);
-                resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, editable, &label));
+                resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, editable, label()));
                 let (cur, pending) = lookup(p);
                 let online = layout.rows.at(r).is_some_and(|(b, _)| b.online)
                     && layout.cols.at(c).is_some_and(|(b, _)| b.online);
                 look.paint_cell(ui.painter(), rect, cur.as_ref(), pending, selected == Some(p), !online || !editable);
-                let resp = resp.on_hover_text(tooltip(&label, cur.as_ref()));
+                let resp = resp.on_hover_ui(|ui| {
+                    ui.label(tooltip(&label(), cur.as_ref()));
+                });
                 if !editable {
                     if resp.clicked() {
                         actions.select = Some(Selection::Cell { input: p.0, output: p.1 });

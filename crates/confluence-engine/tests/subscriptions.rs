@@ -191,7 +191,7 @@ fn a_store_follows_the_engine() {
     let dir = tempfile::tempdir().unwrap();
     let pipe = format!("confluence-store-a-{}", std::process::id());
     let _engine = spawn(&pipe, dir.path());
-    let store = confluence_client::StateStore::spawn(pipe.clone(), Box::new(|| {}));
+    let store = confluence_client::StateStore::spawn(pipe.clone(), Box::new(|_| {}));
     wait_for("live", Duration::from_secs(10), || is_live(&store));
     let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
     c.call(Command::SetPoint { input: 3, output: 4, gain_db: -3.0, mute: true, invert: false }).unwrap();
@@ -213,7 +213,7 @@ fn a_store_resyncs_after_the_engine_restarts() {
     let dir = tempfile::tempdir().unwrap();
     let pipe = format!("confluence-store-b-{}", std::process::id());
     let mut engine = spawn(&pipe, dir.path());
-    let store = confluence_client::StateStore::spawn(pipe.clone(), Box::new(|| {}));
+    let store = confluence_client::StateStore::spawn(pipe.clone(), Box::new(|_| {}));
     wait_for("live", Duration::from_secs(10), || is_live(&store));
     let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
     c.call(Command::SetPoint { input: 1, output: 1, gain_db: 0.0, mute: false, invert: false }).unwrap();
@@ -263,4 +263,26 @@ fn open_connections_do_not_hold_up_shutdown() {
     assert!(status.success(), "{status:?}");
     assert!(elapsed < Duration::from_secs(3), "exited promptly: {elapsed:?}\n{err}");
     assert!(!err.contains("stopping anyway"), "devices were stopped cleanly:\n{err}");
+}
+
+/// A front end can tell state changes (repaint now) from telemetry (which
+/// it may draw less often).
+#[test]
+fn a_store_says_what_kind_of_update_it_made() {
+    use confluence_client::Update;
+    use std::sync::{Arc, Mutex};
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = format!("confluence-store-c-{}", std::process::id());
+    let _engine = spawn(&pipe, dir.path());
+    let seen: Arc<Mutex<Vec<Update>>> = Arc::default();
+    let log = seen.clone();
+    let store = confluence_client::StateStore::spawn(pipe.clone(), Box::new(move |u| log.lock().unwrap().push(u)));
+    wait_for("live", Duration::from_secs(10), || is_live(&store));
+    let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    c.call(Command::SetPoint { input: 1, output: 2, gain_db: 0.0, mute: false, invert: false }).unwrap();
+    wait_for("both kinds", Duration::from_secs(3), || {
+        let s = seen.lock().unwrap();
+        s.contains(&Update::State) && s.contains(&Update::Telemetry)
+    });
+    c.call(Command::Shutdown).unwrap();
 }

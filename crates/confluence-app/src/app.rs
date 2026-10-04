@@ -3,11 +3,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use confluence_api::PointState;
-use confluence_client::{ConnState, StateStore, StoreView};
+use confluence_client::{ConnState, StateStore, StoreView, Update};
 use eframe::egui::{self, Align, Align2, Button, Id, Key, Layout, RichText};
 
 use crate::commands::{Edit, Outcome, Worker};
@@ -24,6 +25,9 @@ pub const INSPECTOR_KEY: &str = "inspector_open";
 const QUIET: Duration = Duration::from_secs(2);
 /// Reconnecting for this long: offer Start engine too.
 const OFFER_START_AFTER: Duration = Duration::from_secs(3);
+/// A press that moves further than this before release is a drag, not a
+/// click (spec §4.1; egui's default is 6 px).
+const CLICK_DIST: f32 = 3.0;
 /// The xrun count flashes for this long after it rises.
 const XRUN_FLASH: Duration = Duration::from_secs(1);
 
@@ -57,6 +61,19 @@ pub fn startup_error_text(e: &dyn std::fmt::Display) -> String {
 
 The audio engine runs on its own; audio is not affected."
     )
+}
+
+/// How long telemetry may wait to be drawn: the top bar's figures are fine a
+/// few times a second; a slot's live graphs get every sample.
+pub const TELEMETRY_REPAINT: Duration = Duration::from_millis(250);
+
+/// `None`: repaint now; else repaint within this long.
+pub fn telemetry_repaint(graphs_shown: bool) -> Option<Duration> {
+    if graphs_shown {
+        None
+    } else {
+        Some(TELEMETRY_REPAINT)
+    }
 }
 
 /// True once per new snapshot: `seen` is the snapshot count last handled.
@@ -148,6 +165,8 @@ pub struct ConfluenceApp {
     xruns: (u64, Option<Instant>),
     /// The store's snapshot count last handled (see `fresh_snapshot`).
     snapshots_seen: u64,
+    /// Whether live health graphs are on screen (telemetry repaints at full rate).
+    graphs_live: Arc<AtomicBool>,
     look: Look,
     skin_dir: Option<PathBuf>,
     /// A slot waiting for "Remove ‹name›?" to be confirmed.
@@ -171,9 +190,19 @@ impl ConfluenceApp {
                 }
             })
         };
+        let graphs_live = Arc::new(AtomicBool::new(false));
         let store = StateStore::spawn(config.pipe.clone(), {
-            let wake = wake.clone();
-            Box::new(move || wake())
+            let (repaint, graphs_live) = (repaint.clone(), graphs_live.clone());
+            Box::new(move |what| {
+                if let Ok(ctx) = repaint.lock() {
+                    if let Some(ctx) = ctx.as_ref() {
+                        match (what, telemetry_repaint(graphs_live.load(Ordering::Relaxed))) {
+                            (Update::Telemetry, Some(after)) => ctx.request_repaint_after(after),
+                            _ => ctx.request_repaint(),
+                        }
+                    }
+                }
+            })
         });
         let worker = Worker::spawn(config.pipe.clone(), wake);
         let view = store.view();
@@ -190,6 +219,7 @@ impl ConfluenceApp {
             inspector_open: true,
             xruns: (0, None),
             snapshots_seen: 0,
+            graphs_live,
             look: Look::builtin(),
             skin_dir: config.skin,
             confirm_remove: None,
@@ -268,6 +298,7 @@ impl ConfluenceApp {
                     }
                 }
                 self.look.apply(&ctx);
+                ctx.options_mut(|o| o.input_options.max_click_dist = CLICK_DIST);
                 *r = Some(ctx.clone());
             }
         }
@@ -299,6 +330,8 @@ impl ConfluenceApp {
             ctx.request_repaint_after(Duration::from_secs_f64(wait));
         }
 
+        let graphs = self.inspector_open && matches!(self.selection, Selection::Slot(_));
+        self.graphs_live.store(graphs, Ordering::Relaxed);
         self.top_bar(ui, &view, now);
         self.side_panels(ui, &view, now);
         self.matrix(ui, &view);
@@ -423,6 +456,11 @@ impl ConfluenceApp {
             _ => None,
         };
         let selection = self.selection;
+        // Only the inspected slot's history is copied, once per frame.
+        let history = match selection {
+            Selection::Slot(id) => self.store.history_of(id),
+            _ => None,
+        };
         let look = &self.look;
         let actions = egui::Panel::right("inspector")
             .resizable(true)
@@ -430,7 +468,9 @@ impl ConfluenceApp {
             .show(ui, |ui| {
                 look.paint_surface(ui.painter(), ui.max_rect(), "panel", look.skin.colors.panel);
                 egui::ScrollArea::vertical()
-                    .show(ui, |ui| crate::inspector::show(ui, view, look, &selection, point, editable))
+                    .show(ui, |ui| {
+                        crate::inspector::show(ui, view, look, &selection, point, history.as_ref(), editable)
+                    })
                     .inner
             })
             .inner;
@@ -665,6 +705,13 @@ mod tests {
         let text = startup_error_text(&"no suitable graphics adapter");
         assert!(text.contains("no suitable graphics adapter"), "{text}");
         assert!(text.contains("audio"), "says that audio is unaffected: {text}");
+    }
+
+    #[test]
+    fn telemetry_repaints_slowly_unless_live_graphs_are_shown() {
+        assert_eq!(telemetry_repaint(false), Some(TELEMETRY_REPAINT), "top-bar figures: a few times a second");
+        assert_eq!(telemetry_repaint(true), None, "live graphs: every sample");
+        assert!(TELEMETRY_REPAINT >= Duration::from_millis(200));
     }
 
     #[test]

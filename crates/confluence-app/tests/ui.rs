@@ -355,3 +355,39 @@ fn cells_can_be_selected_while_disconnected() {
     assert_eq!(h.state().selection(), confluence_app::matrix::Selection::Cell { input: i, output: o });
     assert!(h.state().point(i, o).is_none(), "no edit while disconnected");
 }
+
+/// A press that moves more than 3 px before release is not a click (spec
+/// §4.1), so a small wobble on a cell never toggles its route.
+#[test]
+fn a_press_that_moves_more_than_three_pixels_is_not_a_click() {
+    use eframe::egui::{Event, PointerButton};
+    let d = EngineDir::new("click-dist");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_vasio(&mut c, 1);
+    let mut h = harness(app_for(&d));
+    let cell = "VASIO 1 in 1 → VASIO 1 out 1";
+    pump_until(&mut h, "the grid", LONG, |h| h.query_by_role_and_label(Role::Button, cell).is_some());
+    settle(&mut h);
+    let p = h.get_by_role_and_label(Role::Button, cell).rect().center();
+    let q = p + eframe::egui::vec2(0.0, 4.0);
+    let button = |pos, pressed| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    h.event(Event::PointerMoved(p));
+    h.event(button(p, true));
+    h.step();
+    h.event(Event::PointerMoved(q));
+    h.step();
+    h.event(button(q, false));
+    for _ in 0..20 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(h.state().point(i, o).is_none(), "a 4 px wobble routed the cell");
+    assert!(!engine_points(&mut c).contains(&(i, o)));
+    c.call(Command::Shutdown).unwrap();
+}
