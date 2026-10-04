@@ -2,7 +2,7 @@
 //! control and Control API command handling. Not real-time; call [`Engine::tick`]
 //! every 10–20 ms from the control thread.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +15,9 @@ use confluence_core::mailbox::{self, Receiver, Sender};
 use confluence_core::matrix::{matrix, MatrixController};
 
 use crate::alloc::ChannelAllocator;
-use crate::audio::{AudioEngine, AudioMsg, InputEntry, OutputEntry, Returned, StrictEntry, StrictSide, MAX_SLOTS};
+use crate::audio::{
+    AudioEngine, AudioMsg, InputEntry, LoadMeter, OutputEntry, Returned, StrictEntry, StrictSide, MAX_SLOTS,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
@@ -168,6 +170,7 @@ pub struct Engine {
     strict: usize,
     blocks: Arc<AtomicU64>,
     master_ppm: Arc<AtomicU64>,
+    dsp_load: Arc<AtomicU32>,
 }
 
 impl Engine {
@@ -178,6 +181,7 @@ impl Engine {
         let (returns_tx, returns) = mailbox::channel(4 * MAX_SLOTS);
         let blocks = Arc::new(AtomicU64::new(0));
         let master_ppm = Arc::new(AtomicU64::new(0f64.to_bits()));
+        let dsp_load = Arc::new(AtomicU32::new(0));
         let mut inputs = PlanarBuffer::new(cfg.max_inputs, cfg.block);
         let mut outputs = PlanarBuffer::new(cfg.max_outputs, cfg.block);
         inputs.set_frames(cfg.block);
@@ -195,6 +199,7 @@ impl Engine {
             sample_rate: cfg.sample_rate,
             master_est: None,
             master_ppm: master_ppm.clone(),
+            load: LoadMeter::new(dsp_load.clone()),
         };
         let engine = Engine {
             cfg,
@@ -210,6 +215,7 @@ impl Engine {
             strict: 0,
             blocks,
             master_ppm,
+            dsp_load,
         };
         (engine, audio)
     }
@@ -221,6 +227,11 @@ impl Engine {
     /// Master blocks processed so far.
     pub fn blocks(&self) -> u64 {
         self.blocks.load(Ordering::Relaxed)
+    }
+
+    /// Smoothed fraction (0..=1) of the block period the audio thread spends processing.
+    pub fn dsp_load(&self) -> f32 {
+        f32::from_bits(self.dsp_load.load(Ordering::Relaxed))
     }
 
     /// The hardware master's measured deviation from nominal (0 on the internal clock).

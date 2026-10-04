@@ -19,3 +19,13 @@ fn delivers_blocks_at_the_nominal_rate() {
     // 2 s at 48 kHz / 256 = 375 blocks; allow scheduler slop.
     assert!((360..=390).contains(&blocks), "{blocks} blocks in 2 s");
 }
+
+#[test]
+fn the_engine_reports_a_plausible_dsp_load() {
+    let (engine, audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let clock = InternalClock::start(audio, 48_000.0).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let load = engine.dsp_load();
+    assert!(clock.stop().is_some());
+    assert!(load > 0.0 && load < 1.0, "{load}");
+}
