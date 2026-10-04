@@ -7,8 +7,9 @@ Status: Milestone 0 in progress. Done so far:
 - the engine core and clock-drift correction;
 - the headless engine;
 - ASIO (several drivers in one process), WASAPI and per-application capture;
-- VASIO, a virtual ASIO driver that connects DAWs to the engine.
-- VAIO, a virtual Windows playback device whose audio goes to the engine (test-signed for now).
+- VASIO, a virtual ASIO driver that connects DAWs to the engine;
+- VAIO, a virtual Windows playback device whose audio goes to the engine (test-signed for now);
+- a desktop window (matrix, devices, clock health), with skins.
 
 ## Build and test
 
@@ -16,6 +17,20 @@ Status: Milestone 0 in progress. Done so far:
     cargo test --workspace
     cargo run -p confluence-engine
     cargo run -p confluence-cli -- health
+
+## The window
+
+    cargo run -p confluence-app --bin confluence
+
+`confluence.exe` shows the matrix of a running engine:
+- click a cell to route or unroute it;
+- drag up or down (or use the wheel) on a route to change its gain, holding Shift for fine steps;
+- double-click a cell for a plain 0 dB route;
+- right-click a cell for mute, invert and remove.
+
+Click a slot's header to see its clock health. **Devices…** adds devices. If no engine is running, **Start engine** starts the one next to the window's executable. Closing the window never stops the audio.
+
+`--skin <folder>` loads a skin: a `skin.toml` (colours, slot colours, sizes) plus PNG images for the background, panels, cells and slot bands. Anything a skin leaves out uses the built-in look, and problems show as warnings rather than errors.
 
 ## Devices
 
