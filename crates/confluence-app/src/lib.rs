@@ -5,4 +5,6 @@
 pub mod commands;
 pub mod engine_launch;
 pub mod matrix;
+pub mod notify;
+pub mod pending;
 pub mod theme;
