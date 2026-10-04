@@ -52,6 +52,11 @@ static void rejects_regions_it_cannot_trust() {
     Region short_buffer(1024, 256);
     CHECK(!vaio::attach(l, short_buffer.bytes.data(), short_buffer.bytes.size() - 8, 0));
     CHECK(!vaio::attach(l, nullptr, 0, 0));
+    // A misaligned region would make every interlocked access a split lock.
+    std::vector<unsigned char> raw(CONFLUENCE_VAIO_HEADER_BYTES + 1024 * 8 + 8);
+    Region proto(1024, 256);
+    std::memcpy(raw.data() + 1, proto.bytes.data(), CONFLUENCE_VAIO_HEADER_BYTES);
+    CHECK(!vaio::attach(l, raw.data() + 1, raw.size() - 1, 0));
 }
 
 static void fills_the_ring_up_to_target_and_no_further() {

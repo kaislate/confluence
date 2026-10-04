@@ -124,6 +124,11 @@ pub trait StrictStats: Send + Sync {
     fn attached(&self) -> Option<bool> {
         None
     }
+
+    /// What to tell the user while nothing is attached (e.g. "no app playing").
+    fn idle_note(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Parameters of a strict slot (a device on the engine's own clock).
@@ -528,6 +533,7 @@ impl Engine {
                     device_faults: 0,
                     driver_requests: 0,
                     attached: None,
+                    idle_note: None,
                 })
             }
             SlotStats::Master => Some(SlotHealth {
@@ -542,6 +548,7 @@ impl Engine {
                 device_faults: 0,
                 driver_requests: 0,
                 attached: None,
+                idle_note: None,
             }),
             SlotStats::Strict(stats) => {
                 let (underruns, overruns) = stats.xruns();
@@ -558,6 +565,7 @@ impl Engine {
                     device_faults: 0,
                     driver_requests: 0,
                     attached,
+                    idle_note: (attached == Some(false)).then(|| stats.idle_note()).flatten().map(String::from),
                 })
             }
             SlotStats::None => None,

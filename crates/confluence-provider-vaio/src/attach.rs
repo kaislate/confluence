@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows::core::HSTRING;
+use windows::core::{HRESULT, HSTRING};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PATH_NOT_FOUND, HANDLE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BUSY, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING,
+    ERROR_PATH_NOT_FOUND, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
@@ -51,13 +52,7 @@ impl Attachment {
                 None,
             )
         }
-        .map_err(|e| match e.code() {
-            c if c == ERROR_FILE_NOT_FOUND.to_hresult() || c == ERROR_PATH_NOT_FOUND.to_hresult() => {
-                VaioError::NotInstalled
-            }
-            c if c == ERROR_ACCESS_DENIED.to_hresult() => VaioError::InUse,
-            _ => VaioError::Io(e.to_string()),
-        })?;
+        .map_err(|e| open_error(e.code(), &e.to_string()))?;
         let device = SendHandle(device);
         let (tx, rx) = sync_channel::<Result<(), VaioError>>(1);
         let thread = std::thread::Builder::new()
@@ -74,6 +69,28 @@ impl Attachment {
             Ok(Err(e)) => Err(e),
             Err(_) => Err(VaioError::Io("the VAIO driver did not answer".into())),
         }
+    }
+}
+
+/// Why opening the control device failed.
+fn open_error(code: HRESULT, message: &str) -> VaioError {
+    match code {
+        c if c == ERROR_FILE_NOT_FOUND.to_hresult() || c == ERROR_PATH_NOT_FOUND.to_hresult() => {
+            VaioError::NotInstalled
+        }
+        // The device is exclusive: another engine has it open (or, less
+        // likely, this account may not open it).
+        c if c == ERROR_ACCESS_DENIED.to_hresult() => VaioError::InUse,
+        _ => VaioError::Io(message.to_string()),
+    }
+}
+
+/// Why the driver refused the attach request at once.
+fn attach_error(code: HRESULT, message: &str) -> VaioError {
+    match code {
+        c if c == ERROR_INVALID_PARAMETER.to_hresult() => VaioError::Rejected,
+        c if c == ERROR_BUSY.to_hresult() => VaioError::InUse,
+        _ => VaioError::Io(message.to_string()),
     }
 }
 
@@ -104,7 +121,7 @@ fn run(
         };
         match issued {
             Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {}
-            Err(e) => return Err(VaioError::Io(e.to_string())),
+            Err(e) => return Err(attach_error(e.code(), &e.to_string())),
             Ok(()) => return Err(VaioError::Rejected), // completed at once: refused
         }
         if region.header().attached.load(Ordering::Acquire) != 1 {
@@ -140,5 +157,29 @@ impl Drop for Attachment {
         }
         // SAFETY: opened in `start`; the thread has exited.
         let _ = unsafe { CloseHandle(self.device.0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::ERROR_NOT_SUPPORTED;
+
+    #[test]
+    fn open_errors_say_what_went_wrong() {
+        assert_eq!(open_error(ERROR_FILE_NOT_FOUND.to_hresult(), "x"), VaioError::NotInstalled);
+        assert_eq!(open_error(ERROR_PATH_NOT_FOUND.to_hresult(), "x"), VaioError::NotInstalled);
+        // An exclusive device already open, or an account that may not open it.
+        assert_eq!(open_error(ERROR_ACCESS_DENIED.to_hresult(), "x"), VaioError::InUse);
+        assert_eq!(open_error(ERROR_NOT_SUPPORTED.to_hresult(), "odd"), VaioError::Io("odd".into()));
+    }
+
+    #[test]
+    fn a_refused_attach_is_not_a_generic_io_error() {
+        // STATUS_INVALID_PARAMETER: the driver rejected the region.
+        assert_eq!(attach_error(ERROR_INVALID_PARAMETER.to_hresult(), "x"), VaioError::Rejected);
+        // STATUS_DEVICE_BUSY: another engine is attached.
+        assert_eq!(attach_error(ERROR_BUSY.to_hresult(), "x"), VaioError::InUse);
+        assert_eq!(attach_error(ERROR_NOT_SUPPORTED.to_hresult(), "odd"), VaioError::Io("odd".into()));
     }
 }

@@ -101,9 +101,13 @@ pub struct SlotHealth {
     /// Reset, resync and rate-change requests from the driver. The engine does
     /// not re-open devices yet: re-add the device to apply them.
     pub driver_requests: u64,
-    /// For a slot served to another program (VASIO): whether one is attached.
+    /// For a slot served to another program (VASIO, VAIO): whether one is attached.
     /// `None` for slots where this does not apply.
     pub attached: Option<bool>,
+    /// When `attached` is `Some(false)`: why, in the slot's own terms (e.g.
+    /// "no app playing" for VAIO).
+    #[serde(default)]
+    pub idle_note: Option<String>,
 }
 
 /// Kinds of device the engine can open.
