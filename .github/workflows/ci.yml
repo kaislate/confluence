@@ -1,5 +1,10 @@
 name: ci
-on: [push, pull_request]
+# One run per PR (pull_request) plus one on main after a merge: a push to a
+# PR branch would otherwise start the same job twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
 jobs:
   windows:
     runs-on: windows-latest
