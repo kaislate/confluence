@@ -4,4 +4,5 @@
 
 pub mod commands;
 pub mod engine_launch;
+pub mod matrix;
 pub mod theme;
