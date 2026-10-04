@@ -12,6 +12,15 @@ use std::path::{Path, PathBuf};
 
 use confluence_api::{read_envelope_since, write_frame, Command, Envelope, FrameError};
 
+/// The journal's own record format version. It changes only when a journaled
+/// command's encoding changes, not with every Control API bump, so an older
+/// engine can still read the journal after an upgrade is rolled back.
+pub const JOURNAL_VERSION: u16 = 1;
+
+fn record(id: u32, cmd: &Command) -> Envelope<Command> {
+    Envelope { version: JOURNAL_VERSION, id, body: cmd.clone() }
+}
+
 pub struct Journal {
     path: PathBuf,
     file: File,
@@ -55,7 +64,8 @@ impl Journal {
         {
             let mut reader = BufReader::new(&mut file);
             loop {
-                // Version 1 records (before subscriptions) are still valid commands.
+                // Records from older engines, and from engines that tagged them
+                // with their API version, are all valid commands.
                 match read_envelope_since::<_, Command>(&mut reader, 1) {
                     Ok(Some(env)) => {
                         commands.push(env.body);
@@ -76,7 +86,7 @@ impl Journal {
 
     /// Appends a mutating command and flushes it to the OS.
     pub fn append(&mut self, cmd: &Command) -> io::Result<()> {
-        write_frame(&mut self.file, &Envelope::new(self.next_id, cmd.clone())).map_err(io::Error::other)?;
+        write_frame(&mut self.file, &record(self.next_id, cmd)).map_err(io::Error::other)?;
         self.next_id = self.next_id.wrapping_add(1);
         Ok(())
     }
@@ -87,7 +97,7 @@ impl Journal {
         {
             let mut out = File::create(&tmp)?;
             for (i, cmd) in state.iter().enumerate() {
-                write_frame(&mut out, &Envelope::new(i as u32, cmd.clone())).map_err(io::Error::other)?;
+                write_frame(&mut out, &record(i as u32, cmd)).map_err(io::Error::other)?;
             }
             out.flush()?;
             out.sync_all()?;
@@ -120,6 +130,27 @@ mod tests {
         let (_journal, replay) = Journal::open(&path).unwrap();
         assert_eq!(replay, vec![set(1)]);
         assert!(fs::metadata(&path).unwrap().len() > 0, "not truncated");
+    }
+
+    /// The journal keeps its own format version, so an API bump does not stop
+    /// an older engine from reading it (rolling back must not lose routes).
+    #[test]
+    fn records_are_written_in_the_journal_format_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.bin");
+        {
+            let (mut j, _) = Journal::open(&path).unwrap();
+            j.append(&set(1)).unwrap();
+            j.compact(&[set(2)]).unwrap();
+            j.append(&set(3)).unwrap();
+        }
+        let mut f = BufReader::new(File::open(&path).unwrap());
+        let mut n = 0;
+        while let Some(env) = confluence_api::read_frame::<_, Envelope<Command>>(&mut f).unwrap() {
+            assert_eq!(env.version, JOURNAL_VERSION);
+            n += 1;
+        }
+        assert_eq!((n, JOURNAL_VERSION), (2, 1));
     }
 
     #[test]

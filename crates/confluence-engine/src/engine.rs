@@ -487,6 +487,9 @@ impl Engine {
     /// owns the device providers; here `RemoveSlot` only detaches the slot.
     pub fn handle(&mut self, cmd: &Command) -> Response {
         match *cmd {
+            Command::SetPoint { gain_db, .. } if !gain_db.is_finite() => {
+                Response::Error(format!("gain must be a number of dB, not {gain_db}"))
+            }
             Command::SetPoint { input, output, gain_db, mute, invert } => {
                 match self.matrix.set_point(input, output, PointParams { gain_db, mute, invert }) {
                     Ok(()) => Response::Ok,
@@ -645,6 +648,18 @@ fn claim_maybe(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A NaN gain never equals itself: it would look changed in every state
+    /// diff (a new version every 100 ms) and come back from the journal.
+    #[test]
+    fn a_gain_that_is_not_a_number_is_refused() {
+        let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        for gain_db in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let cmd = Command::SetPoint { input: 0, output: 0, gain_db, mute: false, invert: false };
+            assert!(matches!(engine.handle(&cmd), Response::Error(_)), "{gain_db}");
+        }
+        assert_eq!(engine.handle(&Command::ListPoints), Response::Points(Vec::new()));
+    }
 
     fn spec(name: &str, channels: usize) -> SoftSlotSpec {
         SoftSlotSpec {

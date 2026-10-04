@@ -24,7 +24,7 @@ mod app {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::Receiver;
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Arc, Mutex, MutexGuard, Weak};
     use std::time::{Duration, Instant};
 
     use confluence_api::{Command, DeviceInfo, EngineStatus, Event, Response, SlotHealth};
@@ -108,18 +108,23 @@ mod app {
     }
 
     /// The Control API: commands, and subscriptions to the published state.
+    /// Connections can stay open indefinitely (a GUI keeps one), so it holds the
+    /// state weakly: only a command in progress keeps it alive at shutdown.
     struct Control {
-        state: Arc<Mutex<State>>,
+        state: Weak<Mutex<State>>,
         shutdown: Arc<AtomicBool>,
     }
 
     impl Service for Control {
         fn handle(&self, cmd: &Command) -> Response {
-            let state = &self.state;
             if *cmd == Command::Shutdown {
                 self.shutdown.store(true, Ordering::SeqCst);
                 return Response::Ok;
             }
+            let Some(state) = self.state.upgrade() else {
+                return Response::Error("the engine is shutting down".into());
+            };
+            let state = &state;
             // Device enumeration and driver initialisation can be slow (a bad
             // driver can take seconds): do them without the lock, so the
             // engine keeps ticking and other clients keep being answered.
@@ -197,7 +202,7 @@ mod app {
         }
 
         fn subscribe(&self) -> Option<(confluence_api::State, Receiver<Event>)> {
-            Some(lock(&self.state).publisher.subscribe())
+            self.state.upgrade().map(|state| lock(&state).publisher.subscribe())
         }
     }
 
@@ -324,7 +329,7 @@ mod app {
                 }
             })?;
         }
-        let handler = Arc::new(Control { state: state.clone(), shutdown: shutdown.clone() });
+        let handler = Arc::new(Control { state: Arc::downgrade(&state), shutdown: shutdown.clone() });
         let server = listener.serve(handler)?;
         eprintln!("confluence-engine: listening on {}", pipe_path(&pipe));
 

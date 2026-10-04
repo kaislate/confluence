@@ -261,7 +261,7 @@ fn serve(mut file: File, handler: Handler) {
     loop {
         match read_envelope::<_, Command>(&mut file) {
             Ok(Some(env)) if env.body == Command::Subscribe => {
-                stream(file, env.id, &handler);
+                stream(file, env.id, handler);
                 return;
             }
             Ok(Some(env)) => {
@@ -282,8 +282,12 @@ fn serve(mut file: File, handler: Handler) {
 
 /// Writes the snapshot, then every event, until the client or the engine goes
 /// away. After `Subscribe` nothing more is read from the connection.
-fn stream(mut file: File, id: u32, handler: &Handler) {
-    let Some((snapshot, events)) = handler.subscribe() else {
+fn stream(mut file: File, id: u32, handler: Handler) {
+    let subscription = handler.subscribe();
+    // A subscriber that stops reading can block a write here for good: it
+    // must not keep the service (and the engine's state) alive meanwhile.
+    drop(handler);
+    let Some((snapshot, events)) = subscription else {
         let msg = Response::Error("subscriptions are not available".into());
         let _ = write_frame(&mut file, &Envelope::new(id, msg));
         return;

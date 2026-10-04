@@ -233,3 +233,34 @@ fn a_store_resyncs_after_the_engine_restarts() {
     let mut c2 = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
     c2.call(Command::Shutdown).unwrap();
 }
+
+/// Connections that stay open (a GUI's command connection, a subscriber that
+/// stopped reading) must not keep the engine's state alive at shutdown: it has
+/// to exit promptly and stop its devices cleanly.
+#[test]
+fn open_connections_do_not_hold_up_shutdown() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = format!("confluence-sub-g-{}", std::process::id());
+    let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
+    cmd.args(["--pipe", &pipe, "--journal"])
+        .arg(dir.path().join("journal.bin"))
+        .arg("--devices")
+        .arg(dir.path().join("devices.json"))
+        .stderr(std::process::Stdio::piped());
+    let mut engine = Engine(Some(cmd.spawn().unwrap()));
+    let (_, _never_read) = Subscription::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let mut idle = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    idle.call(Command::ListPoints).unwrap();
+    let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    assert_eq!(c.call(Command::Shutdown).unwrap(), Response::Ok);
+    let start = Instant::now();
+    let mut child = engine.0.take().unwrap();
+    let status = child.wait().unwrap();
+    let elapsed = start.elapsed();
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert!(status.success(), "{status:?}");
+    assert!(elapsed < Duration::from_secs(3), "exited promptly: {elapsed:?}\n{err}");
+    assert!(!err.contains("stopping anyway"), "devices were stopped cleanly:\n{err}");
+}
