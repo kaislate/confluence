@@ -9,7 +9,7 @@
 #define CONFLUENCE_VAIO_VERSION           1u
 #define CONFLUENCE_VAIO_SAMPLE_RATE       48000u
 #define CONFLUENCE_VAIO_CHANNELS          2u
-#define CONFLUENCE_VAIO_BYTES_PER_FRAME   8u            /* 2 x float32 */
+#define CONFLUENCE_VAIO_BYTES_PER_FRAME   8u            /* 2 x 32-bit signed PCM */
 #define CONFLUENCE_VAIO_HEADER_BYTES      4096u         /* the ring starts here */
 #define CONFLUENCE_VAIO_MIN_CAPACITY      1024u
 #define CONFLUENCE_VAIO_MAX_CAPACITY      65536u

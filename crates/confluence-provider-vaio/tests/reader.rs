@@ -7,14 +7,16 @@ use std::sync::Arc;
 
 use confluence_provider_vaio::{check_rate, ring_shape, Reader, Region, VaioError, VaioStats};
 
-/// Does what the driver does: puts frames (n, -n) in the ring and bumps the write counter.
+/// Does what the driver does: puts 32-bit PCM frames (n, -n) / 32768 in the
+/// ring and bumps the write counter.
 fn driver_writes(region: &Region, frames: u64) {
     let h = region.header();
     let start = h.write_frames.load(Ordering::Acquire);
     for n in start..start + frames {
         // SAFETY: test-only writer; nothing else writes these frames.
         let f = unsafe { region.frame_mut(n) };
-        *f = [n as f32, -(n as f32)];
+        let v = (n as i32 % 32768) << 16;
+        *f = [v, -v];
     }
     h.write_frames.store(start + frames, Ordering::Release);
 }
@@ -35,7 +37,8 @@ fn a_block_comes_out_in_order_and_deinterleaved() {
     let mut got = vec![(0usize, 0usize, 0f32); 0];
     assert!(reader.read(256, |ch, f, s| got.push((ch, f, s))));
     assert_eq!(got.len(), 512);
-    assert!(got.contains(&(0, 0, 0.0)) && got.contains(&(1, 255, -255.0)));
+    // 32-bit PCM becomes float: 255 << 16 is 255 / 32768 of full scale.
+    assert!(got.contains(&(0, 0, 0.0)) && got.contains(&(1, 255, -255.0 / 32768.0)), "{:?}", &got[..4]);
     assert_eq!(region.header().read_frames.load(Ordering::Acquire), 256);
     assert!(!reader.read(256, |_, _, _| {}), "only 44 left");
 }

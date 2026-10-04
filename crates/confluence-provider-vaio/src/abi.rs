@@ -8,6 +8,8 @@ pub const MAGIC: u32 = 0x4F49_4156; // "VAIO", little-endian
 pub const VERSION: u32 = 1;
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: usize = 2;
+/// The endpoint's format: 48 kHz, two channels of 32-bit signed PCM
+/// (Windows does not create an endpoint for a float-only device format).
 pub const BYTES_PER_FRAME: usize = 8;
 /// The ring starts this many bytes into the region.
 pub const HEADER_BYTES: usize = 4096;

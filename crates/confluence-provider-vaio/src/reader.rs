@@ -6,6 +6,11 @@ use std::sync::Arc;
 use crate::region::Region;
 use crate::VaioStats;
 
+/// 32-bit signed PCM (the endpoint's format) to float, full scale = 1.0.
+fn pcm_to_f32(s: i32) -> f32 {
+    s as f32 / 2_147_483_648.0
+}
+
 pub struct Reader {
     region: Arc<Region>,
     stats: Arc<VaioStats>,
@@ -50,8 +55,8 @@ impl Reader {
         }
         for f in 0..block {
             let [l, r] = self.region.frame(self.read + f as u64);
-            out(0, f, l);
-            out(1, f, r);
+            out(0, f, pcm_to_f32(l));
+            out(1, f, pcm_to_f32(r));
         }
         self.read += block as u64;
         h.read_frames.store(self.read, Ordering::Release);

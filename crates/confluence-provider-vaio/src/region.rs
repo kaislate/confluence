@@ -65,17 +65,18 @@ impl Region {
     /// The caller is the ring's only writer for that frame (the driver, or a
     /// test's fake driver), and no reference to it outlives the next write.
     #[allow(clippy::mut_from_ref)]
-    pub unsafe fn frame_mut(&self, frame: u64) -> &mut [f32; 2] {
+    pub unsafe fn frame_mut(&self, frame: u64) -> &mut [i32; 2] {
         let at = HEADER_BYTES + (frame % u64::from(self.capacity)) as usize * BYTES_PER_FRAME;
-        &mut *self.ptr.add(at).cast::<[f32; 2]>()
+        &mut *self.ptr.add(at).cast::<[i32; 2]>()
     }
 
-    pub(crate) fn frame(&self, frame: u64) -> [f32; 2] {
+    /// A frame of the ring: two 32-bit signed PCM samples (left, right).
+    pub(crate) fn frame(&self, frame: u64) -> [i32; 2] {
         let at = HEADER_BYTES + (frame % u64::from(self.capacity)) as usize * BYTES_PER_FRAME;
         // SAFETY: inside the region; a torn read of a frame being rewritten is
         // impossible because the driver never writes frames the reader may read
         // (it stays within `target` of the reader's position).
-        unsafe { std::ptr::read_volatile(self.ptr.add(at).cast::<[f32; 2]>()) }
+        unsafe { std::ptr::read_volatile(self.ptr.add(at).cast::<[i32; 2]>()) }
     }
 }
 

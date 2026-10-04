@@ -19,7 +19,7 @@ Abstract:
 #define SPEAKER_DEVICE_MAX_CHANNELS                 2       // Max Channels.
 
 #define SPEAKER_HOST_MAX_CHANNELS                   2       // Max Channels.
-#define SPEAKER_HOST_MIN_BITS_PER_SAMPLE            32      // Confluence VAIO: float32 only
+#define SPEAKER_HOST_MIN_BITS_PER_SAMPLE            32      // Confluence VAIO: 32-bit PCM only
 #define SPEAKER_HOST_MAX_BITS_PER_SAMPLE            32      // Max Bits Per Sample
 #define SPEAKER_HOST_MIN_SAMPLE_RATE                48000   // Min Sample Rate
 #define SPEAKER_HOST_MAX_SAMPLE_RATE                48000   // Max Sample Rate
@@ -34,14 +34,14 @@ Abstract:
 static 
 KSDATAFORMAT_WAVEFORMATEXTENSIBLE SpeakerHostPinSupportedDeviceFormats[] =
 {
-    { // 0: Confluence VAIO's only format, 48 kHz 32-bit float stereo
+    { // 0: Confluence VAIO's only format, 48 kHz 32-bit PCM stereo
         {
             sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
             0,
             0,
             0,
             STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT),
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
             STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
         },
         {
@@ -56,7 +56,7 @@ KSDATAFORMAT_WAVEFORMATEXTENSIBLE SpeakerHostPinSupportedDeviceFormats[] =
             },
             32,
             KSAUDIO_SPEAKER_STEREO,
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
         }
     }
 };
@@ -107,7 +107,7 @@ KSDATARANGE_AUDIO SpeakerPinDataRangesStream[] =
             0,
             0,
             STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT),
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
             STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
         },
         SPEAKER_HOST_MAX_CHANNELS,           
