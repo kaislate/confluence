@@ -2,8 +2,10 @@
 //! engine, drawn from a live `StateStore` copy; edits go through a worker
 //! thread so the window never waits on the engine.
 
+pub mod app;
 pub mod commands;
 pub mod engine_launch;
+pub mod grid_view;
 pub mod matrix;
 pub mod notify;
 pub mod pending;
