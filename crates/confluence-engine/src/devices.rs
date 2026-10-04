@@ -22,6 +22,7 @@ use crate::engine::{
     Engine, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec, StrictSlotSpec, StrictStats,
 };
 use confluence_core::buffer::PlanarBuffer;
+use confluence_provider_vaio::{VaioSlot, VaioStats};
 use confluence_provider_vasio::config::InstanceConfig;
 use confluence_provider_vasio::{VasioSlot, VasioStats};
 use std::sync::Arc;
@@ -51,6 +52,7 @@ impl Binding {
 /// (A VASIO slot itself lives on the audio thread; its handle is its counters.)
 enum Handle {
     Vasio(#[allow(dead_code)] Arc<VasioStats>),
+    Vaio(#[allow(dead_code)] Arc<VaioStats>),
     Asio(AsioDevice),
     Wasapi(WasapiStream),
 }
@@ -81,6 +83,8 @@ enum Loaded {
     Wasapi(WasapiStream, Option<String>),
     /// Nothing slow to do: the engine side is created when attached.
     Vasio,
+    /// As VASIO: the driver is attached when the slot is created.
+    Vaio,
 }
 
 /// Finds a WASAPI endpoint by its saved id, else by name.
@@ -99,6 +103,10 @@ fn load(opener: &AsioOpener, kind: DeviceKind, name: &str, endpoint_id: Option<&
         DeviceKind::Vasio => {
             parse_vasio(name)?;
             Loaded::Vasio
+        }
+        DeviceKind::Vaio => {
+            parse_vaio(name)?;
+            Loaded::Vaio
         }
         DeviceKind::WasapiRender | DeviceKind::WasapiCapture | DeviceKind::AppCapture => {
             let target = match kind {
@@ -360,6 +368,9 @@ impl DeviceManager {
         for n in 1..=confluence_provider_vasio::INSTANCES {
             out.push(DeviceInfo { kind: DeviceKind::Vasio, name: n.to_string(), inputs: 0, outputs: 0 });
         }
+        if confluence_provider_vaio::installed() {
+            out.push(DeviceInfo { kind: DeviceKind::Vaio, name: "1".into(), inputs: 2, outputs: 0 });
+        }
         Ok(out)
     }
 
@@ -613,7 +624,7 @@ impl DeviceManager {
                         lost |= hl.lost.load(Ordering::Relaxed);
                         faults += hl.faults.load(Ordering::Relaxed);
                     }
-                    Handle::Vasio(_) => {}
+                    Handle::Vasio(_) | Handle::Vaio(_) => {}
                 }
             }
             for h in slots.iter_mut().filter(|h| b.slots.contains(&h.id)) {
@@ -685,6 +696,7 @@ impl DeviceManager {
         match loaded {
             Loaded::Asio(dev) => self.open_asio(engine, name, device, at, dev).map(|(b, s)| (b, Some(s))),
             Loaded::Vasio => self.open_vasio(engine, name, device, at).map(|b| (b, None)),
+            Loaded::Vaio => self.open_vaio(engine, name, device, at).map(|b| (b, None)),
             Loaded::Wasapi(mut stream, endpoint_id) => {
                 let f = stream.format();
                 let mut binding = Binding { endpoint_id, ..binding_of(kind, name) };
@@ -774,6 +786,49 @@ impl DeviceManager {
             endpoint_id: None,
         };
         let handles = stats.map(Handle::Vasio).into_iter().collect();
+        Ok(Bound { binding, slots: vec![id], handles })
+    }
+
+    fn open_vaio(
+        &mut self,
+        engine: &mut Engine,
+        name: &str,
+        device: String,
+        at: Option<&Binding>,
+    ) -> Result<Bound, String> {
+        let instance = parse_vaio(name)?;
+        let (rate, block) = (engine.config().sample_rate, engine.config().block);
+        // Before any channel is taken or the driver touched.
+        confluence_provider_vaio::check_rate(rate).map_err(|e| e.to_string())?;
+        confluence_provider_vaio::ring_shape(block).map_err(|e| e.to_string())?;
+        let spec = StrictSlotSpec {
+            name: format!("VAIO {instance}"),
+            device,
+            inputs: confluence_provider_vaio::CHANNELS,
+            outputs: 0,
+            first_input: at.map(|b| b.first_input),
+            first_output: None,
+        };
+        let mut stats = None;
+        let (id, ch) = engine
+            .add_strict_slot(&spec, |ch| {
+                let slot = VaioSlot::open(rate, block).map_err(|e| e.to_string())?;
+                let s = slot.stats();
+                stats = Some(s.clone());
+                let side = VaioSide { slot, first_input: ch.first_input };
+                Ok((Box::new(side) as Box<dyn StrictSide>, s as Arc<dyn StrictStats>))
+            })
+            .map_err(|e| e.to_string())?;
+        let binding = Binding {
+            kind: DeviceKind::Vaio,
+            name: name.trim().to_string(),
+            first_input: ch.first_input as u32,
+            inputs: ch.inputs as u32,
+            first_output: 0,
+            outputs: 0,
+            endpoint_id: None,
+        };
+        let handles = stats.map(Handle::Vaio).into_iter().collect();
         Ok(Bound { binding, slots: vec![id], handles })
     }
 
@@ -927,6 +982,31 @@ impl StrictStats for VasioStats {
     }
 }
 
+/// The VAIO endpoint as a strict slot on the audio thread (inputs only).
+struct VaioSide {
+    slot: VaioSlot,
+    first_input: usize,
+}
+
+impl StrictSide for VaioSide {
+    fn receive(&mut self, inputs: &mut PlanarBuffer) {
+        self.slot.receive(inputs, self.first_input);
+    }
+
+    fn send(&mut self, _outputs: &PlanarBuffer) {}
+}
+
+impl StrictStats for VaioStats {
+    fn xruns(&self) -> (u64, u64) {
+        (self.underruns.load(Ordering::Relaxed), 0)
+    }
+
+    /// Whether an app is playing to the endpoint.
+    fn attached(&self) -> Option<bool> {
+        Some(self.streaming.load(Ordering::Relaxed))
+    }
+}
+
 fn slot_stats(stats: Option<Arc<VasioStats>>) -> Arc<dyn StrictStats> {
     stats.unwrap_or_default()
 }
@@ -980,11 +1060,20 @@ fn same_device(binding: &Binding, kind: DeviceKind, name: &str) -> bool {
             (Ok(a), Ok(b)) => a.0 == b.0,
             _ => binding.name == name,
         },
+        DeviceKind::Vaio => binding.name.trim() == name.trim(),
         _ => binding.name == name,
     }
 }
 
 /// Parses a VASIO device name: `N`, `N:C` or `N:IxO` (DAW inputs x outputs).
+/// Milestone 0 has one VAIO endpoint, "1".
+pub fn parse_vaio(name: &str) -> Result<u32, String> {
+    match name.trim() {
+        "1" => Ok(1),
+        other => Err(format!("'{other}' is not a VAIO device: only VAIO 1 exists")),
+    }
+}
+
 pub fn parse_vasio(name: &str) -> Result<(u32, usize, usize), String> {
     let bad = || format!("'{name}' is not a VASIO device: use N, N:channels or N:INxOUT (e.g. 1, 1:8, 1:8x2)");
     let (n, shape) = name.trim().split_once(':').unwrap_or((name.trim(), "2"));
@@ -1002,6 +1091,7 @@ pub fn parse_vasio(name: &str) -> Result<(u32, usize, usize), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::EngineConfig;
 
     #[test]
     fn wasapi_bindings_remember_the_endpoint_id_and_old_files_still_load() {
@@ -1015,6 +1105,23 @@ mod tests {
         assert_eq!(serde_json::from_str::<Binding>(&text).unwrap(), with_id);
         let asio = binding_of(DeviceKind::Asio, "x");
         assert!(!serde_json::to_string(&asio).unwrap().contains("endpoint_id"), "only written when known");
+    }
+
+    #[test]
+    fn vaio_has_one_instance_named_1() {
+        assert_eq!(parse_vaio("1"), Ok(1));
+        assert_eq!(parse_vaio(" 1 "), Ok(1));
+        assert!(parse_vaio("2").unwrap_err().contains("only VAIO 1"));
+        assert!(parse_vaio("speakers").is_err());
+    }
+
+    #[test]
+    fn vaio_on_a_44k_engine_is_a_clear_error_before_the_driver_is_touched() {
+        let (mut engine, _audio) = Engine::new(EngineConfig::new(44_100.0, 256));
+        let mut devices = DeviceManager::new(None);
+        let err = devices.add(&mut engine, DeviceKind::Vaio, "1").unwrap_err();
+        assert!(err.contains("48 kHz") && err.contains("44100"), "{err}");
+        assert!(engine.slots().is_empty());
     }
 
     #[test]

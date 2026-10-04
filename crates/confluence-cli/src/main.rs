@@ -41,7 +41,7 @@ enum Cmd {
     Shutdown,
     /// List audio devices the engine can open.
     Devices,
-    /// Open a device as slot(s): `add-device asio "MOTU Gen 5"`, `add-device vasio 1:8x2`.
+    /// Open a device as slot(s): `add-device asio "MOTU Gen 5"`, `add-device vasio 1:8x2`, `add-device vaio 1`.
     AddDevice { kind: Kind, name: String },
     /// Close a slot and remove the routes on its channels.
     RemoveSlot { id: u32 },
@@ -54,6 +54,7 @@ enum Kind {
     WasapiIn,
     App,
     Vasio,
+    Vaio,
 }
 
 impl From<Kind> for DeviceKind {
@@ -64,6 +65,7 @@ impl From<Kind> for DeviceKind {
             Kind::WasapiIn => DeviceKind::WasapiCapture,
             Kind::App => DeviceKind::AppCapture,
             Kind::Vasio => DeviceKind::Vasio,
+            Kind::Vaio => DeviceKind::Vaio,
         }
     }
 }
@@ -197,6 +199,12 @@ mod tests {
             cli.command.to_command(),
             Command::SetPoint { input: 1, output: 2, gain_db: -6.5, mute: false, invert: true }
         );
+    }
+
+    #[test]
+    fn add_device_vaio_parses() {
+        let cli = Cli::try_parse_from(["confluence-cli", "add-device", "vaio", "1"]).unwrap();
+        assert_eq!(cli.command.to_command(), Command::AddDevice { kind: DeviceKind::Vaio, name: "1".into() });
     }
 
     #[test]

@@ -297,6 +297,7 @@ dependencies = [
  "confluence-api",
  "confluence-core",
  "confluence-provider-asio",
+ "confluence-provider-vaio",
  "confluence-provider-vasio",
  "confluence-provider-wasapi",
  "confluence-rt",
