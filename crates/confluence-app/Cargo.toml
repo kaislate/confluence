@@ -22,6 +22,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 egui_kittest = "0.36"
 tempfile = "3"
 confluence-provider-vasio = { path = "../confluence-provider-vasio" }
+confluence-engine = { path = "../confluence-engine" }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [lints]
 workspace = true

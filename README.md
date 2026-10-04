@@ -27,6 +27,7 @@ Status: Milestone 0 in progress. Done so far:
 - drag up or down (or use the wheel) on a route to change its gain, holding Shift for fine steps;
 - double-click a cell for a plain 0 dB route;
 - right-click a cell for mute, invert and remove.
+- with a cell selected: arrows move, Space routes or unroutes, `+`/`-` change gain by 1 dB (hold Alt for 0.1 dB), `M` mutes, `I` inverts, Delete removes.
 
 Click a slot's header to see its clock health. **Devices…** adds devices. If no engine is running, **Start engine** starts the one next to the window's executable. Closing the window never stops the audio.
 

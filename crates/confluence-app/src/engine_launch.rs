@@ -6,6 +6,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const ENGINE_EXE: &str = "confluence-engine.exe";
+/// Windows `ERROR_ACCESS_DENIED`: what starting outside a job reports when
+/// the job does not allow it.
+const ERROR_ACCESS_DENIED: i32 = 5;
 /// The Start button ignores presses for this long after one.
 const DEBOUNCE: Duration = Duration::from_secs(5);
 /// An engine that exits within this long of starting is reported.
@@ -53,6 +56,20 @@ impl Launcher {
         if !self.exe.is_file() {
             return Err(format!("cannot start the engine: {} not found", self.exe.display()));
         }
+        // Outside the window's job if it is in one (some terminals and IDEs put
+        // what they start in a kill-on-close job): closing the window must not
+        // stop the engine. A job that forbids breaking away refuses with access
+        // denied; then start inside it rather than not at all.
+        let child = match self.spawn(true) {
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => self.spawn(false),
+            other => other,
+        }
+        .map_err(|e| format!("cannot start the engine: {e}"))?;
+        self.started = Some((child, now));
+        Ok(())
+    }
+
+    fn spawn(&self, break_away: bool) -> std::io::Result<Child> {
         let mut cmd = Command::new(&self.exe);
         cmd.args(&self.args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         #[cfg(windows)]
@@ -60,12 +77,22 @@ impl Launcher {
             use std::os::windows::process::CommandExt;
             const DETACHED_PROCESS: u32 = 0x0000_0008;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+            let mut flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+            if break_away {
+                flags |= CREATE_BREAKAWAY_FROM_JOB;
+            }
+            cmd.creation_flags(flags);
         }
-        let child = cmd.spawn().map_err(|e| format!("cannot start the engine: {e}"))?;
-        self.started = Some((child, now));
-        Ok(())
+        #[cfg(not(windows))]
+        let _ = break_away;
+        cmd.spawn()
+    }
+
+    /// The id of the process started last, while it is still being watched.
+    pub fn pid(&self) -> Option<u32> {
+        self.started.as_ref().map(|(child, _)| child.id())
     }
 
     /// A message if the engine just started has already exited; call each frame.

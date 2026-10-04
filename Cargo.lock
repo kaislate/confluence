@@ -888,6 +888,7 @@ version = "0.1.0"
 dependencies = [
  "confluence-api",
  "confluence-client",
+ "confluence-engine",
  "confluence-provider-vasio",
  "eframe",
  "egui_kittest",
@@ -895,6 +896,7 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
+ "windows",
 ]
 
 [[package]]
