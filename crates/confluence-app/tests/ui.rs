@@ -334,3 +334,24 @@ fn the_first_edit_after_an_engine_restart_works() {
     assert!(h.query_by_label_contains("lost the engine").is_none(), "the edit failed on the old connection");
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+/// While the engine is away the grid is read-only, but cells can still be
+/// selected to look at them in the inspector (as slot headers can).
+#[test]
+fn cells_can_be_selected_while_disconnected() {
+    let d = EngineDir::new("offline-select");
+    let mut engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_vasio(&mut c, 1);
+    drop(c);
+    let mut h = harness(app_for(&d));
+    let cell = "VASIO 1 in 1 → VASIO 1 out 1";
+    pump_until(&mut h, "the grid", LONG, |h| h.query_by_role_and_label(Role::Button, cell).is_some());
+    engine.kill();
+    pump_until(&mut h, "Reconnecting", LONG, |h| h.query_all_by_label_contains("Reconnecting").next().is_some());
+    settle(&mut h);
+    h.get_by_role_and_label(Role::Button, cell).click();
+    settle(&mut h);
+    assert_eq!(h.state().selection(), confluence_app::matrix::Selection::Cell { input: i, output: o });
+    assert!(h.state().point(i, o).is_none(), "no edit while disconnected");
+}

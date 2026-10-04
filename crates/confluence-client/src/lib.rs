@@ -11,7 +11,7 @@ mod subscription;
 pub use subscription::Subscription;
 
 mod store;
-pub use store::{ConnState, Gap, HealthSample, History, StateStore, Store, StoreView, HISTORY_LEN};
+pub use store::{ConnState, Gap, HealthSample, History, SessionEnd, StateStore, Store, StoreView, HISTORY_LEN};
 
 pub fn pipe_path(name: &str) -> String {
     format!(r"\\.\pipe\{name}")

@@ -18,6 +18,46 @@ pub const HISTORY_LEN: usize = 600;
 /// First and longest wait between reconnect attempts.
 const BACKOFF_MIN: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// A subscription that lasted this long was healthy: the backoff starts over.
+const HEALTHY: Duration = Duration::from_secs(10);
+
+/// The wait before each (re)subscription: doubling while subscriptions keep
+/// ending soon (no engine, or repeated gaps), starting over after a healthy one.
+#[derive(Debug)]
+struct Backoff {
+    wait: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff { wait: BACKOFF_MIN }
+    }
+}
+
+impl Backoff {
+    /// The wait to use now; the next one is longer.
+    fn next(&mut self) -> Duration {
+        let wait = self.wait;
+        self.wait = (self.wait * 2).min(BACKOFF_MAX);
+        wait
+    }
+
+    /// A subscription ended after `lasted`.
+    fn ended_after(&mut self, lasted: Duration) {
+        if lasted >= HEALTHY {
+            self.wait = BACKOFF_MIN;
+        }
+    }
+}
+
+/// How a subscription ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SessionEnd {
+    /// A version gap: resubscribing for a fresh snapshot; still connected.
+    Gap,
+    /// The connection is gone (or could not be made).
+    Lost,
+}
 /// How long one connection attempt waits for the pipe.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -60,6 +100,8 @@ pub struct StoreView {
     pub history: Arc<History>,
     /// When anything (snapshot or event) last arrived from the engine.
     pub last_event: Option<Instant>,
+    /// Snapshots taken so far: a new one replaced the state wholesale.
+    pub snapshots: u64,
 }
 
 /// A versioned event that did not follow the last version.
@@ -89,6 +131,7 @@ impl Store {
                 health: Vec::new(),
                 history: Arc::new(History::new()),
                 last_event: None,
+                snapshots: 0,
             },
             gap_pending: false,
             ever_live: false,
@@ -106,6 +149,7 @@ impl Store {
         self.view.state = Some(s);
         self.view.conn = ConnState::Live;
         self.view.last_event = Some(now);
+        self.view.snapshots += 1;
         self.ever_live = true;
     }
 
@@ -160,6 +204,14 @@ impl Store {
         Ok(())
     }
 
+    /// A subscription ended. A gap keeps the view `Live` (a fresh snapshot
+    /// follows at once); a lost connection is a disconnect.
+    pub fn ended(&mut self, how: SessionEnd, now: Instant) {
+        if how == SessionEnd::Lost {
+            self.disconnected(now);
+        }
+    }
+
     /// The connection ended (or an attempt failed). The state stays, stale,
     /// until the next snapshot. Before any engine was reached this stays
     /// `Connecting`.
@@ -179,7 +231,8 @@ impl Store {
 }
 
 /// [`Store`] on a thread that keeps it connected to the engine. Dropping it
-/// stops the thread: at once while it is waiting to reconnect, otherwise at
+/// stops the thread: within one connection attempt and wait (at most about
+/// 2.5 s) while it is reconnecting, otherwise at
 /// the next event (telemetry arrives every 100 ms from a live engine).
 pub struct StateStore {
     shared: Arc<Mutex<Arc<StoreView>>>,
@@ -194,7 +247,7 @@ impl StateStore {
         let (out, stopping) = (shared.clone(), stop.clone());
         let _ = std::thread::Builder::new().name("confluence-state-store".into()).spawn(move || {
             let mut store = Store::new();
-            let mut backoff = BACKOFF_MIN;
+            let mut backoff = Backoff::default();
             let update = |store: &Store| {
                 if let Ok(mut v) = out.lock() {
                     *v = Arc::new(store.view());
@@ -202,27 +255,29 @@ impl StateStore {
                 on_change();
             };
             while !stopping.load(Ordering::SeqCst) {
+                let mut how = SessionEnd::Lost;
                 if let Ok((snapshot, mut sub)) = Subscription::connect(&pipe, CONNECT_TIMEOUT) {
-                    backoff = BACKOFF_MIN;
-                    store.snapshot(snapshot, Instant::now());
+                    let began = Instant::now();
+                    store.snapshot(snapshot, began);
                     update(&store);
                     while let Ok(e) = sub.recv() {
                         if stopping.load(Ordering::SeqCst) {
                             return;
                         }
                         if store.event(e, Instant::now()).is_err() {
-                            break; // gap: resubscribe (after the backoff) for a fresh snapshot
+                            how = SessionEnd::Gap; // resubscribe for a fresh snapshot
+                            break;
                         }
                         update(&store);
                     }
+                    backoff.ended_after(began.elapsed());
                 }
                 if stopping.load(Ordering::SeqCst) {
                     return;
                 }
-                store.disconnected(Instant::now());
+                store.ended(how, Instant::now());
                 update(&store);
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(BACKOFF_MAX);
+                std::thread::sleep(backoff.next());
             }
         });
         StateStore { shared, stop }
@@ -358,6 +413,38 @@ mod tests {
         s.disconnected(now);
         s.snapshot(state(0, &[]), now); // a restarted engine starts again at 0
         assert!(s.view().state.unwrap().points.is_empty(), "no stale point survives");
+    }
+
+    #[test]
+    fn the_wait_doubles_until_a_subscription_stays_healthy() {
+        let mut b = Backoff::default();
+        let waits: Vec<u128> = (0..7).map(|_| b.next().as_millis()).collect();
+        assert_eq!(waits, vec![100, 200, 400, 800, 1600, 2000, 2000]);
+        b.ended_after(Duration::from_secs(1));
+        assert_eq!(b.next().as_millis(), 2000, "a short-lived subscription (a gap loop) keeps backing off");
+        b.ended_after(HEALTHY);
+        assert_eq!(b.next().as_millis(), 100, "a long healthy subscription starts over");
+    }
+
+    #[test]
+    fn a_version_gap_resyncs_without_looking_disconnected() {
+        let mut s = Store::new();
+        let now = Instant::now();
+        s.snapshot(state(4, &[]), now);
+        s.ended(SessionEnd::Gap, now);
+        assert!(matches!(s.view().conn, ConnState::Live), "still live: a fresh snapshot is on its way");
+        s.ended(SessionEnd::Lost, now);
+        assert!(matches!(s.view().conn, ConnState::Reconnecting { .. }));
+    }
+
+    #[test]
+    fn snapshots_are_counted() {
+        let mut s = Store::new();
+        assert_eq!(s.view().snapshots, 0);
+        s.snapshot(state(0, &[]), Instant::now());
+        s.disconnected(Instant::now());
+        s.snapshot(state(0, &[]), Instant::now());
+        assert_eq!(s.view().snapshots, 2);
     }
 
     #[test]

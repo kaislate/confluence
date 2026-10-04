@@ -49,6 +49,34 @@ pub fn badge(conn: &ConnState, last_event: Option<Instant>, now: Instant) -> Str
     }
 }
 
+/// What the window says when it cannot open at all (a release build has no
+/// console, so this is shown in a message box).
+pub fn startup_error_text(e: &dyn std::fmt::Display) -> String {
+    format!(
+        "Confluence could not open its window: {e}
+
+The audio engine runs on its own; audio is not affected."
+    )
+}
+
+/// True once per new snapshot: `seen` is the snapshot count last handled.
+pub fn fresh_snapshot(seen: &mut u64, snapshots: u64) -> bool {
+    let fresh = snapshots != *seen;
+    *seen = snapshots;
+    fresh
+}
+
+/// The xrun count last seen and when it last rose (the top bar flashes then).
+/// A lower count (a restarted engine) becomes the new baseline, so new xruns
+/// flash again rather than only once they pass the old total.
+pub fn track_xruns(seen: (u64, Option<Instant>), count: u64, now: Instant) -> (u64, Option<Instant>) {
+    if count > seen.0 {
+        (count, Some(now))
+    } else {
+        (count, seen.1)
+    }
+}
+
 /// Keys that act on the selected cell.
 const CELL_KEYS: [(Key, CellKey); 7] = [
     (Key::Space, CellKey::Toggle),
@@ -118,6 +146,8 @@ pub struct ConfluenceApp {
     cell: f32,
     pub inspector_open: bool,
     xruns: (u64, Option<Instant>),
+    /// The store's snapshot count last handled (see `fresh_snapshot`).
+    snapshots_seen: u64,
     look: Look,
     skin_dir: Option<PathBuf>,
     /// A slot waiting for "Remove ‹name›?" to be confirmed.
@@ -159,6 +189,7 @@ impl ConfluenceApp {
             cell: Look::builtin().skin.cell,
             inspector_open: true,
             xruns: (0, None),
+            snapshots_seen: 0,
             look: Look::builtin(),
             skin_dir: config.skin,
             confirm_remove: None,
@@ -248,6 +279,11 @@ impl ConfluenceApp {
             self.notes.error(msg, now);
         }
         let view = self.view.clone();
+        if fresh_snapshot(&mut self.snapshots_seen, view.snapshots) {
+            // The snapshot is the truth now; edits pending against an older
+            // connection got their outcome there or never will.
+            self.pending.clear();
+        }
         if let Some(state) = &view.state {
             self.pending.reconcile(state);
             if !selection_valid(&self.selection, &state.slots) {
@@ -304,9 +340,7 @@ impl ConfluenceApp {
                         Some(c) => dsp.color(c),
                         None => dsp,
                     });
-                    if s.xruns > self.xruns.0 {
-                        self.xruns = (s.xruns, Some(now));
-                    }
+                    self.xruns = track_xruns(self.xruns, s.xruns, now);
                     let flashing = self.xruns.1.is_some_and(|t| now.saturating_duration_since(t) < XRUN_FLASH);
                     if !flashing {
                         self.xruns.1 = None;
@@ -613,6 +647,35 @@ mod tests {
         assert_eq!(cell_keys(&[Key::Minus], alt), (vec![CellKey::Down], true));
         assert_eq!(cell_keys(&[Key::Equals], ctrl), (vec![], false), "Ctrl+= is zoom, not gain");
         assert_eq!(cell_keys(&[Key::M, Key::Space], Modifiers::NONE), (vec![CellKey::Toggle, CellKey::Mute], false));
+    }
+
+    /// After a reconnect the engine's snapshot is the truth: edits pending
+    /// against the old connection (or an engine that restarted at version 0)
+    /// would otherwise stay outlined forever.
+    #[test]
+    fn a_fresh_snapshot_is_noticed_once() {
+        let mut seen = 1;
+        assert!(!fresh_snapshot(&mut seen, 1));
+        assert!(fresh_snapshot(&mut seen, 2));
+        assert!(!fresh_snapshot(&mut seen, 2));
+    }
+
+    #[test]
+    fn a_startup_failure_explains_itself() {
+        let text = startup_error_text(&"no suitable graphics adapter");
+        assert!(text.contains("no suitable graphics adapter"), "{text}");
+        assert!(text.contains("audio"), "says that audio is unaffected: {text}");
+    }
+
+    #[test]
+    fn xruns_flash_again_after_an_engine_restart() {
+        let t0 = Instant::now();
+        let seen = track_xruns((50, None), 50, t0);
+        assert_eq!(seen, (50, None), "no new xruns: no flash");
+        let restarted = track_xruns(seen, 0, t0);
+        assert_eq!(restarted, (0, None), "a restarted engine counts from 0 again");
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(track_xruns(restarted, 3, t1), (3, Some(t1)), "new xruns flash");
     }
 
     #[test]
