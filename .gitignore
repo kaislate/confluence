@@ -19,3 +19,11 @@ Thumbs.db
 
 # Claude Code worktrees
 /.claude/
+
+# Confluence VAIO driver build output
+drivers/vaio/packages/
+drivers/vaio/.tools/
+drivers/vaio/out/
+drivers/vaio/Source/**/x64/
+drivers/vaio/test/*.exe
+drivers/vaio/test/*.obj

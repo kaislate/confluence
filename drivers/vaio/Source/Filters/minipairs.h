@@ -161,9 +161,12 @@ PENDPOINT_MINIPAIR  g_RenderEndpoints[] =
 // unnessary, this array could contain render endpoints.
 //
 static
-PENDPOINT_MINIPAIR  g_CaptureEndpoints[] =
+// Confluence VAIO: playback only, so no capture endpoint is installed. The
+// microphone tables above stay in the build but are never registered, and
+// InstallAllCaptureFilters skips the NULL entry.
+PENDPOINT_MINIPAIR  g_CaptureEndpoints[] = 
 {
-    &MicArray1Miniports,
+    NULL,
 };
 
 #define g_cCaptureEndpoints (SIZEOF_ARRAY(g_CaptureEndpoints))

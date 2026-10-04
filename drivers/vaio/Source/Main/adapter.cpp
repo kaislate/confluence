@@ -658,6 +658,10 @@ InstallAllCaptureFilters(
 
     for (ULONG i = 0; i < g_cCaptureEndpoints; ++i, ++ppAeMiniports)
     {
+        if (*ppAeMiniports == NULL)
+        {
+            continue;   // Confluence VAIO: no capture endpoint
+        }
         ntStatus = InstallEndpointCaptureFilters(_pDeviceObject, _pIrp, _pAdapterCommon, *ppAeMiniports);
         IF_FAILED_JUMP(ntStatus, Exit);
     }
