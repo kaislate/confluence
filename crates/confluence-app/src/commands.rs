@@ -14,6 +14,10 @@ use confluence_client::Client;
 pub const GAIN_INTERVAL: Duration = Duration::from_millis(30);
 /// How long a connection attempt waits for the engine's pipe.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long one edit may take before the engine counts as not responding.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Opening a device can legitimately take seconds (a slow driver).
+const ADD_DEVICE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A change the user asked for.
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +95,11 @@ impl Outbox {
         self.queue.len()
     }
 
+    /// Takes every queued edit, in order.
+    pub fn drain(&mut self) -> Vec<Edit> {
+        self.queue.drain(..).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -132,11 +141,16 @@ pub struct Worker {
 impl Worker {
     /// Starts the worker; `wake` runs after every outcome (the UI repaints).
     pub fn spawn(pipe: String, wake: Arc<dyn Fn() + Send + Sync>) -> Worker {
+        Self::spawn_with(pipe, wake, CALL_TIMEOUT)
+    }
+
+    /// As [`Worker::spawn`], with a given limit on how long one call may take.
+    pub fn spawn_with(pipe: String, wake: Arc<dyn Fn() + Send + Sync>, call_timeout: Duration) -> Worker {
         let (edits, edit_rx) = channel::<Edit>();
         let (out_tx, outcomes) = channel::<Outcome>();
         let _ = std::thread::Builder::new()
             .name("confluence-commands".into())
-            .spawn(move || run(&pipe, &edit_rx, &out_tx, &wake));
+            .spawn(move || run(&pipe, &edit_rx, &out_tx, &wake, call_timeout));
         Worker { edits, outcomes }
     }
 
@@ -152,9 +166,58 @@ impl Worker {
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
-fn run(pipe: &str, edits: &Receiver<Edit>, out: &Sender<Outcome>, wake: &Wake) {
+/// Why a call produced no reply.
+enum Failure {
+    /// The connection failed or could not be made.
+    Lost(String),
+    /// No reply within the time limit: the engine is not responding.
+    Hung,
+}
+
+const NOT_RESPONDING: &str = "the engine is not responding";
+
+/// A connection on its own thread, so a call that never returns can be given
+/// up on: the thread is abandoned and ends when its call finally returns.
+struct Caller {
+    requests: Sender<Command>,
+    replies: Receiver<Result<Response, String>>,
+}
+
+impl Caller {
+    fn connect(pipe: &str) -> Result<Caller, String> {
+        let mut client =
+            Client::connect(pipe, CONNECT_TIMEOUT).map_err(|e| format!("not connected to the engine ({e})"))?;
+        let (requests, request_rx) = channel::<Command>();
+        let (reply_tx, replies) = channel();
+        std::thread::Builder::new()
+            .name("confluence-call".into())
+            .spawn(move || {
+                for cmd in request_rx {
+                    let reply = client.call(cmd).map_err(|e| format!("lost the engine ({e})"));
+                    if reply_tx.send(reply).is_err() {
+                        return; // given up on
+                    }
+                }
+            })
+            .map_err(|e| format!("cannot start a connection thread ({e})"))?;
+        Ok(Caller { requests, replies })
+    }
+
+    fn call(&self, cmd: Command, timeout: Duration) -> Result<Response, Failure> {
+        if self.requests.send(cmd).is_err() {
+            return Err(Failure::Lost("lost the engine".into()));
+        }
+        match self.replies.recv_timeout(timeout) {
+            Ok(reply) => reply.map_err(Failure::Lost),
+            Err(RecvTimeoutError::Timeout) => Err(Failure::Hung),
+            Err(RecvTimeoutError::Disconnected) => Err(Failure::Lost("lost the engine".into())),
+        }
+    }
+}
+
+fn run(pipe: &str, edits: &Receiver<Edit>, out: &Sender<Outcome>, wake: &Wake, timeout: Duration) {
     let mut outbox = Outbox::default();
-    let mut client: Option<Client> = None;
+    let mut caller: Option<Caller> = None;
     loop {
         let received = match outbox.wait(Instant::now()) {
             None => edits.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -174,7 +237,15 @@ fn run(pipe: &str, edits: &Receiver<Edit>, out: &Sender<Outcome>, wake: &Wake) {
             queue(&mut outbox, edit, pipe, out, wake);
         }
         while let Some(edit) = outbox.next_ready(Instant::now()) {
-            let _ = out.send(send(&mut client, pipe, edit));
+            let (outcome, hung) = send(&mut caller, pipe, edit, timeout);
+            let _ = out.send(outcome);
+            if hung {
+                // Everything waiting behind the stuck call fails too, rather
+                // than each waiting out its own timeout.
+                for edit in outbox.drain().into_iter().chain(edits.try_iter()) {
+                    let _ = out.send(Outcome::Failed { edit, reason: NOT_RESPONDING.into() });
+                }
+            }
             wake();
         }
     }
@@ -187,42 +258,44 @@ fn queue(outbox: &mut Outbox, edit: Edit, pipe: &str, out: &Sender<Outcome>, wak
     }
     let (pipe, out, wake) = (pipe.to_string(), out.clone(), wake.clone());
     let _ = std::thread::Builder::new().name("confluence-add-device".into()).spawn(move || {
-        let mut client = None;
-        let _ = out.send(send(&mut client, &pipe, edit));
+        let mut caller = None;
+        let (outcome, _) = send(&mut caller, &pipe, edit, ADD_DEVICE_TIMEOUT);
+        let _ = out.send(outcome);
         wake();
     });
 }
 
 /// One call, connecting first if needed; a failed call drops the connection.
-fn call(client: &mut Option<Client>, pipe: &str, edit: &Edit) -> Result<Response, String> {
-    let c = match client {
+fn call(caller: &mut Option<Caller>, pipe: &str, edit: &Edit, timeout: Duration) -> Result<Response, Failure> {
+    let c = match caller {
         Some(c) => c,
-        None => match Client::connect(pipe, CONNECT_TIMEOUT) {
-            Ok(c) => client.insert(c),
-            Err(e) => return Err(format!("not connected to the engine ({e})")),
-        },
+        None => caller.insert(Caller::connect(pipe).map_err(Failure::Lost)?),
     };
-    c.call(edit.command()).map_err(|e| {
-        *client = None;
-        format!("lost the engine ({e})")
-    })
+    let result = c.call(edit.command(), timeout);
+    if result.is_err() {
+        *caller = None;
+    }
+    result
 }
 
-fn send(client: &mut Option<Client>, pipe: &str, edit: Edit) -> Outcome {
-    let reused = client.is_some();
-    let mut result = call(client, pipe, &edit);
-    if reused && result.is_err() {
+/// Sends one edit; the flag is true when the engine did not answer in time.
+fn send(caller: &mut Option<Caller>, pipe: &str, edit: Edit, timeout: Duration) -> (Outcome, bool) {
+    let reused = caller.is_some();
+    let mut result = call(caller, pipe, &edit, timeout);
+    if reused && matches!(result, Err(Failure::Lost(_))) {
         // The connection may be from before an engine restart: try once more
         // on a fresh one. Every edit sent this way is safe to repeat.
-        result = call(client, pipe, &edit);
+        result = call(caller, pipe, &edit, timeout);
     }
-    match result {
+    let outcome = match result {
         Ok(Response::Applied { version }) => Outcome::Done { edit, version: Some(version), ids: Vec::new() },
         Ok(Response::Added { ids, version }) => Outcome::Done { edit, version: Some(version), ids },
         Ok(Response::Error(reason)) => Outcome::Failed { edit, reason },
         Ok(_) => Outcome::Done { edit, version: None, ids: Vec::new() },
-        Err(reason) => Outcome::Failed { edit, reason },
-    }
+        Err(Failure::Lost(reason)) => Outcome::Failed { edit, reason },
+        Err(Failure::Hung) => return (Outcome::Failed { edit, reason: NOT_RESPONDING.into() }, true),
+    };
+    (outcome, false)
 }
 
 #[cfg(test)]
@@ -297,6 +370,51 @@ mod tests {
         assert_eq!(Edit::RemoveSlot { id: 7 }.command(), Command::RemoveSlot { id: 7 });
         assert_eq!(gain(3, 4, 0.0).point(), Some((3, 4)));
         assert_eq!(Edit::RemoveSlot { id: 7 }.point(), None);
+    }
+
+    /// Collects outcomes until `n` arrived, failing after `limit`.
+    fn outcomes(worker: &Worker, n: usize, limit: Duration) -> Vec<Outcome> {
+        let start = Instant::now();
+        let mut got = Vec::new();
+        while got.len() < n {
+            got.extend(worker.outcomes());
+            assert!(start.elapsed() < limit, "only {} of {n} outcomes after {limit:?}: {got:?}", got.len());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        got
+    }
+
+    /// An engine that stops answering must not block edits forever: the stuck
+    /// edit and everything queued behind it fail, and the next edit gets a
+    /// fresh connection.
+    #[test]
+    fn a_hung_engine_fails_edits_instead_of_blocking_them() {
+        use confluence_engine::ipc::{service_fn, PipeServer};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let name = format!("confluence-hung-{}", std::process::id());
+        let first = Arc::new(AtomicBool::new(true));
+        let server = PipeServer::start(&name, {
+            let first = first.clone();
+            service_fn(move |_| {
+                if first.swap(false, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_secs(5)); // hung
+                }
+                Response::Applied { version: 1 }
+            })
+        })
+        .unwrap();
+        let worker = Worker::spawn_with(name, Arc::new(|| {}), Duration::from_millis(300));
+        worker.send(gain(1, 1, -6.0));
+        std::thread::sleep(Duration::from_millis(50));
+        worker.send(Edit::RemovePoint { input: 2, output: 2 }); // queued behind the hung call
+        let got = outcomes(&worker, 2, Duration::from_secs(2));
+        for o in &got {
+            assert!(matches!(o, Outcome::Failed { reason, .. } if reason.contains("not responding")), "{got:?}");
+        }
+        worker.send(Edit::RemovePoint { input: 3, output: 3 });
+        let next = outcomes(&worker, 1, Duration::from_secs(2));
+        assert!(matches!(next[0], Outcome::Done { .. }), "the next edit is not stuck: {next:?}");
+        server.stop();
     }
 
     #[test]
