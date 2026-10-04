@@ -50,6 +50,15 @@ impl Backoff {
     }
 }
 
+/// What a store update changed, for a front end deciding when to redraw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Update {
+    /// The state or the connection changed: show it now.
+    State,
+    /// Only telemetry (status, health, history): it may be drawn less often.
+    Telemetry,
+}
+
 /// How a subscription ended.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SessionEnd {
@@ -263,7 +272,7 @@ pub struct StateStore {
 
 impl StateStore {
     /// Starts following the engine on `pipe`; `on_change` runs after every update.
-    pub fn spawn(pipe: String, on_change: Box<dyn Fn() + Send + Sync>) -> StateStore {
+    pub fn spawn(pipe: String, on_change: Box<dyn Fn(Update) + Send + Sync>) -> StateStore {
         let shared = Arc::new(Mutex::new(Arc::new(Store::new().view())));
         let stop = Arc::new(AtomicBool::new(false));
         let store = Store::new();
@@ -272,28 +281,32 @@ impl StateStore {
         let _ = std::thread::Builder::new().name("confluence-state-store".into()).spawn(move || {
             let mut store = store;
             let mut backoff = Backoff::default();
-            let update = |store: &Store| {
+            let update = |store: &Store, what: Update| {
                 let view = Arc::new(store.view()); // built before taking the lock
                 if let Ok(mut v) = out.lock() {
                     *v = view;
                 }
-                on_change();
+                on_change(what);
             };
             while !stopping.load(Ordering::SeqCst) {
                 let mut how = SessionEnd::Lost;
                 if let Ok((snapshot, mut sub)) = Subscription::connect(&pipe, CONNECT_TIMEOUT) {
                     let began = Instant::now();
                     store.snapshot(snapshot, began);
-                    update(&store);
+                    update(&store, Update::State);
                     while let Ok(e) = sub.recv() {
                         if stopping.load(Ordering::SeqCst) {
                             return;
                         }
+                        let what = match e {
+                            Event::Telemetry { .. } => Update::Telemetry,
+                            Event::Changed { .. } => Update::State,
+                        };
                         if store.event(e, Instant::now()).is_err() {
                             how = SessionEnd::Gap; // resubscribe for a fresh snapshot
                             break;
                         }
-                        update(&store);
+                        update(&store, what);
                     }
                     backoff.ended_after(began.elapsed());
                 }
@@ -301,7 +314,7 @@ impl StateStore {
                     return;
                 }
                 store.ended(how, Instant::now());
-                update(&store);
+                update(&store, Update::State);
                 std::thread::sleep(backoff.next());
             }
         });
@@ -534,7 +547,7 @@ mod tests {
         let held = guard.clone();
         let store = StateStore::spawn(
             format!("confluence-no-engine-{}", std::process::id()),
-            Box::new(move || {
+            Box::new(move |_| {
                 let _ = &held;
             }),
         );
