@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use confluence_api::{read_envelope, write_frame, Command, Envelope, FrameError};
+use confluence_api::{read_envelope_since, write_frame, Command, Envelope, FrameError};
 
 pub struct Journal {
     path: PathBuf,
@@ -55,7 +55,8 @@ impl Journal {
         {
             let mut reader = BufReader::new(&mut file);
             loop {
-                match read_envelope::<_, Command>(&mut reader) {
+                // Version 1 records (before subscriptions) are still valid commands.
+                match read_envelope_since::<_, Command>(&mut reader, 1) {
                     Ok(Some(env)) => {
                         commands.push(env.body);
                         good_len = reader.stream_position()?;
@@ -104,6 +105,21 @@ mod tests {
 
     fn set(i: u32) -> Command {
         Command::SetPoint { input: i, output: i, gain_db: -3.0, mute: false, invert: false }
+    }
+
+    /// Existing users' journals were written with protocol version 1: they
+    /// must replay after the bump, not be judged corrupt and truncated.
+    #[test]
+    fn a_version_1_journal_still_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.bin");
+        {
+            let mut f = File::create(&path).unwrap();
+            write_frame(&mut f, &Envelope { version: 1, id: 0, body: set(1) }).unwrap();
+        }
+        let (_journal, replay) = Journal::open(&path).unwrap();
+        assert_eq!(replay, vec![set(1)]);
+        assert!(fs::metadata(&path).unwrap().len() > 0, "not truncated");
     }
 
     #[test]

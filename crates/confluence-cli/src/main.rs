@@ -147,6 +147,16 @@ fn render(resp: &Response) -> String {
         Response::SlotsAdded(ids) => {
             format!("added slot(s) {}", ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", "))
         }
+        Response::Added { ids, version } => format!(
+            "added slot(s) {} (version {version})",
+            ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ")
+        ),
+        Response::Applied { version } => format!("ok (version {version})"),
+        Response::Snapshot(s) => {
+            format!("state version {} ({} slots, {} points)", s.version, s.slots.len(), s.points.len())
+        }
+        Response::Event(e) => format!("{e:?}"),
+        Response::Status(s) => format!("{s:?}"),
     }
 }
 

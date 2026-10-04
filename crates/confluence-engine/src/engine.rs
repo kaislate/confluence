@@ -512,6 +512,9 @@ impl Engine {
             Command::ListDevices | Command::AddDevice { .. } => {
                 Response::Error("device commands are handled by the engine process".into())
             }
+            Command::Subscribe | Command::Status => {
+                Response::Error("subscriptions and status are served by the engine process".into())
+            }
             Command::Shutdown => Response::Ok,
         }
     }
