@@ -334,7 +334,7 @@ mod app {
             let mut s = lock(&state);
             s.engine.tick();
             ticks += 1;
-            if ticks % PUBLISH_TICKS == 0 {
+            if ticks.is_multiple_of(PUBLISH_TICKS) {
                 // Catches changes no command made: devices lost or back, a DAW attaching.
                 publish(&mut s);
                 let h = health(&mut s);
