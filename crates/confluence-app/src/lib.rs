@@ -7,4 +7,5 @@ pub mod engine_launch;
 pub mod matrix;
 pub mod notify;
 pub mod pending;
+pub mod skin;
 pub mod theme;
