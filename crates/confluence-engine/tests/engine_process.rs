@@ -6,7 +6,7 @@ use std::process::{Child, Command as Process};
 use std::time::Duration;
 
 use confluence_api::{Command, PointState, Response};
-use confluence_engine::ipc::PipeClient;
+use confluence_client::Client;
 
 /// A running engine process, killed if the test ends (or fails) without
 /// shutting it down, so no orphaned engine outlives the test run.
@@ -60,7 +60,7 @@ fn run_expecting_exit(pipe: &str, journal: &std::path::Path) -> Option<(std::pro
     }
 }
 
-fn shutdown(mut engine: Engine, client: &mut PipeClient) {
+fn shutdown(mut engine: Engine, client: &mut Client) {
     assert_eq!(client.call(Command::Shutdown).unwrap(), Response::Ok);
     let status = engine.0.take().unwrap().wait().unwrap();
     assert!(status.success(), "{status:?}");
@@ -73,16 +73,16 @@ fn control_journal_and_restart() {
     let pipe = format!("confluence-proc-test-{}", std::process::id());
 
     let child = spawn(&pipe, &journal);
-    let mut c = PipeClient::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     let set = Command::SetPoint { input: 2, output: 3, gain_db: -12.0, mute: false, invert: true };
-    assert_eq!(c.call(set).unwrap(), Response::Ok);
+    assert!(matches!(c.call(set).unwrap(), Response::Applied { .. }));
     std::thread::sleep(Duration::from_millis(300));
     let Response::Health { blocks, .. } = c.call(Command::Health).unwrap() else { panic!() };
     assert!(blocks > 20, "internal clock is running: {blocks} blocks");
     shutdown(child, &mut c);
 
     let child = spawn(&pipe, &journal);
-    let mut c = PipeClient::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     let points = c.call(Command::ListPoints).unwrap();
     assert_eq!(
         points,
@@ -98,15 +98,15 @@ fn killed_engine_keeps_acknowledged_changes() {
     let pipe = format!("confluence-kill-test-{}", std::process::id());
 
     let mut child = spawn(&pipe, &journal);
-    let mut c = PipeClient::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     for i in 0..5 {
         let set = Command::SetPoint { input: i, output: i, gain_db: -1.0, mute: false, invert: false };
-        assert_eq!(c.call(set).unwrap(), Response::Ok);
+        assert!(matches!(c.call(set).unwrap(), Response::Applied { .. }));
     }
     child.kill(); // no clean shutdown
 
     let child = spawn(&pipe, &journal);
-    let mut c = PipeClient::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     let Response::Points(points) = c.call(Command::ListPoints).unwrap() else { panic!() };
     assert_eq!(points.len(), 5, "every acknowledged change survived");
     shutdown(child, &mut c);
@@ -118,9 +118,9 @@ fn second_instance_on_the_same_pipe_exits_with_an_error() {
     let journal = dir.path().join("journal.bin");
     let pipe = format!("confluence-dup-test-{}", std::process::id());
     let mut first = spawn(&pipe, &journal);
-    let mut c = PipeClient::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     let set = |i: u32| Command::SetPoint { input: i, output: i, gain_db: 0.0, mute: false, invert: false };
-    assert_eq!(c.call(set(1)).unwrap(), Response::Ok);
+    assert!(matches!(c.call(set(1)).unwrap(), Response::Applied { .. }));
 
     // Same pipe and same journal, as with two default-configured engines.
     let (status, stderr) = run_expecting_exit(&pipe, &journal).expect("second instance must not keep running");
@@ -128,10 +128,10 @@ fn second_instance_on_the_same_pipe_exits_with_an_error() {
     assert!(stderr.contains("already running"), "clear message, got: {stderr}");
 
     // The first engine is unaffected and its journal still records changes.
-    assert_eq!(c.call(set(2)).unwrap(), Response::Ok);
+    assert!(matches!(c.call(set(2)).unwrap(), Response::Applied { .. }));
     first.kill();
     let restarted = spawn(&pipe, &journal);
-    let mut c = PipeClient::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     let Response::Points(points) = c.call(Command::ListPoints).unwrap() else { panic!() };
     assert_eq!(points.len(), 2, "both acknowledged changes survived: {points:?}");
     shutdown(restarted, &mut c);
@@ -144,7 +144,7 @@ fn second_engine_on_another_pipe_cannot_share_the_journal() {
     let pipe_a = format!("confluence-share-a-{}", std::process::id());
     let pipe_b = format!("confluence-share-b-{}", std::process::id());
     let first = spawn(&pipe_a, &journal);
-    let mut c = PipeClient::connect(&pipe_a, Duration::from_secs(10)).unwrap();
+    let mut c = Client::connect(&pipe_a, Duration::from_secs(10)).unwrap();
 
     let outcome = run_expecting_exit(&pipe_b, &journal);
     let (status, stderr) = outcome.expect("a second engine must not run on a journal that is in use");
@@ -164,19 +164,19 @@ fn a_removed_slots_routes_stay_removed_after_a_restart() {
     let pipe = format!("confluence-removed-routes-{}", std::process::id());
 
     let child = spawn(&pipe, &journal);
-    let mut c = PipeClient::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     let on_device = Command::SetPoint { input: 1, output: 7, gain_db: 0.0, mute: false, invert: false };
     let elsewhere = Command::SetPoint { input: 10, output: 11, gain_db: 0.0, mute: false, invert: false };
-    assert_eq!(c.call(on_device).unwrap(), Response::Ok);
-    assert_eq!(c.call(elsewhere).unwrap(), Response::Ok);
+    assert!(matches!(c.call(on_device).unwrap(), Response::Applied { .. }));
+    assert!(matches!(c.call(elsewhere).unwrap(), Response::Applied { .. }));
     let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
     let offline = slots.iter().find(|s| !s.online).expect("the missing device holds its channels");
-    assert_eq!(c.call(Command::RemoveSlot { id: offline.id }).unwrap(), Response::Ok);
+    assert!(matches!(c.call(Command::RemoveSlot { id: offline.id }).unwrap(), Response::Applied { .. }));
     shutdown(child, &mut c);
 
     // Whatever device takes inputs 0..2 next must not inherit the old route.
     let child = spawn(&pipe, &journal);
-    let mut c = PipeClient::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     let Response::Points(points) = c.call(Command::ListPoints).unwrap() else { panic!() };
     let routes: Vec<(u32, u32)> = points.iter().map(|p| (p.input, p.output)).collect();
     assert_eq!(routes, vec![(10, 11)]);

@@ -23,14 +23,16 @@ mod app {
     use std::error::Error;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Arc, Mutex, MutexGuard, Weak};
     use std::time::{Duration, Instant};
 
-    use confluence_api::{Command, Response};
+    use confluence_api::{Command, DeviceInfo, EngineStatus, Event, Response, SlotHealth};
     use confluence_engine::clock::InternalClock;
     use confluence_engine::devices::{start_asio_master, DeviceManager};
-    use confluence_engine::ipc::{default_pipe_name, pipe_path, Handler, PipeServer};
+    use confluence_engine::ipc::{default_pipe_name, pipe_path, PipeServer, Service};
     use confluence_engine::journal::Journal;
+    use confluence_engine::publish::{published_state, Publisher};
     use confluence_engine::rt::disable_power_throttling;
     use confluence_engine::{Engine, EngineConfig};
     use confluence_provider_asio::AsioDevice;
@@ -62,6 +64,146 @@ mod app {
         engine: Engine,
         journal: Journal,
         devices: DeviceManager,
+        publisher: Publisher,
+        /// The device list, refreshed without the lock (enumeration is slow).
+        device_list: Arc<Mutex<Vec<DeviceInfo>>>,
+        /// The master clock's binding, for status.
+        master: String,
+    }
+
+    /// How often state is diffed and telemetry sent, in control-loop ticks of 10 ms.
+    const PUBLISH_TICKS: u64 = 10;
+    /// How often the device list is refreshed.
+    const DEVICE_SCAN: Duration = Duration::from_secs(2);
+
+    /// Slot health, with each device's own health added.
+    fn health(s: &mut State) -> Vec<SlotHealth> {
+        let mut resp = s.engine.handle(&Command::Health);
+        s.devices.annotate(&mut resp);
+        match resp {
+            Response::Health { slots, .. } => slots,
+            _ => Vec::new(),
+        }
+    }
+
+    fn status(s: &State, health: &[SlotHealth]) -> EngineStatus {
+        let cfg = s.engine.config();
+        EngineStatus {
+            master: s.master.clone(),
+            sample_rate: cfg.sample_rate,
+            block: cfg.block as u32,
+            blocks: s.engine.blocks(),
+            dsp_load: s.engine.dsp_load(),
+            xruns: health.iter().map(|h| h.underruns + h.overruns).sum(),
+        }
+    }
+
+    /// Diffs the current state against the last published one; returns the version.
+    fn publish(s: &mut State) -> u64 {
+        let health = health(s);
+        let status = status(s, &health);
+        let list = s.device_list.lock().map(|l| l.clone()).unwrap_or_default();
+        let now = published_state(&mut s.engine, &s.devices, &list, status);
+        s.publisher.publish(now)
+    }
+
+    /// The Control API: commands, and subscriptions to the published state.
+    /// Connections can stay open indefinitely (a GUI keeps one), so it holds the
+    /// state weakly: only a command in progress keeps it alive at shutdown.
+    struct Control {
+        state: Weak<Mutex<State>>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl Service for Control {
+        fn handle(&self, cmd: &Command) -> Response {
+            if *cmd == Command::Shutdown {
+                self.shutdown.store(true, Ordering::SeqCst);
+                return Response::Ok;
+            }
+            let Some(state) = self.state.upgrade() else {
+                return Response::Error("the engine is shutting down".into());
+            };
+            let state = &state;
+            // Device enumeration and driver initialisation can be slow (a bad
+            // driver can take seconds): do them without the lock, so the
+            // engine keeps ticking and other clients keep being answered.
+            match cmd {
+                Command::ListDevices => {
+                    return match DeviceManager::list_devices() {
+                        Ok(d) => {
+                            if let Ok(mut l) = lock(state).device_list.lock() {
+                                l.clone_from(&d);
+                            }
+                            Response::Devices(d)
+                        }
+                        Err(e) => Response::Error(e),
+                    };
+                }
+                Command::Status => {
+                    let mut s = lock(state);
+                    let h = health(&mut s);
+                    return Response::Status(status(&s, &h));
+                }
+                Command::AddDevice { kind, name } => {
+                    let pending = match lock(state).devices.begin_add(*kind, name) {
+                        Ok(p) => p,
+                        Err(e) => return Response::Error(e),
+                    };
+                    let loaded = pending.load();
+                    let attached = {
+                        let mut s = lock(state);
+                        let State { engine, devices, .. } = &mut *s;
+                        match devices.attach_add(engine, loaded) {
+                            Ok(a) => a,
+                            Err(e) => return Response::Error(e),
+                        }
+                    };
+                    // Starting an ASIO driver can be slow too: not under the lock.
+                    let started = attached.start();
+                    let mut s = lock(state);
+                    let State { engine, devices, .. } = &mut *s;
+                    let added = devices.commit_add(engine, started);
+                    return match added {
+                        Ok(ids) => {
+                            let version = publish(&mut s);
+                            Response::Added { ids, version }
+                        }
+                        Err(e) => Response::Error(e),
+                    };
+                }
+                _ => {}
+            }
+            let mut s = lock(state);
+            let State { engine, devices, journal, .. } = &mut *s;
+            let mut resp = match devices.handle(engine, cmd) {
+                Some(resp) => resp,
+                None => engine.handle(cmd),
+            };
+            devices.annotate(&mut resp);
+            if resp == Response::Ok {
+                // Removing a slot also removes its routes: rewrite the journal
+                // so they do not come back, on other devices, after a restart.
+                let saved = match cmd {
+                    Command::RemoveSlot { .. } => journal.compact(&state_commands(engine)),
+                    _ if cmd.is_mutation() => journal.append(cmd),
+                    _ => Ok(()),
+                };
+                if let Err(e) = saved {
+                    publish(&mut s);
+                    return Response::Error(format!("applied but not saved: {e}"));
+                }
+                if cmd.is_mutation() || matches!(cmd, Command::RemoveSlot { .. }) {
+                    // Published before the reply, so its version includes this change.
+                    return Response::Applied { version: publish(&mut s) };
+                }
+            }
+            resp
+        }
+
+        fn subscribe(&self) -> Option<(confluence_api::State, Receiver<Event>)> {
+            self.state.upgrade().map(|state| lock(&state).publisher.subscribe())
+        }
     }
 
     /// Whatever drives the engine; dropping it stops the audio.
@@ -150,80 +292,64 @@ mod app {
         for w in warnings {
             eprintln!("confluence-engine: warning: {w}");
         }
-        let state = Arc::new(Mutex::new(State { engine, journal, devices }));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handler: Handler = {
-            let (state, shutdown) = (state.clone(), shutdown.clone());
-            Arc::new(move |cmd: &Command| {
-                if *cmd == Command::Shutdown {
-                    shutdown.store(true, Ordering::SeqCst);
-                    return Response::Ok;
-                }
-                // Device enumeration and driver initialisation can be slow (a bad
-                // driver can take seconds): do them without the lock, so the
-                // engine keeps ticking and other clients keep being answered.
-                match cmd {
-                    Command::ListDevices => {
-                        return match DeviceManager::list_devices() {
-                            Ok(d) => Response::Devices(d),
-                            Err(e) => Response::Error(e),
-                        };
-                    }
-                    Command::AddDevice { kind, name } => {
-                        let pending = match lock(&state).devices.begin_add(*kind, name) {
-                            Ok(p) => p,
-                            Err(e) => return Response::Error(e),
-                        };
-                        let loaded = pending.load();
-                        let attached = {
-                            let mut s = lock(&state);
-                            let State { engine, devices, .. } = &mut *s;
-                            match devices.attach_add(engine, loaded) {
-                                Ok(a) => a,
-                                Err(e) => return Response::Error(e),
-                            }
-                        };
-                        // Starting an ASIO driver can be slow too: not under the lock.
-                        let started = attached.start();
-                        let mut s = lock(&state);
-                        let State { engine, devices, .. } = &mut *s;
-                        return match devices.commit_add(engine, started) {
-                            Ok(ids) => Response::SlotsAdded(ids),
-                            Err(e) => Response::Error(e),
-                        };
-                    }
-                    _ => {}
-                }
-                let mut s = lock(&state);
-                let State { engine, devices, journal } = &mut *s;
-                let mut resp = match devices.handle(engine, cmd) {
-                    Some(resp) => resp,
-                    None => engine.handle(cmd),
-                };
-                devices.annotate(&mut resp);
-                if resp == Response::Ok {
-                    // Removing a slot also removes its routes: rewrite the journal
-                    // so they do not come back, on other devices, after a restart.
-                    let saved = match cmd {
-                        Command::RemoveSlot { .. } => journal.compact(&state_commands(engine)),
-                        _ if cmd.is_mutation() => journal.append(cmd),
-                        _ => Ok(()),
-                    };
-                    if let Err(e) = saved {
-                        return Response::Error(format!("applied but not saved: {e}"));
-                    }
-                }
-                resp
-            })
+        // The device list starts empty and is filled by the scan thread below,
+        // so a slow enumeration never delays the engine's start.
+        let device_list = Arc::new(Mutex::new(Vec::new()));
+        let first = EngineStatus {
+            master: args.master.clone(),
+            sample_rate: rate,
+            block: block as u32,
+            blocks: 0,
+            dsp_load: 0.0,
+            xruns: 0,
         };
+        let publisher = Publisher::new(published_state(&mut engine, &devices, &[], first));
+        let state = Arc::new(Mutex::new(State {
+            engine,
+            journal,
+            devices,
+            publisher,
+            device_list: device_list.clone(),
+            master: args.master.clone(),
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        {
+            let stop = shutdown.clone();
+            std::thread::Builder::new().name("confluence-device-scan".into()).spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if let Ok(d) = DeviceManager::list_devices() {
+                        if let Ok(mut l) = device_list.lock() {
+                            *l = d;
+                        }
+                    }
+                    let next = Instant::now() + DEVICE_SCAN;
+                    while !stop.load(Ordering::SeqCst) && Instant::now() < next {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            })?;
+        }
+        let handler = Arc::new(Control { state: Arc::downgrade(&state), shutdown: shutdown.clone() });
         let server = listener.serve(handler)?;
         eprintln!("confluence-engine: listening on {}", pipe_path(&pipe));
 
+        let mut ticks = 0u64;
         while !shutdown.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(10));
-            lock(&state).engine.tick();
+            let mut s = lock(&state);
+            s.engine.tick();
+            ticks += 1;
+            if ticks.is_multiple_of(PUBLISH_TICKS) {
+                // Catches changes no command made: devices lost or back, a DAW attaching.
+                publish(&mut s);
+                let h = health(&mut s);
+                let st = status(&s, &h);
+                s.publisher.telemetry(st, h);
+            }
         }
         server.stop();
+        // Ends every subscription, so their connection threads let go of the state.
+        lock(&state).publisher.close();
         // Soft devices first (their bridges feed the engine), then the master.
         // A command may still be loading or starting a device without the
         // lock: give it a moment to finish. The master is stopped either way.

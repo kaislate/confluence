@@ -11,6 +11,8 @@ pub mod engine;
 #[cfg(windows)]
 pub mod ipc;
 pub mod journal;
+#[cfg(windows)]
+pub mod publish;
 pub mod sim;
 
 #[cfg(windows)]

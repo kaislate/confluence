@@ -35,6 +35,13 @@ Add devices as soft slots. Each one gets its own channels and a drift-corrected 
 
 A saved device that is missing at startup keeps its channels as an OFFLINE slot, so routes to it survive.
 
+### Watching the engine
+
+    cargo run -p confluence-cli -- watch     # every change to routes, slots and devices, plus a status line each second
+    cargo run -p confluence-cli -- status    # master clock, rate, block, DSP load, xruns
+
+Front ends subscribe to the engine: they get a snapshot, then versioned change events and 10 Hz telemetry. `confluence-client`'s `StateStore` keeps a live local copy and reconnects by itself.
+
 ## VASIO (virtual ASIO for DAWs)
 
 `confluence_vasio.dll` gives DAWs eight ASIO drivers, "Confluence VASIO 1" to "8". Register it once from an **administrator** terminal (`regsvr32 /u` removes it):

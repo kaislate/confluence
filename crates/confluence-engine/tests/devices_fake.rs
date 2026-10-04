@@ -11,6 +11,7 @@ use std::time::Duration;
 use confluence_api::{Command, DeviceKind, Response};
 use confluence_engine::clock::InternalClock;
 use confluence_engine::devices::{start_asio_master, AsioOpener, DeviceManager};
+use confluence_engine::publish::published_state;
 use confluence_engine::{Engine, EngineConfig, MasterChannels};
 use confluence_provider_asio::fake::{FakeConfig, FakeProbe};
 use confluence_provider_asio::{AsioDevice, AsioHostError, DriverSource, MAX_DRIVERS};
@@ -646,4 +647,67 @@ fn an_offline_device_that_fails_to_start_keeps_its_channels_and_routes() {
     broken.store(false, Ordering::Release);
     devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap();
     assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)]);
+}
+
+fn status() -> confluence_api::EngineStatus {
+    confluence_api::EngineStatus {
+        master: "internal".into(),
+        sample_rate: 48_000.0,
+        block: 256,
+        blocks: 0,
+        dsp_load: 0.0,
+        xruns: 0,
+    }
+}
+
+#[test]
+fn the_published_state_shows_slots_points_and_notices() {
+    let _budget = driver_budget();
+    let probe = Arc::new(FakeProbe::default());
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_asio_opener(opener(vec![("fake:pub", probe)]));
+    let ids = devices.add(&mut engine, DeviceKind::Asio, "fake:pub").unwrap();
+    route(&mut engine, 0, 0);
+    let s = published_state(&mut engine, &devices, &[], status());
+    assert_eq!(s.slots.iter().map(|s| s.id).collect::<Vec<_>>(), ids);
+    assert_eq!(s.points.len(), 1);
+    assert!(s.notices.is_empty());
+}
+
+#[test]
+/// The device coming back replaces its offline slot with online ones: a
+/// subscriber sees the offline slot removed and the online slots added.
+fn an_offline_slot_coming_back_shows_in_the_published_diff() {
+    let _budget = driver_budget();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("devices.json");
+    let a = Arc::new(FakeProbe::default());
+    let plugged = Arc::new(AtomicBool::new(true));
+    let open = || -> AsioOpener {
+        let (a, plugged) = (a.clone(), plugged.clone());
+        Box::new(move |name: &str| {
+            if !plugged.load(Ordering::Acquire) {
+                return Err(AsioHostError::NotInstalled(name.into()));
+            }
+            opener(vec![("fake:back", a.clone())])(name)
+        })
+    };
+    {
+        let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let mut devices = DeviceManager::open_file(path.clone()).0.with_asio_opener(open());
+        devices.add(&mut engine, DeviceKind::Asio, "fake:back").unwrap();
+    }
+    plugged.store(false, Ordering::Release);
+    let (mut engine, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::open_file(path).0.with_asio_opener(open());
+    assert_eq!(devices.restore(&mut engine).len(), 1, "starts offline");
+    let before = published_state(&mut engine, &devices, &[], status());
+    plugged.store(true, Ordering::Release);
+    devices.add(&mut engine, DeviceKind::Asio, "fake:back").unwrap();
+    let after = published_state(&mut engine, &devices, &[], status());
+    let offline = before.slots.iter().find(|s| !s.online).unwrap().id;
+    let changes = confluence_api::diff(&before, &after);
+    assert!(changes.contains(&confluence_api::Change::SlotRemoved { id: offline }), "{changes:?}");
+    let added = changes.iter().filter(|c| matches!(c, confluence_api::Change::SlotAdded(s) if s.online)).count();
+    assert_eq!(added, 2, "{changes:?}");
 }

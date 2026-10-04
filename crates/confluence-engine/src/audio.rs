@@ -4,7 +4,7 @@
 //! removed through a mailbox; removed slot state goes back to the control side
 //! to be dropped there.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use confluence_core::bridge::{InputEngineSide, OutputEngineSide};
@@ -79,6 +79,33 @@ pub struct AudioEngine {
     /// Drift of a hardware master against the engine time base; `None` on the internal clock.
     pub(crate) master_est: Option<RateEstimator>,
     pub(crate) master_ppm: Arc<AtomicU64>,
+    pub(crate) load: LoadMeter,
+}
+
+/// Smoothing time constant of the DSP load, in seconds.
+const LOAD_TIME_CONSTANT_S: f64 = 1.0;
+
+/// Smoothed fraction of the block period the audio thread spends processing.
+/// Written on the audio thread (atomics only), read by the control side.
+pub(crate) struct LoadMeter {
+    smoothed: f64,
+    shared: Arc<AtomicU32>,
+}
+
+impl LoadMeter {
+    pub(crate) fn new(shared: Arc<AtomicU32>) -> Self {
+        LoadMeter { smoothed: 0.0, shared }
+    }
+
+    pub(crate) fn record(&mut self, busy_s: f64, period_s: f64) {
+        if period_s <= 0.0 {
+            return;
+        }
+        let x = (busy_s / period_s).clamp(0.0, 1.0);
+        let alpha = (period_s / LOAD_TIME_CONSTANT_S).min(1.0);
+        self.smoothed += alpha * (x - self.smoothed);
+        self.shared.store((self.smoothed as f32).to_bits(), Ordering::Relaxed);
+    }
 }
 
 impl AudioEngine {
@@ -114,6 +141,7 @@ impl AudioEngine {
     }
 
     fn run(&mut self, now: f64, master_ppm: f64) {
+        let start = std::time::Instant::now();
         self.apply_messages();
         for e in self.strict.iter_mut() {
             e.side.receive(&mut self.inputs);
@@ -129,6 +157,8 @@ impl AudioEngine {
             e.side.send(&self.outputs);
         }
         self.blocks.fetch_add(1, Ordering::Relaxed);
+        let period = self.outputs.frames() as f64 / self.sample_rate;
+        self.load.record(start.elapsed().as_secs_f64(), period);
     }
 
     /// Master block size in frames.
@@ -192,5 +222,25 @@ impl AudioEngine {
             // flight, so this cannot happen; leaking beats freeing here.
             std::mem::forget(r);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dsp_load_is_the_smoothed_busy_fraction() {
+        let shared = Arc::new(AtomicU32::new(0));
+        let mut m = LoadMeter::new(shared.clone());
+        let period = 256.0 / 48_000.0;
+        for _ in 0..2000 {
+            m.record(period * 0.25, period); // a quarter of every block
+        }
+        let v = f32::from_bits(shared.load(Ordering::Relaxed));
+        assert!((v - 0.25).abs() < 0.01, "{v}");
+        m.record(period * 10.0, period); // one overlong block: a bump, clamped
+        let v = f32::from_bits(shared.load(Ordering::Relaxed));
+        assert!(v > 0.25 && v <= 1.0, "{v}");
     }
 }

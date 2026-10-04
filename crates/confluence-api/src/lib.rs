@@ -5,8 +5,11 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+mod state;
+pub use state::diff;
+
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 1;
+pub const API_VERSION: u16 = 2;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -43,6 +46,13 @@ pub enum Command {
     RemoveSlot {
         id: u32,
     },
+    // New commands go at the end: postcard encodes the variant index, and the
+    // journal still replays records written by older versions.
+    /// Turns this connection into an event stream: the reply is
+    /// `Response::Snapshot`, then only `Response::Event` frames follow.
+    Subscribe,
+    /// Engine status (rate, block, load, xruns, master).
+    Status,
 }
 
 impl Command {
@@ -178,6 +188,76 @@ pub enum Response {
     Error(String),
     Devices(Vec<DeviceInfo>),
     SlotsAdded(Vec<u32>),
+    /// The full state, first reply on a subscription.
+    Snapshot(State),
+    /// One event on a subscription (envelope id 0).
+    Event(Event),
+    Status(EngineStatus),
+    /// A mutation succeeded; `version` is the state version after it.
+    Applied {
+        version: u64,
+    },
+    /// `AddDevice` succeeded over the pipe: the new slots, and the version after it.
+    Added {
+        ids: Vec<u32>,
+        version: u64,
+    },
+}
+
+/// Live engine numbers: in snapshots and in every telemetry event.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EngineStatus {
+    /// The master clock's binding, e.g. `asio:GoXLR ASIO Driver`, or `internal`.
+    pub master: String,
+    pub sample_rate: f64,
+    pub block: u32,
+    /// Engine blocks run.
+    pub blocks: u64,
+    /// Smoothed fraction (0..=1) of the block period spent processing.
+    pub dsp_load: f32,
+    /// Sum of all slots' under- and overruns.
+    pub xruns: u64,
+}
+
+/// Everything a subscriber needs to rebuild the engine's state.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct State {
+    pub version: u64,
+    pub status: EngineStatus,
+    /// Sorted by id.
+    pub slots: Vec<SlotState>,
+    /// Sorted by (input, output).
+    pub points: Vec<PointState>,
+    /// Devices that can be added.
+    pub devices: Vec<DeviceInfo>,
+    pub notices: Vec<String>,
+}
+
+/// One difference between two published states.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Change {
+    /// Added or modified.
+    PointSet(PointState),
+    PointRemoved {
+        input: u32,
+        output: u32,
+    },
+    SlotAdded(SlotState),
+    /// Same id, some field changed (e.g. `online`).
+    SlotChanged(SlotState),
+    SlotRemoved {
+        id: u32,
+    },
+    DevicesChanged(Vec<DeviceInfo>),
+    NoticesChanged(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Event {
+    /// Versioned: `version` is the previous version + 1.
+    Changed { version: u64, changes: Vec<Change> },
+    /// Unversioned, about 10 Hz.
+    Telemetry { status: EngineStatus, health: Vec<SlotHealth> },
 }
 
 /// Every message on the wire carries the protocol version and a request id.
@@ -240,6 +320,19 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<Op
 pub fn read_envelope<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<Option<Envelope<T>>, FrameError> {
     match read_frame::<R, Envelope<T>>(r)? {
         Some(env) if env.version != API_VERSION => Err(FrameError::Version(env.version)),
+        other => Ok(other),
+    }
+}
+
+/// As [`read_envelope`], but accepts any protocol version from `oldest` up to
+/// [`API_VERSION`]. The journal uses it, so files written by an older engine
+/// still replay (commands are only ever appended, never reordered).
+pub fn read_envelope_since<R: Read, T: for<'de> Deserialize<'de>>(
+    r: &mut R,
+    oldest: u16,
+) -> Result<Option<Envelope<T>>, FrameError> {
+    match read_frame::<R, Envelope<T>>(r)? {
+        Some(env) if env.version < oldest || env.version > API_VERSION => Err(FrameError::Version(env.version)),
         other => Ok(other),
     }
 }

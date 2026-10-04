@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use confluence_api::{Command, DeviceKind, Response};
+use confluence_api::{Change, Command, DeviceKind, EngineStatus, Event, Response};
 
 #[derive(Parser)]
 #[command(version, about = "Control a running Confluence engine")]
@@ -45,6 +45,10 @@ enum Cmd {
     AddDevice { kind: Kind, name: String },
     /// Close a slot and remove the routes on its channels.
     RemoveSlot { id: u32 },
+    /// Show the engine's master clock, rate, block, DSP load and xruns.
+    Status,
+    /// Follow every change to routes, slots and devices live, with a status line each second.
+    Watch,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -84,6 +88,8 @@ impl Cmd {
             Cmd::Devices => Command::ListDevices,
             Cmd::AddDevice { kind, ref name } => Command::AddDevice { kind: kind.into(), name: name.clone() },
             Cmd::RemoveSlot { id } => Command::RemoveSlot { id },
+            Cmd::Status => Command::Status,
+            Cmd::Watch => Command::Subscribe,
         }
     }
 }
@@ -147,6 +153,16 @@ fn render(resp: &Response) -> String {
         Response::SlotsAdded(ids) => {
             format!("added slot(s) {}", ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", "))
         }
+        Response::Added { ids, version } => format!(
+            "added slot(s) {} (version {version})",
+            ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ")
+        ),
+        Response::Applied { version } => format!("ok (version {version})"),
+        Response::Snapshot(s) => {
+            format!("state version {} ({} slots, {} points)", s.version, s.slots.len(), s.points.len())
+        }
+        Response::Event(e) => format!("{e:?}"),
+        Response::Status(s) => render_status(s),
     }
 }
 
@@ -154,11 +170,14 @@ fn render(resp: &Response) -> String {
 fn main() -> ExitCode {
     use std::time::Duration;
 
-    use confluence_engine::ipc::{default_pipe_name, PipeClient};
+    use confluence_client::{default_pipe_name, Client};
 
     let cli = Cli::parse();
     let pipe = cli.pipe.clone().unwrap_or_else(default_pipe_name);
-    let mut client = match PipeClient::connect(&pipe, Duration::from_secs(2)) {
+    if matches!(cli.command, Cmd::Watch) {
+        return watch(&pipe);
+    }
+    let mut client = match Client::connect(&pipe, Duration::from_secs(2)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("cannot reach engine on pipe '{pipe}': {e}");
@@ -181,6 +200,86 @@ fn main() -> ExitCode {
     }
 }
 
+fn render_status(s: &EngineStatus) -> String {
+    format!(
+        "master {}  {:.0} Hz  block {}  dsp {:.1}%  xruns {}  blocks {}",
+        s.master,
+        s.sample_rate,
+        s.block,
+        s.dsp_load * 100.0,
+        s.xruns,
+        s.blocks
+    )
+}
+
+fn render_change(c: &Change) -> String {
+    match c {
+        Change::PointSet(p) => format!(
+            "route {} -> {} {:+.1} dB{}{}",
+            p.input,
+            p.output,
+            p.gain_db,
+            if p.mute { " muted" } else { "" },
+            if p.invert { " inverted" } else { "" }
+        ),
+        Change::PointRemoved { input, output } => format!("route {input} -> {output} removed"),
+        Change::SlotAdded(s) => format!("slot #{} {} added", s.id, s.name),
+        Change::SlotChanged(s) => format!("slot #{} {} {}", s.id, s.name, if s.online { "online" } else { "offline" }),
+        Change::SlotRemoved { id } => format!("slot #{id} removed"),
+        Change::DevicesChanged(d) => format!("{} devices available", d.len()),
+        Change::NoticesChanged(n) if n.is_empty() => "notices: none".into(),
+        Change::NoticesChanged(n) => format!("notices: {}", n.join("; ")),
+    }
+}
+
+/// One line per change; telemetry is shown separately (once a second).
+fn render_event(e: &Event) -> Option<String> {
+    match e {
+        Event::Changed { version, changes } => {
+            Some(changes.iter().map(|c| format!("v{version}  {}", render_change(c))).collect::<Vec<_>>().join("\n"))
+        }
+        Event::Telemetry { .. } => None,
+    }
+}
+
+/// Subscribes and prints changes as they come, plus a status line each second.
+#[cfg(windows)]
+fn watch(pipe: &str) -> ExitCode {
+    use std::time::{Duration, Instant};
+
+    use confluence_client::Subscription;
+
+    let (state, mut sub) = match Subscription::connect(pipe, Duration::from_secs(2)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot subscribe to engine on pipe '{pipe}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("state version {}: {} slots, {} routes", state.version, state.slots.len(), state.points.len());
+    println!("{}", render_status(&state.status));
+    let mut last_status = Instant::now();
+    loop {
+        match sub.recv() {
+            Ok(Event::Telemetry { status, .. }) => {
+                if last_status.elapsed() >= Duration::from_secs(1) {
+                    println!("{}", render_status(&status));
+                    last_status = Instant::now();
+                }
+            }
+            Ok(e) => {
+                if let Some(text) = render_event(&e) {
+                    println!("{text}");
+                }
+            }
+            Err(e) => {
+                eprintln!("engine stream ended: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+}
+
 #[cfg(not(windows))]
 fn main() -> ExitCode {
     eprintln!("confluence-cli runs on Windows only");
@@ -190,7 +289,43 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use confluence_api::{PointState, SlotHealth};
+    use confluence_api::{Change, EngineStatus, Event, PointState, SlotHealth};
+
+    #[test]
+    fn status_and_events_render_readably() {
+        let s = EngineStatus {
+            master: "asio:GoXLR ASIO Driver".into(),
+            sample_rate: 48_000.0,
+            block: 512,
+            blocks: 1234,
+            dsp_load: 0.125,
+            xruns: 2,
+        };
+        let line = render_status(&s);
+        assert!(line.contains("asio:GoXLR ASIO Driver") && line.contains("48000") && line.contains("512"), "{line}");
+        assert!(line.contains("12.5%") && line.contains("xruns 2"), "{line}");
+        assert_eq!(render(&Response::Status(s.clone())), line);
+        let e = Event::Changed {
+            version: 7,
+            changes: vec![Change::PointRemoved { input: 1, output: 2 }, Change::SlotRemoved { id: 3 }],
+        };
+        let text = render_event(&e).unwrap();
+        assert_eq!(
+            text,
+            "v7  route 1 -> 2 removed
+v7  slot #3 removed"
+        );
+        assert!(render_event(&Event::Telemetry { status: s, health: Vec::new() }).is_none());
+        let cli = Cli::try_parse_from(["confluence-cli", "watch"]).unwrap();
+        assert!(matches!(cli.command, Cmd::Watch));
+        let cli = Cli::try_parse_from(["confluence-cli", "status"]).unwrap();
+        assert_eq!(cli.command.to_command(), Command::Status);
+    }
+
+    #[test]
+    fn mutations_print_their_version() {
+        assert_eq!(render(&Response::Applied { version: 12 }), "ok (version 12)");
+    }
 
     #[test]
     fn negative_gain_parses() {
