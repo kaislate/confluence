@@ -180,3 +180,16 @@ fn a_parameter_change_does_not_wait_for_a_busy_plugin_thread() {
     }
     loading.join().unwrap().unwrap();
 }
+
+/// The thread runs a window message loop now: requests must still be
+/// answered at once, not at its poll interval.
+#[test]
+fn requests_are_answered_promptly() {
+    let t = PluginThread::start().unwrap();
+    let (mut link, _p) = load(&t, 2);
+    let started = Instant::now();
+    for _ in 0..100 {
+        link.save_state().unwrap();
+    }
+    assert!(started.elapsed() < Duration::from_millis(1000), "100 round trips took {:?}", started.elapsed());
+}

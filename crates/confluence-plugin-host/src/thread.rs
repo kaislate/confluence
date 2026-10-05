@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +20,7 @@ use confluence_core::processor::Processor;
 
 use crate::host::{host_info, Host, Main, Shared};
 use crate::processor::ClapProcessor;
+use crate::wake::Wake;
 
 /// How long a caller waits for the plugin thread.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -91,14 +92,24 @@ enum Msg {
 #[derive(Clone)]
 pub struct PluginThread {
     tx: mpsc::Sender<Msg>,
+    wake: Arc<Wake>,
 }
 
 impl PluginThread {
     /// Starts the plugin thread.
     pub fn start() -> std::io::Result<PluginThread> {
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new().name("confluence-plugins".into()).spawn(move || run(rx))?;
-        Ok(PluginThread { tx })
+        let wake = Arc::new(Wake::new()?);
+        let w = wake.clone();
+        std::thread::Builder::new().name("confluence-plugins".into()).spawn(move || run(rx, w))?;
+        Ok(PluginThread { tx, wake })
+    }
+
+    /// Queues a request and wakes the thread.
+    fn send(&self, msg: Msg) -> Result<(), mpsc::SendError<Msg>> {
+        let r = self.tx.send(msg);
+        self.wake.set();
+        r
     }
 
     /// Loads plugin `id` from `src`, activated at `rate` with blocks of up to
@@ -135,7 +146,7 @@ impl PluginThread {
         if let Ok(p) = any.downcast::<ClapProcessor>() {
             let plugin = p.plugin;
             if let Err(mpsc::SendError(Msg::Reclaim { processor, .. })) =
-                self.tx.send(Msg::Reclaim { plugin, processor: p })
+                self.send(Msg::Reclaim { plugin, processor: p })
             {
                 // The plugin thread is gone; nothing can deactivate it now.
                 std::mem::forget(processor);
@@ -145,7 +156,7 @@ impl PluginThread {
 
     fn call<T>(&self, timeout: Duration, make: impl FnOnce(mpsc::Sender<T>) -> Msg) -> Result<T, String> {
         let (reply, rx) = mpsc::channel();
-        self.tx.send(make(reply)).map_err(|_| "the plugin thread has stopped".to_string())?;
+        self.send(make(reply)).map_err(|_| "the plugin thread has stopped".to_string())?;
         rx.recv_timeout(timeout).map_err(|_| "the plugin did not respond".to_string())
     }
 }
@@ -278,7 +289,7 @@ impl PluginLink {
         let value = p.value;
         p.text = format!("{value:.2}");
         let (reply, rx) = mpsc::channel();
-        if self.thread.tx.send(Msg::Text { plugin: self.plugin, id, value, reply }).is_ok() {
+        if self.thread.send(Msg::Text { plugin: self.plugin, id, value, reply }).is_ok() {
             self.texts.retain(|(q, _)| *q != id);
             self.texts.push((id, rx));
         }
@@ -287,7 +298,7 @@ impl PluginLink {
 
 impl Drop for PluginLink {
     fn drop(&mut self) {
-        let _ = self.thread.tx.send(Msg::Forget { plugin: self.plugin });
+        let _ = self.thread.send(Msg::Forget { plugin: self.plugin });
     }
 }
 
@@ -301,23 +312,30 @@ struct Slot {
     processing: bool,
 }
 
-fn run(rx: mpsc::Receiver<Msg>) {
+fn run(rx: mpsc::Receiver<Msg>, wake: Arc<Wake>) {
+    #[cfg(windows)]
+    windows_setup();
     let mut plugins: HashMap<u64, Slot> = HashMap::new();
     let mut next = 1u64;
     loop {
-        match rx.recv_timeout(POLL) {
-            Ok(msg) => handle(msg, &mut plugins, &mut next),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                // The engine is exiting. A processor may still be running on
-                // the audio thread: destroying its instance now could crash
-                // it, so those instances are left for the process exit.
-                for (_, slot) in plugins.drain() {
-                    if slot.processing {
-                        std::mem::forget(slot.instance);
+        wait(&rx, &wake);
+        #[cfg(windows)]
+        pump_messages();
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => handle(msg, &mut plugins, &mut next),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The engine is exiting. A processor may still be running on
+                    // the audio thread: destroying its instance now could crash
+                    // it, so those instances are left for the process exit.
+                    for (_, slot) in plugins.drain() {
+                        if slot.processing {
+                            std::mem::forget(slot.instance);
+                        }
                     }
+                    return;
                 }
-                return;
             }
         }
         for slot in plugins.values_mut() {
@@ -325,6 +343,43 @@ fn run(rx: mpsc::Receiver<Msg>) {
                 slot.instance.call_on_main_thread_callback();
             }
         }
+    }
+}
+
+/// Waits for a request, a window message, or the callback poll interval.
+#[cfg(windows)]
+fn wait(_rx: &mpsc::Receiver<Msg>, wake: &Wake) {
+    use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjects, QS_ALLINPUT};
+    // SAFETY: one valid event handle; a timeout, not an infinite wait.
+    let _ = unsafe { MsgWaitForMultipleObjects(Some(&[wake.handle()]), false, POLL.as_millis() as u32, QS_ALLINPUT) };
+}
+
+#[cfg(not(windows))]
+fn wait(_rx: &mpsc::Receiver<Msg>, _wake: &Wake) {
+    std::thread::sleep(Duration::from_millis(1));
+}
+
+/// Runs every window message waiting for this thread (plugin editors).
+#[cfg(windows)]
+fn pump_messages() {
+    use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
+    let mut msg = MSG::default();
+    // SAFETY: standard message loop on this thread's own queue.
+    unsafe {
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// Editor windows follow each monitor's scale.
+#[cfg(windows)]
+fn windows_setup() {
+    use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+    // SAFETY: affects only this thread.
+    unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 }
 

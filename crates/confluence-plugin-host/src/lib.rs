@@ -11,6 +11,7 @@
 mod host;
 mod processor;
 mod thread;
+mod wake;
 
 use std::path::Path;
 
