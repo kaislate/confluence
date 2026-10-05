@@ -429,3 +429,41 @@ fn an_insert_bus_is_added_routed_and_cannot_loop() {
     assert!(!engine_points(&mut c).contains(&(bus.first_input, bus.first_output)));
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_plugin_is_loaded_from_the_picker_and_its_gain_set() {
+    use eframe::egui::accesskit::{Action as AkAction, ActionData, ActionRequest};
+    use egui_kittest::kittest::NodeT;
+    let d = EngineDir::new("plugin");
+    d.add_test_plugin();
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let add = Command::AddBus { name: "FX".into(), channels: 2, first_input: None, first_output: None };
+    let Response::Added { ids, .. } = c.call(add).unwrap() else { panic!() };
+    let bus = ids[0];
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "the bus header", LONG, |h| h.query_by_label("FX outputs").is_some());
+    h.get_by_label("FX outputs").click();
+    pump_until(&mut h, "the bus panel", LONG, |h| h.query_by_label("Load plugin…").is_some());
+    h.get_by_label("Load plugin…").click();
+    settle(&mut h);
+    // The picker follows the engine's scan, which may still be running.
+    pump_until(&mut h, "the plugin in the picker", LONG, |h| h.query_by_label("Load Confluence Test Gain").is_some());
+    settle(&mut h);
+    h.get_by_label("Load Confluence Test Gain").click();
+    pump_until(&mut h, "the plugin on the bus", LONG, |h| h.query_by_label("Confluence Test Gain").is_some());
+    pump_until(&mut h, "the Gain slider", LONG, |h| h.query_by_label("Gain").is_some());
+    let (target_node, target_tree) = h.get_by_label("Gain").accesskit_node().locate();
+    h.event(eframe::egui::Event::AccessKitActionRequest(ActionRequest {
+        action: AkAction::SetValue,
+        target_node,
+        target_tree,
+        data: Some(ActionData::NumericValue(-6.0)),
+    }));
+    pump_until(&mut h, "the engine's new gain", LONG, |_| {
+        let (state, _sub) = confluence_client::Subscription::connect(&d.pipe, Duration::from_secs(5)).unwrap();
+        state.bus_plugins.iter().any(|p| p.bus == bus && p.params.first().is_some_and(|q| q.value == -6.0))
+    });
+    pump_until(&mut h, "the plugin's text", LONG, |h| h.query_by_label("-6.0 dB").is_some());
+    c.call(Command::Shutdown).unwrap();
+}

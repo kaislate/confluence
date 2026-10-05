@@ -1,0 +1,21 @@
+[package]
+name = "confluence-plugin-host"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hosts CLAP plugins for Confluence's insert buses: one plugin thread, real-time processors, parameter links"
+
+[dependencies]
+confluence-api = { path = "../confluence-api" }
+confluence-core = { path = "../confluence-core" }
+clack-host = { workspace = true, features = ["clack-plugin"] }
+clack-plugin = { workspace = true }
+clack-extensions = { workspace = true, features = ["clack-host"] }
+
+[dev-dependencies]
+confluence-test-plugin = { path = "../confluence-test-plugin" }
+assert_no_alloc = { workspace = true }
+
+[lints]
+workspace = true

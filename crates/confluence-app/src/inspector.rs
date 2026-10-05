@@ -1,7 +1,7 @@
 //! The inspector: the selected route, the selected slot (with clock health),
 //! or a summary when nothing is selected.
 
-use confluence_api::{ClockRole, PointState, SlotState, State};
+use confluence_api::{ClockRole, PluginStatus, PointState, SlotState, State};
 use std::collections::VecDeque;
 
 use confluence_client::{HealthSample, StoreView, HISTORY_LEN};
@@ -17,6 +17,16 @@ pub enum Action {
     Edit(Edit),
     /// Ask before removing this slot.
     RemoveSlot(u32),
+    /// Open the plugin picker for this bus.
+    PickPlugin(u32),
+}
+
+/// What the inspector needs to show plugins between engine updates.
+pub struct PluginUi<'a> {
+    /// Parameter values sent but not yet confirmed: (bus, param) → value.
+    pub pending: &'a std::collections::HashMap<(u32, u32), f64>,
+    /// A bus whose plugin is being loaded.
+    pub loading: Option<u32>,
 }
 
 /// Routes with an end on one of the slot's channels.
@@ -34,6 +44,7 @@ fn range_text(first: u32, n: u32) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     view: &StoreView,
@@ -42,6 +53,7 @@ pub fn show(
     point: Option<PointState>,
     history: Option<&VecDeque<Option<HealthSample>>>,
     editable: bool,
+    plugin_ui: &PluginUi,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let Some(state) = &view.state else {
@@ -51,7 +63,7 @@ pub fn show(
     ui.add_enabled_ui(editable, |ui| match *selection {
         Selection::None => summary(ui, look, state),
         Selection::Cell { input, output } => point_panel(ui, state, input, output, point, &mut actions),
-        Selection::Slot(id) => slot_panel(ui, look, view, history, state, id, &mut actions),
+        Selection::Slot(id) => slot_panel(ui, look, view, history, state, id, plugin_ui, &mut actions),
     });
     actions
 }
@@ -116,6 +128,7 @@ fn point_panel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn slot_panel(
     ui: &mut egui::Ui,
     look: &Look,
@@ -123,6 +136,7 @@ fn slot_panel(
     history: Option<&VecDeque<Option<HealthSample>>>,
     state: &State,
     id: u32,
+    plugin_ui: &PluginUi,
     actions: &mut Vec<Action>,
 ) {
     let c = &look.skin.colors;
@@ -133,7 +147,7 @@ fn slot_panel(
     };
     ui.heading(&slot.name);
     if slot.is_bus() {
-        bus_panel(ui, view, slot, error, actions);
+        bus_panel(ui, view, state, slot, look, plugin_ui, actions);
         return;
     }
     ui.label(format!("Device: {}", if slot.device.is_empty() { "—" } else { slot.device.as_str() }));
@@ -206,23 +220,98 @@ fn slot_panel(
     }
 }
 
-/// An insert bus: its channels and whether its processing has faulted.
-fn bus_panel(ui: &mut egui::Ui, view: &StoreView, slot: &SlotState, error: Color32, actions: &mut Vec<Action>) {
+/// An insert bus: its channels, its plugin and the plugin's parameters.
+fn bus_panel(
+    ui: &mut egui::Ui,
+    view: &StoreView,
+    state: &State,
+    slot: &SlotState,
+    look: &Look,
+    plugin_ui: &PluginUi,
+    actions: &mut Vec<Action>,
+) {
+    let (warn, error) = (look.skin.colors.warn, look.skin.colors.error);
     ui.label(format!("Insert bus · {} channels", slot.inputs));
-    ui.label(RichText::new("No plugins: passes audio through").weak());
     ui.label(format!(
         "sends {} · returns {}",
         range_text(slot.first_output, slot.outputs),
         range_text(slot.first_input, slot.inputs)
     ));
-    if let Some(h) = view.health.iter().find(|h| h.id == slot.id) {
+    ui.separator();
+    let bus = slot.id;
+    match state.bus_plugins.iter().find(|p| p.bus == bus) {
+        _ if plugin_ui.loading == Some(bus) => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.label("Loading the plugin…");
+            });
+        }
+        None => {
+            ui.label("Plugin: none");
+            ui.label(RichText::new("Passes audio through").weak());
+            if ui.button("Load plugin…").clicked() {
+                actions.push(Action::PickPlugin(bus));
+            }
+        }
+        Some(p) => {
+            ui.label(RichText::new(&p.info.name).strong());
+            if !p.info.vendor.is_empty() {
+                ui.label(RichText::new(&p.info.vendor).weak());
+            }
+            match &p.status {
+                PluginStatus::Running => {}
+                PluginStatus::Faulted => {
+                    ui.label(RichText::new("The plugin stopped after an error — load it again").color(error));
+                }
+                PluginStatus::Failed(why) => {
+                    ui.label(RichText::new(format!("Missing: {why}")).color(warn));
+                }
+            }
+            if p.latency > 0 {
+                ui.label(RichText::new(format!("Latency {} samples (not compensated)", p.latency)).weak());
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Replace…").clicked() {
+                    actions.push(Action::PickPlugin(bus));
+                }
+                if ui.button("Unload").clicked() {
+                    actions.push(Action::Edit(Edit::UnloadPlugin { bus }));
+                }
+            });
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().id_salt("plugin-params").show(ui, |ui| {
+                for q in &p.params {
+                    let pending = plugin_ui.pending.get(&(bus, q.id)).copied();
+                    let mut v = pending.unwrap_or(q.value);
+                    ui.horizontal(|ui| {
+                        let mut slider = Slider::new(&mut v, q.min..=q.max).show_value(false).text(&q.name);
+                        if q.stepped {
+                            slider = slider.step_by(1.0);
+                        }
+                        let r = ui.add_enabled(!q.read_only, slider);
+                        let shown = match pending {
+                            Some(x) if x != q.value => format!("{x:.2}"),
+                            _ => q.text.clone(),
+                        };
+                        ui.label(shown);
+                        if r.double_clicked() {
+                            actions.push(Action::Edit(Edit::SetParam { bus, param: q.id, value: q.default }));
+                        } else if r.changed() {
+                            actions.push(Action::Edit(Edit::SetParam { bus, param: q.id, value: v }));
+                        }
+                    });
+                }
+            });
+        }
+    }
+    if let Some(h) = view.health.iter().find(|h| h.id == bus) {
         if h.device_faults > 0 {
             ui.label(RichText::new(format!("Processing faults {}", h.device_faults)).color(error));
         }
     }
     ui.separator();
     if ui.add(Button::new("Remove slot…")).clicked() {
-        actions.push(Action::RemoveSlot(slot.id));
+        actions.push(Action::RemoveSlot(bus));
     }
 }
 
@@ -264,6 +353,9 @@ mod tests {
             points: vec![p(0, 2), p(1, 1), p(3, 3)],
             devices: Vec::new(),
             notices: Vec::new(),
+            plugins: Vec::new(),
+            bad_plugins: Vec::new(),
+            bus_plugins: Vec::new(),
         };
         assert_eq!(routes_of(&state, &a), 2, "0→2 (its input) and 1→1 (both)");
         assert_eq!(routes_of(&state, &b), 2, "0→2 (its output) and 3→3");
@@ -275,7 +367,7 @@ mod display_tests {
     use super::*;
     use confluence_api::{ClockRole, EngineStatus};
     use confluence_client::ConnState;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
     use egui_kittest::Harness;
 
     fn view_with(point: PointState) -> StoreView {
@@ -305,6 +397,9 @@ mod display_tests {
                 points: vec![point],
                 devices: Vec::new(),
                 notices: Vec::new(),
+                plugins: Vec::new(),
+                bad_plugins: Vec::new(),
+                bus_plugins: Vec::new(),
             }),
             conn: ConnState::Live,
             status: None,
@@ -312,6 +407,116 @@ mod display_tests {
             last_event: None,
             snapshots: 1,
         }
+    }
+
+    fn bus_view(plugin: Option<confluence_api::LoadedPlugin>) -> StoreView {
+        let mut view = view_with(PointState { input: 0, output: 0, gain_db: 0.0, mute: false, invert: false });
+        let state = view.state.as_mut().unwrap();
+        state.slots.push(SlotState {
+            id: 2,
+            name: "FX".into(),
+            device: confluence_api::BUS_DEVICE.into(),
+            role: ClockRole::Strict,
+            online: true,
+            first_input: 2,
+            inputs: 2,
+            first_output: 2,
+            outputs: 2,
+        });
+        state.bus_plugins = plugin.into_iter().collect();
+        view
+    }
+
+    fn gain_plugin(status: confluence_api::PluginStatus) -> confluence_api::LoadedPlugin {
+        confluence_api::LoadedPlugin {
+            bus: 2,
+            info: confluence_api::PluginInfo {
+                path: "t.clap".into(),
+                id: "t".into(),
+                name: "Test Gain".into(),
+                vendor: "Confluence".into(),
+                version: "1".into(),
+            },
+            status,
+            latency: 0,
+            params: vec![confluence_api::ParamState {
+                id: 1,
+                name: "Gain".into(),
+                module: String::new(),
+                min: -60.0,
+                max: 12.0,
+                default: 0.0,
+                value: 0.0,
+                text: "0.0 dB".into(),
+                stepped: false,
+                read_only: false,
+            }],
+        }
+    }
+
+    /// Runs the inspector with bus 2 selected; returns what it asked for.
+    fn bus_panel_actions(view: &StoreView, setup: impl Fn(&mut Harness<'_>)) -> Vec<Action> {
+        let look = Look::builtin();
+        let pending = std::collections::HashMap::new();
+        let sel = Selection::Slot(2);
+        let mut out = Vec::new();
+        {
+            let mut h = Harness::new_ui(|ui| {
+                let ui_state = PluginUi { pending: &pending, loading: None };
+                out.extend(show(ui, view, &look, &sel, None, None, true, &ui_state));
+            });
+            h.run();
+            setup(&mut h);
+            h.run();
+        }
+        out
+    }
+
+    #[test]
+    fn a_bus_without_a_plugin_offers_to_load_one() {
+        let view = bus_view(None);
+        let actions = bus_panel_actions(&view, |h| {
+            assert!(h.query_by_label("Plugin: none").is_some());
+            h.get_by_label("Load plugin…").click();
+        });
+        assert!(actions.iter().any(|a| matches!(a, Action::PickPlugin(2))));
+    }
+
+    #[test]
+    fn a_plugins_parameter_is_a_slider_that_sends_its_value() {
+        use eframe::egui::accesskit::{Action as AkAction, ActionData, ActionRequest};
+        let view = bus_view(Some(gain_plugin(confluence_api::PluginStatus::Running)));
+        let actions = bus_panel_actions(&view, |h| {
+            assert!(h.query_by_label("Test Gain").is_some());
+            assert!(h.query_by_label("0.0 dB").is_some(), "the plugin's own text");
+            let (target_node, target_tree) = h.get_by_label("Gain").accesskit_node().locate();
+            h.event(eframe::egui::Event::AccessKitActionRequest(ActionRequest {
+                action: AkAction::SetValue,
+                target_node,
+                target_tree,
+                data: Some(ActionData::NumericValue(-6.0)),
+            }));
+        });
+        let sent: Vec<&Edit> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Edit(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, [&Edit::SetParam { bus: 2, param: 1, value: -6.0 }]);
+    }
+
+    #[test]
+    fn a_plugins_trouble_is_spelled_out() {
+        let faulted = bus_view(Some(gain_plugin(confluence_api::PluginStatus::Faulted)));
+        bus_panel_actions(&faulted, |h| {
+            assert!(h.query_by_label_contains("stopped after an error").is_some());
+        });
+        let failed = bus_view(Some(gain_plugin(confluence_api::PluginStatus::Failed("t.clap was not found".into()))));
+        bus_panel_actions(&failed, |h| {
+            assert!(h.query_by_label_contains("Missing: t.clap was not found").is_some());
+        });
     }
 
     /// A route quieter than the slider's range must still show its real gain
@@ -324,7 +529,9 @@ mod display_tests {
         let sel = Selection::Cell { input: 0, output: 0 };
         let mut sent = Vec::new();
         let mut h = Harness::new_ui(|ui| {
-            for a in show(ui, &view, &look, &sel, Some(pt.clone()), None, true) {
+            let pending = std::collections::HashMap::new();
+            let plugin_ui = PluginUi { pending: &pending, loading: None };
+            for a in show(ui, &view, &look, &sel, Some(pt.clone()), None, true, &plugin_ui) {
                 if let Action::Edit(e) = a {
                     sent.push(e);
                 }

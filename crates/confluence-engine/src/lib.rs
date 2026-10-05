@@ -12,6 +12,8 @@ pub mod engine;
 pub mod ipc;
 pub mod journal;
 #[cfg(windows)]
+pub mod plugins;
+#[cfg(windows)]
 pub mod publish;
 pub mod sim;
 
@@ -20,6 +22,6 @@ pub use confluence_rt as rt;
 
 pub use audio::{AudioEngine, StrictSide, MAX_BUSES};
 pub use engine::{
-    BusSpec, Engine, EngineConfig, EngineError, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec,
-    StrictSlotSpec, StrictStats,
+    BusSpec, Engine, EngineConfig, EngineError, MasterChannels, MasterSlotSpec, OfflineSlotSpec, PluginControl,
+    PluginParts, SoftSlotSpec, StrictSlotSpec, StrictStats,
 };

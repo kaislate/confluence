@@ -59,24 +59,32 @@ pub(crate) struct BusEntry {
     pub channels: usize,
     /// `None`: a summing bus (returns = sends).
     pub processor: Option<Box<dyn Processor>>,
-    /// Blocks whose processor panicked (their returns were silenced).
+    /// Faults of its processor (a panic or a processing error).
     pub faults: Arc<AtomicU64>,
+    /// The processor faulted: it is not called again until replaced.
+    pub faulted: bool,
+    /// Pass nothing, even without a processor (a plugin that failed to load).
+    pub silent: bool,
 }
 
 impl BusEntry {
     fn run(&mut self, sends: &PlanarBuffer, returns: &mut PlanarBuffer) {
         let (fs, fr, ch) = (self.first_send, self.first_return, self.channels);
+        if self.faulted || self.silent {
+            BusIo::new(sends, fs, returns, fr, ch).silence();
+            return;
+        }
         let Some(p) = self.processor.as_mut() else {
             BusIo::new(sends, fs, returns, fr, ch).passthrough();
             return;
         };
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             p.process(BusIo::new(sends, fs, &mut *returns, fr, ch))
-        }))
-        .is_ok();
-        if !ok {
+        }));
+        if !matches!(ran, Ok(Ok(()))) {
             BusIo::new(sends, fs, returns, fr, ch).silence();
             self.faults.fetch_add(1, Ordering::Relaxed);
+            self.faulted = true;
         }
     }
 }
@@ -86,6 +94,15 @@ pub(crate) enum AudioMsg {
     AddOutput(Box<OutputEntry>),
     AddStrict(Box<StrictEntry>),
     AddBus(Box<BusEntry>),
+    /// Replace a bus's processor; the old one is stopped and returned.
+    SetProcessor {
+        bus: u32,
+        processor: Option<Box<dyn Processor>>,
+    },
+    SetSilent {
+        bus: u32,
+        silent: bool,
+    },
     Remove(u32),
 }
 
@@ -95,6 +112,7 @@ pub(crate) enum Returned {
     Output(Box<OutputEntry>),
     Strict(Box<StrictEntry>),
     Bus(Box<BusEntry>),
+    Processor(Box<dyn Processor>),
 }
 
 pub struct AudioEngine {
@@ -253,9 +271,29 @@ impl AudioEngine {
                         self.give_back(Returned::Bus(e));
                     }
                 }
+                AudioMsg::SetProcessor { bus, processor } => {
+                    if let Some(b) = self.buses.iter_mut().find(|b| b.id == bus) {
+                        let old = std::mem::replace(&mut b.processor, processor);
+                        b.faulted = false;
+                        if let Some(mut old) = old {
+                            old.stop();
+                            self.give_back(Returned::Processor(old));
+                        }
+                    } else if let Some(p) = processor {
+                        self.give_back(Returned::Processor(p));
+                    }
+                }
+                AudioMsg::SetSilent { bus, silent } => {
+                    if let Some(b) = self.buses.iter_mut().find(|b| b.id == bus) {
+                        b.silent = silent;
+                    }
+                }
                 AudioMsg::Remove(id) => {
                     if let Some(i) = self.buses.iter().position(|e| e.id == id) {
-                        let e = self.buses.swap_remove(i);
+                        let mut e = self.buses.swap_remove(i);
+                        if let Some(p) = e.processor.as_mut() {
+                            p.stop();
+                        }
                         for ch in e.first_return..e.first_return + e.channels {
                             self.inputs.channel_mut(ch).fill(0.0);
                         }

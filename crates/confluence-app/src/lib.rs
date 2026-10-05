@@ -12,5 +12,6 @@ pub mod inspector;
 pub mod matrix;
 pub mod notify;
 pub mod pending;
+pub mod plugins;
 pub mod skin;
 pub mod theme;

@@ -7,7 +7,7 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use confluence_api::{Command, DeviceKind, Response};
+use confluence_api::{BusRef, Command, DeviceKind, Response};
 use confluence_client::Client;
 
 /// Gain changes to one point are sent at most this often.
@@ -27,6 +27,16 @@ pub enum Edit {
     AddDevice { kind: DeviceKind, name: String },
     RemoveSlot { id: u32 },
     AddBus { name: String, channels: u32 },
+    LoadPlugin { bus: u32, path: String, plugin_id: String },
+    UnloadPlugin { bus: u32 },
+    SetParam { bus: u32, param: u32, value: f64 },
+}
+
+/// What a merged, rate-limited edit is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MergeKey {
+    Point(u32, u32),
+    Param(u32, u32),
 }
 
 impl Edit {
@@ -38,6 +48,13 @@ impl Edit {
             Edit::RemovePoint { input, output } => Command::RemovePoint { input: *input, output: *output },
             Edit::AddDevice { kind, name } => Command::AddDevice { kind: *kind, name: name.clone() },
             Edit::RemoveSlot { id } => Command::RemoveSlot { id: *id },
+            Edit::LoadPlugin { bus, path, plugin_id } => {
+                Command::LoadPlugin { bus: BusRef::Id(*bus), path: path.clone(), plugin_id: plugin_id.clone() }
+            }
+            Edit::UnloadPlugin { bus } => Command::UnloadPlugin { bus: BusRef::Id(*bus) },
+            Edit::SetParam { bus, param, value } => {
+                Command::SetParam { bus: BusRef::Id(*bus), param: *param, value: *value }
+            }
             Edit::AddBus { name, channels } => {
                 Command::AddBus { name: name.clone(), channels: *channels, first_input: None, first_output: None }
             }
@@ -52,9 +69,19 @@ impl Edit {
         }
     }
 
-    /// Opening a device can take seconds: it gets its own connection and thread.
+    /// Opening a device or loading a plugin can take seconds: it gets its own
+    /// connection and thread.
     fn is_slow(&self) -> bool {
-        matches!(self, Edit::AddDevice { .. })
+        matches!(self, Edit::AddDevice { .. } | Edit::LoadPlugin { .. })
+    }
+
+    /// Gains and parameter values: merged while queued and rate limited.
+    fn merge_key(&self) -> Option<MergeKey> {
+        match *self {
+            Edit::SetPoint { input, output, .. } => Some(MergeKey::Point(input, output)),
+            Edit::SetParam { bus, param, .. } => Some(MergeKey::Param(bus, param)),
+            _ => None,
+        }
     }
 }
 
@@ -77,16 +104,21 @@ pub enum Outcome {
 #[derive(Default)]
 pub struct Outbox {
     queue: VecDeque<Edit>,
-    last_gain: HashMap<(u32, u32), Instant>,
+    last_gain: HashMap<MergeKey, Instant>,
 }
 
 impl Outbox {
-    /// Queues `edit`. A `SetPoint` replaces the queued `SetPoint` for the same
-    /// point, if that is the latest queued edit for the point.
+    /// Queues `edit`. A gain (`SetPoint`) or parameter value (`SetParam`)
+    /// replaces the queued one for the same point or parameter, if that is the
+    /// latest queued edit about it.
     pub fn push(&mut self, edit: Edit) {
-        if let (Edit::SetPoint { .. }, Some(p)) = (&edit, edit.point()) {
-            if let Some(last) = self.queue.iter_mut().rev().find(|e| e.point() == Some(p)) {
-                if matches!(last, Edit::SetPoint { .. }) {
+        if let Some(k) = edit.merge_key() {
+            let about = |e: &Edit| match k {
+                MergeKey::Point(i, o) => e.point() == Some((i, o)),
+                MergeKey::Param(..) => e.merge_key() == Some(k),
+            };
+            if let Some(last) = self.queue.iter_mut().rev().find(|e| about(e)) {
+                if last.merge_key() == Some(k) {
                     *last = edit;
                     return;
                 }
@@ -113,11 +145,11 @@ impl Outbox {
     pub fn next_ready(&mut self, now: Instant) -> Option<Edit> {
         self.last_gain.retain(|_, t| now.saturating_duration_since(*t) < GAIN_INTERVAL);
         let front = self.queue.front()?;
-        if let (Edit::SetPoint { .. }, Some(p)) = (front, front.point()) {
-            if self.last_gain.contains_key(&p) {
+        if let Some(k) = front.merge_key() {
+            if self.last_gain.contains_key(&k) {
                 return None;
             }
-            self.last_gain.insert(p, now);
+            self.last_gain.insert(k, now);
         }
         self.queue.pop_front()
     }
@@ -125,11 +157,7 @@ impl Outbox {
     /// How long until the front edit may go; `None` when nothing is queued.
     pub fn wait(&self, now: Instant) -> Option<Duration> {
         let front = self.queue.front()?;
-        let gain_point = match front {
-            Edit::SetPoint { .. } => front.point(),
-            _ => None,
-        };
-        Some(match gain_point.and_then(|p| self.last_gain.get(&p)) {
+        Some(match front.merge_key().and_then(|k| self.last_gain.get(&k)) {
             Some(t) => GAIN_INTERVAL.saturating_sub(now.saturating_duration_since(*t)),
             None => Duration::ZERO,
         })
@@ -305,6 +333,43 @@ fn send(caller: &mut Option<Caller>, pipe: &str, edit: Edit, timeout: Duration) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameter_edits_merge_and_are_rate_limited_per_parameter() {
+        let param = |bus, param, value| Edit::SetParam { bus, param, value };
+        let mut o = Outbox::default();
+        o.push(param(1, 1, -1.0));
+        o.push(param(1, 1, -2.0)); // replaces the queued one
+        o.push(param(1, 2, 0.5)); // another parameter: kept
+        assert_eq!(o.len(), 2);
+        let t = Instant::now();
+        assert_eq!(o.next_ready(t), Some(param(1, 1, -2.0)));
+        assert_eq!(o.next_ready(t), Some(param(1, 2, 0.5)));
+        o.push(param(1, 1, -3.0));
+        assert_eq!(o.next_ready(t), None, "the same parameter again waits out the interval");
+        assert_eq!(o.next_ready(t + GAIN_INTERVAL), Some(param(1, 1, -3.0)));
+        assert_eq!(
+            param(4, 1, -6.0).command(),
+            Command::SetParam { bus: confluence_api::BusRef::Id(4), param: 1, value: -6.0 }
+        );
+    }
+
+    #[test]
+    fn loading_a_plugin_is_slow_and_unloading_is_not() {
+        let load = Edit::LoadPlugin { bus: 2, path: "x.clap".into(), plugin_id: "dev.x".into() };
+        assert!(load.is_slow());
+        assert_eq!(
+            load.command(),
+            Command::LoadPlugin {
+                bus: confluence_api::BusRef::Id(2),
+                path: "x.clap".into(),
+                plugin_id: "dev.x".into()
+            }
+        );
+        let unload = Edit::UnloadPlugin { bus: 2 };
+        assert!(!unload.is_slow());
+        assert_eq!(unload.command(), Command::UnloadPlugin { bus: confluence_api::BusRef::Id(2) });
+    }
 
     #[test]
     fn add_bus_is_a_plain_edit() {

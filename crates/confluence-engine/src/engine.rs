@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use confluence_api::{ClockRole, Command, PointState, Response, SlotHealth, SlotState, BUS_DEVICE};
+use confluence_api::{
+    BusRef, ClockRole, Command, LoadedPlugin, ParamState, PluginInfo, PluginStatus, PointState, Response, SlotHealth,
+    SlotState, BUS_DEVICE,
+};
 use confluence_core::asrc::AsrcQuality;
 use confluence_core::bridge::{soft_input, soft_output, BridgeConfig, BridgeStats, InputDeviceSide, OutputDeviceSide};
 use confluence_core::buffer::PlanarBuffer;
@@ -77,7 +80,46 @@ pub enum EngineError {
     BusChannels,
     #[error("too many insert buses")]
     TooManyBuses,
+    #[error("slot {0} is not an insert bus")]
+    NotABus(u32),
+    #[error("no insert bus at channel {0}")]
+    NoBusAt(u32),
 }
+
+/// The engine's handle on the plugin of an insert bus (its audio side runs as
+/// the bus's [`Processor`]). Implemented by the engine process over the plugin
+/// host; tests use fakes.
+pub trait PluginControl: Send {
+    fn info(&self) -> PluginInfo;
+    /// Samples of delay the plugin reports.
+    fn latency(&self) -> u32;
+    /// Parameters with their latest values and texts.
+    fn params(&self) -> Vec<ParamState>;
+    fn set_param(&mut self, id: u32, value: f64) -> Result<(), String>;
+    /// Takes in values the plugin reported itself; true if any changed.
+    fn poll(&mut self) -> bool;
+    fn save_state(&mut self) -> Result<Vec<u8>, String>;
+    fn load_state(&mut self, state: &[u8]) -> Result<(), String>;
+}
+
+/// A loaded plugin: the engine's control of it and its processor for the bus.
+pub type PluginParts = (Box<dyn PluginControl>, Box<dyn Processor>);
+
+/// What is on an insert bus besides its routes.
+enum BusPlugin {
+    Loaded {
+        control: Box<dyn PluginControl>,
+        /// The bus's fault count when this plugin was installed.
+        faults_before: u64,
+    },
+    /// Could not be loaded: the bus is silent; the reference, the last state
+    /// and the last value set per parameter are kept, so the plugin comes back
+    /// as it was when it can be loaded again.
+    Failed { info: PluginInfo, why: String, state: Option<Vec<u8>>, values: std::collections::BTreeMap<u32, f64> },
+}
+
+/// Room left in a journal record around a plugin state chunk.
+const STATE_HEADROOM: usize = 4096;
 
 /// Most channels an insert bus can have.
 pub const MAX_BUS_CHANNELS: u32 = 64;
@@ -197,6 +239,12 @@ pub struct Engine {
     plan: PlanController,
     /// Buses or the routes between them changed: compile a new plan on `tick`.
     plan_dirty: bool,
+    /// Processors the audio side gave back, for their owner to dispose of.
+    returned_processors: Vec<Box<dyn Processor>>,
+    /// Plugins on insert buses, by bus id.
+    plugins: std::collections::BTreeMap<u32, BusPlugin>,
+    /// Plugin trouble the user should know about, by bus id.
+    plugin_notices: std::collections::BTreeMap<u32, String>,
     blocks: Arc<AtomicU64>,
     master_ppm: Arc<AtomicU64>,
     dsp_load: Arc<AtomicU32>,
@@ -248,6 +296,9 @@ impl Engine {
             buses: 0,
             plan: plan_ctl,
             plan_dirty: false,
+            returned_processors: Vec::new(),
+            plugins: std::collections::BTreeMap::new(),
+            plugin_notices: std::collections::BTreeMap::new(),
             blocks,
             master_ppm,
             dsp_load,
@@ -453,6 +504,8 @@ impl Engine {
             channels: ch as usize,
             processor,
             faults: faults.clone(),
+            faulted: false,
+            silent: false,
         });
         if self.to_audio.try_send(AudioMsg::AddBus(entry)).is_err() {
             self.inputs.free(first_input, ch);
@@ -474,6 +527,225 @@ impl Engine {
         let state = self.state(id, &spec.name, BUS_DEVICE, ClockRole::Strict, (first_input, ch), (first_output, ch));
         self.slots.push(SlotRecord { state, stats: SlotStats::Bus(faults) });
         Ok(id)
+    }
+
+    /// Replaces a bus's processor (`None`: a summing bus). The old one is
+    /// stopped on the audio side and comes back through
+    /// [`take_returned_processors`](Self::take_returned_processors). Clears a fault.
+    pub fn set_bus_processor(&mut self, bus: u32, processor: Option<Box<dyn Processor>>) -> Result<(), EngineError> {
+        self.check_bus(bus)?;
+        self.to_audio.try_send(AudioMsg::SetProcessor { bus, processor }).map_err(|_| EngineError::Busy)
+    }
+
+    /// A silent bus passes nothing (a plugin that could not be loaded must not
+    /// send the dry signal on).
+    pub fn set_bus_silent(&mut self, bus: u32, silent: bool) -> Result<(), EngineError> {
+        self.check_bus(bus)?;
+        self.to_audio.try_send(AudioMsg::SetSilent { bus, silent }).map_err(|_| EngineError::Busy)
+    }
+
+    /// Processors the audio side has given back since the last call (replaced,
+    /// or from removed buses). Call after `tick`.
+    pub fn take_returned_processors(&mut self) -> Vec<Box<dyn Processor>> {
+        std::mem::take(&mut self.returned_processors)
+    }
+
+    /// Installs a plugin on a bus (its control and its processor), replacing
+    /// whatever was there, or takes it off (`None`: a summing bus again).
+    pub fn set_plugin(&mut self, bus: u32, plugin: Option<PluginParts>) -> Result<(), EngineError> {
+        self.check_bus(bus)?;
+        let (control, processor) = match plugin {
+            Some((c, p)) => (Some(c), Some(p)),
+            None => (None, None),
+        };
+        self.set_bus_processor(bus, processor)?;
+        self.set_bus_silent(bus, false)?;
+        match control {
+            Some(control) => {
+                let faults_before = self.bus_faults(bus);
+                self.plugins.insert(bus, BusPlugin::Loaded { control, faults_before });
+            }
+            None => {
+                self.plugins.remove(&bus);
+            }
+        }
+        Ok(())
+    }
+
+    /// Records a plugin that could not be loaded: the bus goes silent, and the
+    /// plugin's reference (and any state loaded for it) is kept.
+    pub fn set_failed_plugin(&mut self, bus: u32, info: PluginInfo, why: String) -> Result<(), EngineError> {
+        self.check_bus(bus)?;
+        self.set_bus_processor(bus, None)?;
+        self.set_bus_silent(bus, true)?;
+        self.plugins.insert(bus, BusPlugin::Failed { info, why, state: None, values: Default::default() });
+        Ok(())
+    }
+
+    /// The bus a [`BusRef`] names.
+    pub fn resolve_bus(&self, r: &BusRef) -> Result<u32, EngineError> {
+        match *r {
+            BusRef::Id(id) => self.check_bus(id).map(|()| id),
+            BusRef::At(first) => self
+                .slots
+                .iter()
+                .find(|s| matches!(s.stats, SlotStats::Bus(_)) && s.state.first_output == first)
+                .map(|s| s.state.id)
+                .ok_or(EngineError::NoBusAt(first)),
+        }
+    }
+
+    /// The plugin on each bus that has one, sorted by bus id, with the values
+    /// the plugins reported since the last call taken in.
+    pub fn bus_plugins(&mut self) -> Vec<LoadedPlugin> {
+        let buses: Vec<u32> = self.plugins.keys().copied().collect();
+        let mut out = Vec::with_capacity(buses.len());
+        for bus in buses {
+            let faults = self.bus_faults(bus);
+            let Some(p) = self.plugins.get_mut(&bus) else { continue };
+            out.push(match p {
+                BusPlugin::Loaded { control, faults_before } => {
+                    control.poll();
+                    LoadedPlugin {
+                        bus,
+                        info: control.info(),
+                        status: if faults > *faults_before { PluginStatus::Faulted } else { PluginStatus::Running },
+                        latency: control.latency(),
+                        params: control.params(),
+                    }
+                }
+                BusPlugin::Failed { info, why, .. } => LoadedPlugin {
+                    bus,
+                    info: info.clone(),
+                    status: PluginStatus::Failed(why.clone()),
+                    latency: 0,
+                    params: Vec::new(),
+                },
+            });
+        }
+        out
+    }
+
+    /// The commands that recreate every bus's plugin as it is now, for the
+    /// journal: per bus (by send column) `LoadPlugin`, its state chunk when the
+    /// plugin has one that fits a journal record, then every settable
+    /// parameter's value. The values come last: a state read from the plugin
+    /// may not have taken in the latest values yet, and a plugin may have no
+    /// state at all. A state too large to save raises a notice.
+    pub fn plugin_commands(&mut self) -> Vec<Command> {
+        let places: Vec<(u32, u32)> = {
+            let mut v: Vec<(u32, u32)> = self
+                .slots
+                .iter()
+                .filter(|s| matches!(s.stats, SlotStats::Bus(_)))
+                .map(|s| (s.state.first_output, s.state.id))
+                .collect();
+            v.sort();
+            v
+        };
+        let mut out = Vec::new();
+        for (at, bus) in places {
+            let Some(p) = self.plugins.get_mut(&bus) else { continue };
+            let (info, state, values): (PluginInfo, Option<Vec<u8>>, Vec<(u32, f64)>) = match p {
+                BusPlugin::Loaded { control, .. } => {
+                    let values = control.params().iter().filter(|q| !q.read_only).map(|q| (q.id, q.value)).collect();
+                    (control.info(), control.save_state().ok(), values)
+                }
+                BusPlugin::Failed { info, state, values, .. } => {
+                    (info.clone(), state.clone(), values.iter().map(|(k, v)| (*k, *v)).collect())
+                }
+            };
+            out.push(Command::LoadPlugin { bus: BusRef::At(at), path: info.path.clone(), plugin_id: info.id.clone() });
+            match state {
+                Some(state) if state.len() + STATE_HEADROOM <= confluence_api::MAX_FRAME_BYTES as usize => {
+                    self.plugin_notices.remove(&bus);
+                    out.push(Command::SetPluginState { bus: BusRef::At(at), state });
+                }
+                Some(state) => {
+                    self.plugin_notices.insert(
+                        bus,
+                        format!(
+                            "{}: its settings are too large to save ({} KB); only its parameter values are saved",
+                            info.name,
+                            state.len() / 1024
+                        ),
+                    );
+                }
+                None => {
+                    self.plugin_notices.remove(&bus);
+                }
+            }
+            out.extend(values.into_iter().map(|(param, value)| Command::SetParam {
+                bus: BusRef::At(at),
+                param,
+                value,
+            }));
+        }
+        out
+    }
+
+    /// Plugin trouble the user should know about.
+    pub fn plugin_notices(&self) -> Vec<String> {
+        self.plugin_notices.values().cloned().collect()
+    }
+
+    /// A bus's plugin and its current state chunk (for saving the project).
+    pub fn plugin_snapshot(&mut self, bus: u32) -> Option<(PluginInfo, Option<Vec<u8>>)> {
+        match self.plugins.get_mut(&bus)? {
+            BusPlugin::Loaded { control, .. } => Some((control.info(), control.save_state().ok())),
+            BusPlugin::Failed { info, state, .. } => Some((info.clone(), state.clone())),
+        }
+    }
+
+    fn bus_faults(&self, bus: u32) -> u64 {
+        self.slots
+            .iter()
+            .find(|s| s.state.id == bus)
+            .and_then(|s| match &s.stats {
+                SlotStats::Bus(f) => Some(f.load(Ordering::Relaxed)),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    fn plugin_command(&mut self, cmd: &Command) -> Result<(), String> {
+        match cmd {
+            Command::UnloadPlugin { bus } => {
+                let bus = self.resolve_bus(bus).map_err(|e| e.to_string())?;
+                self.set_plugin(bus, None).map_err(|e| e.to_string())
+            }
+            Command::SetParam { bus, param, value } => {
+                let bus = self.resolve_bus(bus).map_err(|e| e.to_string())?;
+                match self.plugins.get_mut(&bus) {
+                    Some(BusPlugin::Loaded { control, .. }) => control.set_param(*param, *value),
+                    Some(BusPlugin::Failed { values, .. }) => {
+                        values.insert(*param, *value);
+                        Ok(())
+                    }
+                    None => Err(format!("insert bus {bus} has no plugin")),
+                }
+            }
+            Command::SetPluginState { bus, state } => {
+                let bus = self.resolve_bus(bus).map_err(|e| e.to_string())?;
+                match self.plugins.get_mut(&bus) {
+                    Some(BusPlugin::Loaded { control, .. }) => control.load_state(state),
+                    Some(BusPlugin::Failed { state: kept, .. }) => {
+                        *kept = Some(state.clone());
+                        Ok(())
+                    }
+                    None => Err(format!("insert bus {bus} has no plugin")),
+                }
+            }
+            _ => Err("plugins are loaded by the engine process".into()),
+        }
+    }
+
+    fn check_bus(&self, bus: u32) -> Result<(), EngineError> {
+        match self.slots.iter().find(|s| s.state.id == bus) {
+            Some(s) if matches!(s.stats, SlotStats::Bus(_)) => Ok(()),
+            Some(_) => Err(EngineError::NotABus(bus)),
+            None => Err(EngineError::NoSuchSlot(bus)),
+        }
     }
 
     fn bus_spans(&self) -> Vec<BusSpan> {
@@ -586,6 +858,8 @@ impl Engine {
             self.to_audio.try_send(AudioMsg::Remove(id)).map_err(|_| EngineError::Busy)?;
             self.buses -= 1;
             self.plan_dirty = true;
+            self.plugins.remove(&id);
+            self.plugin_notices.remove(&id);
         }
         // Routes on the slot's channels go: edges between buses may change.
         self.plan_dirty |= self.buses > 0;
@@ -619,7 +893,12 @@ impl Engine {
                 Returned::Input(entry) => drop(entry),
                 Returned::Output(entry) => drop(entry),
                 Returned::Strict(entry) => drop(entry),
-                Returned::Bus(entry) => drop(entry),
+                Returned::Bus(mut entry) => {
+                    if let Some(p) = entry.processor.take() {
+                        self.returned_processors.push(p);
+                    }
+                }
+                Returned::Processor(p) => self.returned_processors.push(p),
             }
         }
     }
@@ -680,6 +959,14 @@ impl Engine {
                 Response::Error("subscriptions and status are served by the engine process".into())
             }
             Command::Shutdown => Response::Ok,
+            Command::ListPlugins
+            | Command::LoadPlugin { .. }
+            | Command::UnloadPlugin { .. }
+            | Command::SetParam { .. }
+            | Command::SetPluginState { .. } => match self.plugin_command(cmd) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e),
+            },
             Command::AddBus { ref name, channels, first_input, first_output } => {
                 let spec = BusSpec { name: name.clone(), channels, first_input, first_output };
                 match self.add_bus(&spec) {
@@ -827,7 +1114,8 @@ fn claim_maybe(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use confluence_core::processor::{BusIo, Processor};
+    use confluence_core::processor::{BusIo, ProcessError, Processor};
+    use std::sync::Mutex;
 
     fn small() -> (Engine, AudioEngine) {
         let mut cfg = EngineConfig::new(48_000.0, 64);
@@ -987,9 +1275,334 @@ mod tests {
 
     struct Panics;
     impl Processor for Panics {
-        fn process(&mut self, _io: BusIo<'_>) {
+        fn process(&mut self, _io: BusIo<'_>) -> Result<(), ProcessError> {
             panic!("test plugin crash");
         }
+    }
+
+    /// Counts its calls; fails the first `fail` of them; multiplies by `gain`.
+    #[derive(Default)]
+    struct Counter {
+        calls: Arc<AtomicU64>,
+        stopped: Arc<AtomicU64>,
+        fail: u64,
+        gain: f32,
+    }
+
+    impl Processor for Counter {
+        fn process(&mut self, mut io: BusIo<'_>) -> Result<(), ProcessError> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            if n < self.fail {
+                return Err(ProcessError);
+            }
+            io.passthrough();
+            for c in 0..io.channels() {
+                for x in io.ret(c) {
+                    *x *= self.gain;
+                }
+            }
+            Ok(())
+        }
+
+        fn stop(&mut self) {
+            self.stopped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_faulted_processor_is_not_called_again() {
+        let (mut e, mut a) = small();
+        let calls = Arc::new(AtomicU64::new(0));
+        let p = Counter { calls: calls.clone(), fail: 1, gain: 1.0, ..Counter::default() };
+        let b = e.add_bus_with(&bus_at("Bad", 1, 8), Some(Box::new(p))).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        for _ in 0..30 {
+            assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.0, "silent after the fault");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "never called again");
+        let Response::Health { slots, .. } = e.handle(&Command::Health) else { panic!() };
+        assert_eq!(slots.iter().find(|h| h.id == b).unwrap().device_faults, 1);
+    }
+
+    #[test]
+    fn a_new_processor_replaces_the_old_and_the_old_comes_back() {
+        let (mut e, mut a) = small();
+        let stopped = Arc::new(AtomicU64::new(0));
+        let first = Counter { stopped: stopped.clone(), fail: 1, gain: 1.0, ..Counter::default() };
+        let b = e.add_bus_with(&bus_at("Verb", 1, 8), Some(Box::new(first))).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        for _ in 0..30 {
+            block(&mut e, &mut a, 1.0, 3); // faults on the first block
+        }
+        e.set_bus_processor(b, Some(Box::new(Counter { gain: 0.5, ..Counter::default() }))).unwrap();
+        block(&mut e, &mut a, 1.0, 3);
+        assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.5, "the new processor runs: the fault was cleared");
+        let back = e.take_returned_processors();
+        assert_eq!(back.len(), 1);
+        assert_eq!(stopped.load(Ordering::Relaxed), 1, "stopped on the audio side before coming back");
+        e.set_bus_processor(b, None).unwrap();
+        block(&mut e, &mut a, 1.0, 3);
+        assert_eq!(block(&mut e, &mut a, 1.0, 3), 1.0, "no processor: a summing bus again");
+        assert_eq!(e.take_returned_processors().len(), 1);
+    }
+
+    #[test]
+    fn a_silent_bus_passes_nothing() {
+        let (mut e, mut a) = small();
+        let b = e.add_bus(&bus_at("Missing", 1, 8)).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        e.set_bus_silent(b, true).unwrap();
+        for _ in 0..30 {
+            assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.0);
+        }
+        e.set_bus_silent(b, false).unwrap();
+        for _ in 0..30 {
+            block(&mut e, &mut a, 1.0, 3);
+        }
+        assert_eq!(block(&mut e, &mut a, 1.0, 3), 1.0);
+    }
+
+    /// A plugin as the engine sees it, without a plugin.
+    struct FakePlugin {
+        gain: f64,
+        state: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl PluginControl for FakePlugin {
+        fn info(&self) -> PluginInfo {
+            PluginInfo {
+                path: "f.clap".into(),
+                id: "fake".into(),
+                name: "Fake".into(),
+                vendor: String::new(),
+                version: String::new(),
+            }
+        }
+        fn latency(&self) -> u32 {
+            12
+        }
+        fn params(&self) -> Vec<ParamState> {
+            vec![ParamState {
+                id: 1,
+                name: "Gain".into(),
+                module: String::new(),
+                min: -60.0,
+                max: 12.0,
+                default: 0.0,
+                value: self.gain,
+                text: format!("{:.1} dB", self.gain),
+                stepped: false,
+                read_only: false,
+            }]
+        }
+        fn set_param(&mut self, id: u32, value: f64) -> Result<(), String> {
+            if id != 1 {
+                return Err(format!("Fake has no parameter {id}"));
+            }
+            self.gain = value;
+            Ok(())
+        }
+        fn poll(&mut self) -> bool {
+            false
+        }
+        fn save_state(&mut self) -> Result<Vec<u8>, String> {
+            Ok(self.gain.to_le_bytes().to_vec())
+        }
+        fn load_state(&mut self, state: &[u8]) -> Result<(), String> {
+            *self.state.lock().unwrap() = state.to_vec();
+            Ok(())
+        }
+    }
+
+    fn fake() -> Box<dyn PluginControl> {
+        Box::new(FakePlugin { gain: 0.0, state: Arc::new(Mutex::new(Vec::new())) })
+    }
+
+    fn halves() -> Box<dyn Processor> {
+        Box::new(Counter { gain: 0.5, ..Counter::default() })
+    }
+
+    #[test]
+    fn a_plugin_runs_on_its_bus_and_replacing_it_returns_the_old_processor() {
+        let (mut e, mut a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        e.set_plugin(b, Some((fake(), halves()))).unwrap();
+        for _ in 0..30 {
+            block(&mut e, &mut a, 1.0, 3);
+        }
+        assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.5);
+        let shown = e.bus_plugins();
+        assert_eq!(shown.len(), 1);
+        assert_eq!((shown[0].bus, shown[0].info.name.as_str(), shown[0].latency), (b, "Fake", 12));
+        assert_eq!(shown[0].status, PluginStatus::Running);
+        e.set_plugin(b, Some((fake(), halves()))).unwrap();
+        block(&mut e, &mut a, 1.0, 3);
+        e.tick();
+        assert_eq!(e.take_returned_processors().len(), 1, "the replaced one comes back");
+        e.set_plugin(b, None).unwrap();
+        block(&mut e, &mut a, 1.0, 3);
+        e.tick();
+        assert_eq!(e.take_returned_processors().len(), 1);
+        assert!(e.bus_plugins().is_empty());
+    }
+
+    #[test]
+    fn parameters_and_state_go_to_the_plugin() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        e.set_plugin(b, Some((fake(), halves()))).unwrap();
+        let set = |param| Command::SetParam { bus: BusRef::Id(b), param, value: -6.0 };
+        assert_eq!(e.handle(&set(1)), Response::Ok);
+        assert_eq!(e.bus_plugins()[0].params[0].value, -6.0);
+        assert_eq!(e.handle(&set(9)), Response::Error("Fake has no parameter 9".into()));
+        let by_channel = Command::SetParam { bus: BusRef::At(8), param: 1, value: -3.0 };
+        assert_eq!(e.handle(&by_channel), Response::Ok, "a bus can be named by its first send column");
+        assert_eq!(e.plugin_snapshot(b).unwrap().1, Some((-3.0f64).to_le_bytes().to_vec()));
+        let nowhere = Command::SetParam { bus: BusRef::At(2), param: 1, value: 0.0 };
+        assert_eq!(e.handle(&nowhere), Response::Error("no insert bus at channel 2".into()));
+        let (id, _) = e.add_soft_input(&spec("in", 2)).unwrap();
+        let not_bus = Command::UnloadPlugin { bus: BusRef::Id(id) };
+        assert_eq!(e.handle(&not_bus), Response::Error(format!("slot {id} is not an insert bus")));
+        assert_eq!(e.handle(&Command::UnloadPlugin { bus: BusRef::Id(b) }), Response::Ok);
+        assert!(e.bus_plugins().is_empty());
+    }
+
+    #[test]
+    fn removing_a_bus_takes_its_plugin_with_it() {
+        let (mut e, mut a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        e.set_plugin(b, Some((fake(), halves()))).unwrap();
+        block(&mut e, &mut a, 0.0, 3);
+        e.remove_slot(b).unwrap();
+        block(&mut e, &mut a, 0.0, 3);
+        e.tick();
+        assert_eq!(e.take_returned_processors().len(), 1);
+        assert!(e.bus_plugins().is_empty());
+    }
+
+    #[test]
+    fn a_plugin_that_could_not_load_keeps_its_bus_silent_and_its_state() {
+        let (mut e, mut a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        let info = fake().info();
+        e.set_failed_plugin(b, info.clone(), "f.clap was not found".into()).unwrap();
+        let st = Command::SetPluginState { bus: BusRef::At(8), state: vec![7, 7] };
+        assert_eq!(e.handle(&st), Response::Ok, "kept for when the plugin is back");
+        for _ in 0..30 {
+            assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.0, "silent, not the dry signal");
+        }
+        let shown = e.bus_plugins();
+        assert_eq!(shown[0].status, PluginStatus::Failed("f.clap was not found".into()));
+        assert_eq!(e.plugin_snapshot(b), Some((info, Some(vec![7, 7]))));
+        let set = Command::SetParam { bus: BusRef::Id(b), param: 1, value: -9.0 };
+        assert_eq!(e.handle(&set), Response::Ok, "kept for when the plugin is back");
+        let cmds = e.plugin_commands();
+        assert!(cmds.contains(&set_param_at(8, 1, -9.0)), "{cmds:?}");
+    }
+
+    #[test]
+    fn a_plugin_that_fails_while_processing_shows_as_faulted() {
+        let (mut e, mut a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        let bad = Box::new(Counter { fail: 1, gain: 1.0, ..Counter::default() });
+        e.set_plugin(b, Some((fake(), bad))).unwrap();
+        block(&mut e, &mut a, 1.0, 3);
+        assert_eq!(e.bus_plugins()[0].status, PluginStatus::Faulted);
+        e.set_plugin(b, Some((fake(), halves()))).unwrap();
+        block(&mut e, &mut a, 1.0, 3);
+        assert_eq!(e.bus_plugins()[0].status, PluginStatus::Running, "loading again clears it");
+    }
+
+    fn set_param_at(at: u32, param: u32, value: f64) -> Command {
+        Command::SetParam { bus: BusRef::At(at), param, value }
+    }
+
+    /// Saves a fixed state, whatever its values: like a plugin whose state was
+    /// read before the audio side applied the latest values.
+    struct StaleState(FakePlugin, Option<Vec<u8>>);
+
+    impl PluginControl for StaleState {
+        fn info(&self) -> PluginInfo {
+            self.0.info()
+        }
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn params(&self) -> Vec<ParamState> {
+            self.0.params()
+        }
+        fn set_param(&mut self, id: u32, value: f64) -> Result<(), String> {
+            self.0.set_param(id, value)
+        }
+        fn poll(&mut self) -> bool {
+            false
+        }
+        fn save_state(&mut self) -> Result<Vec<u8>, String> {
+            self.1.clone().ok_or_else(|| "this plugin cannot save its state".to_string())
+        }
+        fn load_state(&mut self, _state: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn stale(state: Option<Vec<u8>>) -> Box<dyn PluginControl> {
+        Box::new(StaleState(FakePlugin { gain: 0.0, state: Arc::new(Mutex::new(Vec::new())) }, state))
+    }
+
+    #[test]
+    fn a_plugins_values_are_saved_after_its_state() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        e.set_plugin(b, Some((stale(Some(b"old".to_vec())), halves()))).unwrap();
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: -6.0 });
+        let cmds = e.plugin_commands();
+        let load = Command::LoadPlugin { bus: BusRef::At(8), path: "f.clap".into(), plugin_id: "fake".into() };
+        let state = Command::SetPluginState { bus: BusRef::At(8), state: b"old".to_vec() };
+        assert_eq!(cmds, vec![load, state, set_param_at(8, 1, -6.0)], "values win over a stale state");
+    }
+
+    #[test]
+    fn a_plugin_without_a_state_still_has_its_values_saved() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        e.set_plugin(b, Some((stale(None), halves()))).unwrap();
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: -3.0 });
+        let cmds = e.plugin_commands();
+        assert!(cmds.contains(&set_param_at(8, 1, -3.0)), "{cmds:?}");
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SetPluginState { .. })));
+    }
+
+    #[test]
+    fn a_state_too_large_to_save_is_reported_and_its_values_are_kept() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        let huge = vec![0u8; confluence_api::MAX_FRAME_BYTES as usize];
+        e.set_plugin(b, Some((stale(Some(huge)), halves()))).unwrap();
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: -1.0 });
+        let cmds = e.plugin_commands();
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SetPluginState { .. })), "too large for the journal");
+        assert!(cmds.contains(&set_param_at(8, 1, -1.0)));
+        let notices = e.plugin_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("Fake") && notices[0].contains("too large to save"), "{notices:?}");
+        e.set_plugin(b, Some((stale(Some(vec![1])), halves()))).unwrap();
+        e.plugin_commands();
+        assert!(e.plugin_notices().is_empty(), "cleared once it fits");
+    }
+
+    #[test]
+    fn only_buses_take_processors() {
+        let (mut e, _a) = small();
+        let (id, _) = e.add_soft_input(&spec("in", 2)).unwrap();
+        assert_eq!(e.set_bus_processor(id, None), Err(EngineError::NotABus(id)));
+        assert_eq!(EngineError::NotABus(7).to_string(), "slot 7 is not an insert bus");
     }
 
     #[test]
@@ -1003,7 +1616,7 @@ mod tests {
         }
         let Response::Health { slots, .. } = e.handle(&Command::Health) else { panic!() };
         let h = slots.iter().find(|h| h.id == b).expect("a bus reports health");
-        assert!(h.device_faults >= 3, "{h:?}");
+        assert_eq!(h.device_faults, 1, "a fault stops the processor: one panic, not one per block ({h:?})");
     }
 
     /// A NaN gain never equals itself: it would look changed in every state

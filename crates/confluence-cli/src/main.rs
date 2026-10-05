@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use confluence_api::{Change, Command, DeviceKind, EngineStatus, Event, Response};
+use confluence_api::{BusRef, Change, Command, DeviceKind, EngineStatus, Event, Response};
 
 #[derive(Parser)]
 #[command(version, about = "Control a running Confluence engine")]
@@ -47,6 +47,19 @@ enum Cmd {
     RemoveSlot { id: u32 },
     /// Create an insert bus (send columns + return rows) of CHANNELS channels.
     AddBus { name: String, channels: u32 },
+    /// List the CLAP plugins found on this PC.
+    Plugins,
+    /// Load plugin ID from the CLAP file PATH onto insert bus BUS (a slot id).
+    LoadPlugin { bus: u32, path: String, id: String },
+    /// Take the plugin off insert bus BUS.
+    UnloadPlugin { bus: u32 },
+    /// Set parameter PARAM of the plugin on insert bus BUS.
+    SetParam {
+        bus: u32,
+        param: u32,
+        #[arg(allow_negative_numbers = true)]
+        value: f64,
+    },
     /// Show the engine's master clock, rate, block, DSP load and xruns.
     Status,
     /// Follow every change to routes, slots and devices live, with a status line each second.
@@ -93,6 +106,12 @@ impl Cmd {
             Cmd::AddBus { ref name, channels } => {
                 Command::AddBus { name: name.clone(), channels, first_input: None, first_output: None }
             }
+            Cmd::Plugins => Command::ListPlugins,
+            Cmd::LoadPlugin { bus, ref path, ref id } => {
+                Command::LoadPlugin { bus: BusRef::Id(bus), path: path.clone(), plugin_id: id.clone() }
+            }
+            Cmd::UnloadPlugin { bus } => Command::UnloadPlugin { bus: BusRef::Id(bus) },
+            Cmd::SetParam { bus, param, value } => Command::SetParam { bus: BusRef::Id(bus), param, value },
             Cmd::Status => Command::Status,
             Cmd::Watch => Command::Subscribe,
         }
@@ -102,6 +121,12 @@ impl Cmd {
 fn render(resp: &Response) -> String {
     match resp {
         Response::Ok => "ok".into(),
+        Response::Plugins(p) if p.is_empty() => "no CLAP plugins found".into(),
+        Response::Plugins(p) => p
+            .iter()
+            .map(|p| format!("{} ({}) {}  {}  {}", p.name, p.vendor, p.version, p.id, p.path))
+            .collect::<Vec<_>>()
+            .join("\n"),
         Response::Error(e) => format!("error: {e}"),
         Response::Points(points) if points.is_empty() => "no routes".into(),
         Response::Points(points) => points
@@ -234,6 +259,12 @@ fn render_change(c: &Change) -> String {
         Change::DevicesChanged(d) => format!("{} devices available", d.len()),
         Change::NoticesChanged(n) if n.is_empty() => "notices: none".into(),
         Change::NoticesChanged(n) => format!("notices: {}", n.join("; ")),
+        Change::PluginsChanged(found, bad) => {
+            format!("{} plugins found, {} failed the load check", found.len(), bad.len())
+        }
+        Change::BusPluginSet(p) => format!("bus #{}: {} {:?}", p.bus, p.info.name, p.status),
+        Change::BusPluginRemoved { bus } => format!("bus #{bus}: plugin removed"),
+        Change::ParamChanged { bus, id, text, .. } => format!("bus #{bus}: parameter {id} = {text}"),
     }
 }
 
@@ -345,6 +376,25 @@ v7  slot #3 removed"
     fn add_device_vaio_parses() {
         let cli = Cli::try_parse_from(["confluence-cli", "add-device", "vaio", "1"]).unwrap();
         assert_eq!(cli.command.to_command(), Command::AddDevice { kind: DeviceKind::Vaio, name: "1".into() });
+    }
+
+    #[test]
+    fn plugin_commands_parse() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["confluence-cli"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all).unwrap().command.to_command()
+        };
+        assert_eq!(parse(&["plugins"]), Command::ListPlugins);
+        assert_eq!(
+            parse(&["load-plugin", "4", "C:\\x.clap", "dev.x"]),
+            Command::LoadPlugin { bus: BusRef::Id(4), path: "C:\\x.clap".into(), plugin_id: "dev.x".into() }
+        );
+        assert_eq!(parse(&["unload-plugin", "4"]), Command::UnloadPlugin { bus: BusRef::Id(4) });
+        assert_eq!(
+            parse(&["set-param", "4", "1", "-6.5"]),
+            Command::SetParam { bus: BusRef::Id(4), param: 1, value: -6.5 }
+        );
     }
 
     #[test]

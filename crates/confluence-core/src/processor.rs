@@ -1,11 +1,25 @@
 //! What an insert bus runs between its sends and its returns.
 
+use std::any::Any;
+
 use crate::buffer::PlanarBuffer;
+
+/// A processor failed this block (its bus goes silent and stops calling it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessError;
 
 /// The real-time half of a bus's processing. `process` is called once per
 /// block on the audio thread and must not allocate, lock or block.
-pub trait Processor: Send {
-    fn process(&mut self, io: BusIo<'_>);
+///
+/// `Any` lets the owner that created a processor take it back as its own type
+/// once the audio side returns it (e.g. to deactivate a plugin on its thread).
+pub trait Processor: Any + Send {
+    /// Sends → returns for one block. `Err` is a processing error: the bus
+    /// goes silent and stops calling this processor.
+    fn process(&mut self, io: BusIo<'_>) -> Result<(), ProcessError>;
+
+    /// Called on the audio thread when the processor is taken off its bus.
+    fn stop(&mut self) {}
 }
 
 /// A bus's send channels (read) and return channels (written) for one block.

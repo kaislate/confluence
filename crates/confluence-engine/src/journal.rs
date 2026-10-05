@@ -21,6 +21,29 @@ fn record(id: u32, cmd: &Command) -> Envelope<Command> {
     Envelope { version: JOURNAL_VERSION, id, body: cmd.clone() }
 }
 
+/// Drops every `SetParam` that a later `SetParam` for the same bus and
+/// parameter overrides, before replay: a long drag leaves hundreds of records,
+/// and replayed values queue for the plugin's audio side, which does not run
+/// yet. Edits are not moved across a (re)load or a state load of their bus, nor
+/// across buses being added or removed.
+pub fn collapse_params(cmds: Vec<Command>) -> Vec<Command> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(confluence_api::BusRef, u32)> = HashSet::new();
+    let mut keep = vec![true; cmds.len()];
+    for (i, c) in cmds.iter().enumerate().rev() {
+        match c {
+            // A later edit of the same parameter was already seen: this one is overridden.
+            Command::SetParam { bus, param, .. } if !seen.insert((*bus, *param)) => keep[i] = false,
+            Command::LoadPlugin { bus, .. } | Command::UnloadPlugin { bus } | Command::SetPluginState { bus, .. } => {
+                seen.retain(|(b, _)| b != bus);
+            }
+            Command::AddBus { .. } | Command::RemoveSlot { .. } => seen.clear(),
+            _ => {}
+        }
+    }
+    cmds.into_iter().zip(keep).filter_map(|(c, k)| k.then_some(c)).collect()
+}
+
 pub struct Journal {
     path: PathBuf,
     file: File,
@@ -119,6 +142,28 @@ mod tests {
 
     /// Existing users' journals were written with protocol version 1: they
     /// must replay after the bump, not be judged corrupt and truncated.
+    #[test]
+    fn runs_of_parameter_edits_collapse_to_their_last_value() {
+        use confluence_api::BusRef;
+        let p = |at, param, value| Command::SetParam { bus: BusRef::At(at), param, value };
+        let load = |at| Command::LoadPlugin { bus: BusRef::At(at), path: "x.clap".into(), plugin_id: "x".into() };
+        let cmds = vec![
+            load(8),
+            p(8, 1, -1.0),
+            p(8, 2, 0.5),
+            p(8, 1, -2.0),
+            p(4, 1, -7.0), // another bus: its own run
+            p(8, 1, -3.0),
+            load(8), // a reload: edits before it stay before it
+            p(8, 1, -4.0),
+            p(8, 1, -5.0),
+        ];
+        assert_eq!(
+            collapse_params(cmds),
+            vec![load(8), p(8, 2, 0.5), p(4, 1, -7.0), p(8, 1, -3.0), load(8), p(8, 1, -5.0)]
+        );
+    }
+
     #[test]
     fn a_version_1_journal_still_replays() {
         let dir = tempfile::tempdir().unwrap();
