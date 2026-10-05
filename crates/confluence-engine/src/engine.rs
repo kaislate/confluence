@@ -21,6 +21,7 @@ use confluence_core::processor::Processor;
 
 use crate::alloc::ChannelAllocator;
 
+mod midi_map;
 mod scenes;
 use crate::audio::{
     AudioEngine, AudioMsg, BusEntry, InputEntry, LoadMeter, OutputEntry, Returned, StrictEntry, StrictSide, MAX_BUSES,
@@ -92,6 +93,12 @@ pub enum EngineError {
     MorphTime,
     #[error("no scene named {0}")]
     NoScene(String),
+    #[error("no route from input {0} to output {1}")]
+    NoRoute(u32, u32),
+    #[error("no MIDI binding for CC {2} on channel {1} of {0}")]
+    NoMidiBinding(String, u8, u8),
+    #[error("MIDI messages are 1 to 3 bytes")]
+    MidiLength,
 }
 
 /// The engine's handle on the plugin of an insert bus (its audio side runs as
@@ -275,6 +282,8 @@ pub struct Engine {
     plugin_notices: std::collections::BTreeMap<u32, String>,
     /// Scenes and the running morph.
     scenes: scenes::Scenes,
+    /// MIDI bindings and learn.
+    midi: midi_map::Midi,
     /// Editor changes not saved yet, by (send column, param).
     edits_held: std::collections::BTreeMap<(u32, u32), f64>,
     /// When each (send column, param) was last saved.
@@ -335,6 +344,7 @@ impl Engine {
             plugin_notices: std::collections::BTreeMap::new(),
             edits_held: std::collections::BTreeMap::new(),
             scenes: scenes::Scenes::default(),
+            midi: midi_map::Midi::default(),
             edits_saved: std::collections::HashMap::new(),
             blocks,
             master_ppm,
@@ -1103,7 +1113,7 @@ impl Engine {
             | Command::CancelMidiLearn
             | Command::SetMidiBinding { .. }
             | Command::RemoveMidiBinding { .. }
-            | Command::InjectMidi { .. } => Response::Error("MIDI is not available yet".into()),
+            | Command::InjectMidi { .. } => self.midi_command(cmd),
             Command::SaveScene { .. }
             | Command::PutScene { .. }
             | Command::DeleteScene { .. }
@@ -2221,6 +2231,116 @@ mod tests {
         e.advance_morph(t0 + Duration::from_millis(500)); // 0→2 at −50, unmuted
         e.recall_scene_at("B", t0 + Duration::from_millis(500), false).unwrap();
         assert_eq!(level(&mut e, 0, 2), (0.0, true), "finished where A was taking it, not left at −50");
+    }
+
+    fn cc(device: &str, channel: u8, cc: u8, value: u8) -> crate::midi::MidiEvent {
+        crate::midi::MidiEvent { device: device.into(), bytes: vec![0xB0 | (channel - 1), cc, value] }
+    }
+
+    fn binding(device: &str, channel: u8, cc: u8, input: u32, output: u32) -> confluence_api::MidiBinding {
+        confluence_api::MidiBinding { device: device.into(), channel, cc, input, output }
+    }
+
+    #[test]
+    fn midi_learn_binds_the_next_control_moved() {
+        let (mut e, _a) = small();
+        assert_eq!(
+            e.handle(&Command::LearnMidi { input: 0, output: 1 }),
+            Response::Error("no route from input 0 to output 1".into())
+        );
+        set(&mut e, 0, 1, -6.0, false);
+        assert_eq!(e.handle(&Command::LearnMidi { input: 0, output: 1 }), Response::Ok);
+        assert_eq!(e.midi_learning(), Some((0, 1)));
+        assert!(
+            e.midi_event(&crate::midi::MidiEvent { device: "Pad".into(), bytes: vec![0x90, 60, 100] }).is_empty(),
+            "a note does not bind"
+        );
+        let recorded = e.midi_event(&cc("Pad", 2, 7, 90));
+        assert_eq!(recorded, vec![Command::SetMidiBinding { binding: binding("Pad", 2, 7, 0, 1) }]);
+        assert_eq!(e.midi_learning(), None);
+        assert_eq!(e.midi_bindings(), [binding("Pad", 2, 7, 0, 1)]);
+        assert_eq!(level(&mut e, 0, 1), (-6.0, false), "binding does not move the gain");
+    }
+
+    #[test]
+    fn a_bound_control_sets_the_gain_through_the_fader_taper() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, -6.0, false);
+        e.set_midi_binding(binding("Pad", 1, 7, 0, 1));
+        let recorded = e.midi_event(&cc("Pad", 1, 7, 127));
+        assert_eq!(level(&mut e, 0, 1), (12.0, false));
+        assert_eq!(
+            recorded,
+            vec![Command::SetPoint { input: 0, output: 1, gain_db: 12.0, mute: false, invert: false }]
+        );
+        e.midi_event(&cc("Pad", 1, 7, 0));
+        assert_eq!(level(&mut e, 0, 1).0, -100.0, "the bottom is silence");
+        set(&mut e, 0, 1, -6.0, true);
+        e.midi_event(&cc("Pad", 1, 7, 64));
+        assert!(level(&mut e, 0, 1).1, "mute is kept");
+        assert!(e.midi_event(&cc("Pad", 2, 7, 64)).is_empty(), "another channel");
+        assert!(e.midi_event(&cc("Keys", 1, 7, 64)).is_empty(), "another device");
+        assert!(e.midi_event(&cc("Pad", 1, 8, 64)).is_empty(), "another control");
+        for v in [10, 40, 90, 100] {
+            e.midi_event(&cc("Pad", 1, 7, v));
+        }
+        assert_eq!(level(&mut e, 0, 1).0, confluence_api::taper::cc_to_db(100), "the last value wins");
+    }
+
+    #[test]
+    fn feedback_follows_other_changes_but_does_not_echo_the_control() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, 0.0, false);
+        e.set_midi_binding(binding("Pad", 3, 7, 0, 1));
+        let first = e.midi_feedback();
+        let v0 = confluence_api::taper::db_to_cc(0.0, false);
+        assert_eq!(first, vec![("Pad".to_string(), [0xB2, 7, v0])], "the control is brought in line at once");
+        assert!(e.midi_feedback().is_empty(), "nothing new");
+        e.midi_event(&cc("Pad", 3, 7, 50));
+        assert!(e.midi_feedback().is_empty(), "the control's own value is not sent back");
+        set(&mut e, 0, 1, -20.0, false);
+        let v = confluence_api::taper::db_to_cc(-20.0, false);
+        assert_eq!(e.midi_feedback(), vec![("Pad".to_string(), [0xB2, 7, v])]);
+        set(&mut e, 0, 1, -20.0, true);
+        assert_eq!(e.midi_feedback(), vec![("Pad".to_string(), [0xB2, 7, 0])], "muted shows as the bottom");
+    }
+
+    #[test]
+    fn bindings_are_replaced_removed_and_wait_for_their_route() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, 0.0, false);
+        set(&mut e, 0, 2, 0.0, false);
+        e.set_midi_binding(binding("Pad", 1, 7, 0, 1));
+        e.set_midi_binding(binding("Pad", 1, 7, 0, 2));
+        assert_eq!(e.midi_bindings(), [binding("Pad", 1, 7, 0, 2)], "one binding per control");
+        e.handle(&Command::RemovePoint { input: 0, output: 2 });
+        assert!(e.midi_event(&cc("Pad", 1, 7, 100)).is_empty(), "its route is gone: nothing happens");
+        assert!(e.midi_feedback().is_empty());
+        set(&mut e, 0, 2, 0.0, false);
+        e.midi_event(&cc("Pad", 1, 7, 127));
+        assert_eq!(level(&mut e, 0, 2).0, 12.0, "back with its route");
+        let rm = Command::RemoveMidiBinding { device: "Pad".into(), channel: 1, cc: 7 };
+        assert_eq!(e.handle(&rm), Response::Ok);
+        assert!(e.midi_bindings().is_empty());
+        assert_eq!(e.handle(&rm), Response::Error("no MIDI binding for CC 7 on channel 1 of Pad".into()));
+        let bad = Command::InjectMidi { device: "Pad".into(), bytes: vec![] };
+        assert_eq!(e.handle(&bad), Response::Error("MIDI messages are 1 to 3 bytes".into()));
+    }
+
+    #[test]
+    fn a_control_moved_during_a_morph_wins() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, -40.0, false);
+        save(&mut e, "Q", 1000);
+        set(&mut e, 0, 1, 0.0, false);
+        e.set_midi_binding(binding("Pad", 1, 7, 0, 1));
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("Q", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(300));
+        e.midi_event(&cc("Pad", 1, 7, 127));
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        assert_eq!(level(&mut e, 0, 1).0, 12.0);
+        assert_eq!(e.current_scene(), None);
     }
 
     #[test]
