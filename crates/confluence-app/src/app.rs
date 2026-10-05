@@ -175,6 +175,12 @@ pub struct ConfluenceApp {
     unroute: DeferredUnroute,
     devices_open: bool,
     devices: crate::devices::DevicesState,
+    /// The plugin picker, while open.
+    picker: Option<crate::plugins::Picker>,
+    /// Parameter values sent and not yet confirmed: (bus, param) → value.
+    param_pending: HashMap<(u32, u32), f64>,
+    /// A bus whose plugin is being loaded.
+    plugin_loading: Option<u32>,
 }
 
 impl ConfluenceApp {
@@ -226,6 +232,9 @@ impl ConfluenceApp {
             unroute: DeferredUnroute::default(),
             devices_open: false,
             devices: crate::devices::DevicesState::default(),
+            picker: None,
+            param_pending: HashMap::new(),
+            plugin_loading: None,
         }
     }
 
@@ -244,6 +253,13 @@ impl ConfluenceApp {
     }
 
     fn send(&mut self, edit: Edit) {
+        match edit {
+            Edit::SetParam { bus, param, value } => {
+                self.param_pending.insert((bus, param), value);
+            }
+            Edit::LoadPlugin { bus, .. } => self.plugin_loading = Some(bus),
+            _ => {}
+        }
         self.pending.sent(&edit);
         self.worker.send(edit);
     }
@@ -262,7 +278,23 @@ impl ConfluenceApp {
         }
     }
 
+    /// A parameter's value is shown from the engine again once its edit is
+    /// answered (unless a newer one is already on its way).
+    fn param_answered(&mut self, edit: &Edit) {
+        if let Edit::SetParam { bus, param, value } = edit {
+            if self.param_pending.get(&(*bus, *param)) == Some(value) {
+                self.param_pending.remove(&(*bus, *param));
+            }
+        }
+        if let Edit::LoadPlugin { bus, .. } = edit {
+            if self.plugin_loading == Some(*bus) {
+                self.plugin_loading = None;
+            }
+        }
+    }
+
     fn on_done(&mut self, edit: &Edit, ids: &[u32], now: Instant) {
+        self.param_answered(edit);
         if let Edit::AddBus { name, .. } = edit {
             self.devices.adding_bus = false;
             self.devices.bus_name.clear();
@@ -282,6 +314,7 @@ impl ConfluenceApp {
     }
 
     fn on_failed(&mut self, edit: &Edit, _now: Instant) {
+        self.param_answered(edit);
         if let Edit::AddBus { .. } = edit {
             self.devices.adding_bus = false;
         }
@@ -480,7 +513,18 @@ impl ConfluenceApp {
                 look.paint_surface(ui.painter(), ui.max_rect(), "panel", look.skin.colors.panel);
                 egui::ScrollArea::vertical()
                     .show(ui, |ui| {
-                        crate::inspector::show(ui, view, look, &selection, point, history.as_ref(), editable)
+                        let plugin_ui =
+                            crate::inspector::PluginUi { pending: &self.param_pending, loading: self.plugin_loading };
+                        crate::inspector::show(
+                            ui,
+                            view,
+                            look,
+                            &selection,
+                            point,
+                            history.as_ref(),
+                            editable,
+                            &plugin_ui,
+                        )
                     })
                     .inner
             })
@@ -489,11 +533,24 @@ impl ConfluenceApp {
             match a {
                 crate::inspector::Action::Edit(e) => self.send(e),
                 crate::inspector::Action::RemoveSlot(id) => self.confirm_remove = Some(id),
+                crate::inspector::Action::PickPlugin(bus) => {
+                    self.picker = Some(crate::plugins::Picker { bus, filter: String::new() })
+                }
             }
         }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
+        if let (Some(picker), Some(state)) = (self.picker.as_mut(), view.state.as_ref()) {
+            match crate::plugins::show(ctx, state, picker) {
+                Some(crate::plugins::Choice::Load(edit)) => {
+                    self.picker = None;
+                    self.send(edit);
+                }
+                Some(crate::plugins::Choice::Close) => self.picker = None,
+                None => {}
+            }
+        }
         let Some(id) = self.confirm_remove else { return };
         let Some(state) = &view.state else { return };
         let Some(slot) = state.slots.iter().find(|s| s.id == id) else {

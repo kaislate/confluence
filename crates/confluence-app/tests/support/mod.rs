@@ -38,7 +38,24 @@ impl EngineDir {
             self.dir.path().join("journal.bin").display().to_string(),
             "--devices".into(),
             self.dir.path().join("devices.json").display().to_string(),
+            // Never the user's own plugins: only what a test puts in this folder.
+            "--clap-path".into(),
+            self.clap_dir().display().to_string(),
         ]
+    }
+
+    /// This test's plugin folder (created on first use).
+    pub fn clap_dir(&self) -> PathBuf {
+        let d = self.dir.path().join("clap");
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    /// Puts the test plugin file (`cargo build --workspace` builds it) in the plugin folder.
+    pub fn add_test_plugin(&self) {
+        let dll = engine_exe().parent().unwrap().join("confluence_test_plugin.dll");
+        assert!(dll.is_file(), "{} is missing: run `cargo build --workspace` first", dll.display());
+        std::fs::copy(dll, self.clap_dir().join("ConfluenceTest.clap")).unwrap();
     }
 }
 
