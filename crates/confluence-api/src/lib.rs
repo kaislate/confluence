@@ -10,7 +10,7 @@ pub mod taper;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 6;
+pub const API_VERSION: u16 = 7;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -140,6 +140,38 @@ pub enum Command {
         device: String,
         bytes: Vec<u8>,
     },
+    /// Stores a Luau script (replacing one with that name) and (re)starts it if enabled.
+    SetScript {
+        name: String,
+        source: String,
+        enabled: bool,
+    },
+    DeleteScript {
+        name: String,
+    },
+}
+
+/// Largest script source accepted.
+pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScriptStatus {
+    Running,
+    /// It failed to load, raised an error or ran out of time; saving or
+    /// enabling it again starts it.
+    Stopped(String),
+    Disabled,
+}
+
+/// A Luau script as clients see it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptInfo {
+    pub name: String,
+    pub source: String,
+    pub enabled: bool,
+    pub status: ScriptStatus,
+    /// Its last log lines (`confluence.log`, `print`), oldest first.
+    pub log: Vec<String>,
 }
 
 /// A hardware control (a CC on a channel of a MIDI input) bound to a route's gain.
@@ -212,6 +244,8 @@ impl Command {
                 | Command::RecallScene { .. }
                 | Command::SetMidiBinding { .. }
                 | Command::RemoveMidiBinding { .. }
+                | Command::SetScript { .. }
+                | Command::DeleteScript { .. }
         )
     }
 }
@@ -473,6 +507,8 @@ pub struct State {
     pub midi_bindings: Vec<MidiBinding>,
     /// The route waiting for a control to be moved (MIDI Learn).
     pub midi_learning: Option<(u32, u32)>,
+    /// Luau scripts, sorted by name.
+    pub scripts: Vec<ScriptInfo>,
 }
 
 /// One difference between two published states.
@@ -503,6 +539,7 @@ pub enum Change {
     ScenesChanged(Vec<SceneInfo>, Option<String>, bool),
     /// MIDI inputs, bindings, and the route being learned.
     MidiChanged(Vec<String>, Vec<MidiBinding>, Option<(u32, u32)>),
+    ScriptsChanged(Vec<ScriptInfo>),
     /// Only a parameter's value (and its text) changed.
     ParamChanged {
         bus: u32,
@@ -635,6 +672,8 @@ mod tests {
             },
             Command::RemoveMidiBinding { device: "nanoKONTROL2".into(), channel: 1, cc: 7 },
             Command::InjectMidi { device: "nanoKONTROL2".into(), bytes: vec![0xB0, 7, 100] },
+            Command::SetScript { name: "mute".into(), source: "-- hi".into(), enabled: true },
+            Command::DeleteScript { name: "mute".into() },
         ];
         for (n, c) in cmds.iter().enumerate() {
             assert_eq!(first(c), 11 + n as u8, "{c:?}");
@@ -647,7 +686,11 @@ mod tests {
         assert!(cmds[8..13].iter().all(Command::is_mutation), "scene commands are saved");
         assert!(!cmds[13].is_mutation(), "listing is not");
         let saved: Vec<bool> = cmds[14..].iter().map(Command::is_mutation).collect();
-        assert_eq!(saved, [false, false, true, true, false], "learn/cancel/inject are not saved; bindings are");
+        assert_eq!(
+            saved,
+            [false, false, true, true, false, true, true],
+            "learn/cancel/inject not saved; bindings, scripts are"
+        );
     }
 
     #[test]

@@ -72,6 +72,17 @@ enum Cmd {
     DeleteScene { name: String },
     /// Show MIDI inputs and bindings.
     Midi,
+    /// List the Luau scripts and their status.
+    Scripts,
+    /// Store the Luau script in FILE as NAME (and start it, unless --disabled).
+    SetScript {
+        name: String,
+        file: std::path::PathBuf,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Delete script NAME.
+    DeleteScript { name: String },
     /// The next CC that arrives binds to the gain of route IN → OUT.
     LearnMidi { input: u32, output: u32 },
     /// Handle a MIDI message as if DEVICE sent it (bytes in decimal or 0x hex).
@@ -145,7 +156,12 @@ impl Cmd {
             }
             Cmd::RecallScene { ref name } => Command::RecallScene { name: name.clone() },
             Cmd::DeleteScene { ref name } => Command::DeleteScene { name: name.clone() },
-            Cmd::Midi => Command::Subscribe,
+            Cmd::Midi | Cmd::Scripts => Command::Subscribe,
+            // Reads a file: see `script_command`.
+            Cmd::SetScript { ref name, .. } => {
+                Command::SetScript { name: name.clone(), source: String::new(), enabled: false }
+            }
+            Cmd::DeleteScript { ref name } => Command::DeleteScript { name: name.clone() },
             Cmd::LearnMidi { input, output } => Command::LearnMidi { input, output },
             Cmd::InjectMidi { ref device, ref bytes } => {
                 Command::InjectMidi { device: device.clone(), bytes: bytes.clone() }
@@ -156,6 +172,36 @@ impl Cmd {
             Cmd::Watch => Command::Subscribe,
         }
     }
+}
+
+/// `set-script`: the command with the file's contents.
+fn script_command(cmd: &Cmd) -> Result<Command, String> {
+    match cmd {
+        Cmd::SetScript { name, file, disabled } => {
+            let source = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+            Ok(Command::SetScript { name: name.clone(), source, enabled: !disabled })
+        }
+        other => Ok(other.to_command()),
+    }
+}
+
+/// Scripts and their status, from a state snapshot.
+fn render_scripts(s: &confluence_api::State) -> String {
+    if s.scripts.is_empty() {
+        return "no scripts".into();
+    }
+    s.scripts
+        .iter()
+        .map(|sc| {
+            let status = match &sc.status {
+                confluence_api::ScriptStatus::Running => "running".to_string(),
+                confluence_api::ScriptStatus::Disabled => "disabled".to_string(),
+                confluence_api::ScriptStatus::Stopped(why) => format!("stopped: {why}"),
+            };
+            format!("{}  {status}", sc.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// MIDI inputs, bindings and learn, from a state snapshot.
@@ -296,9 +342,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match client.call(cli.command.to_command()) {
+    let command = match script_command(&cli.command) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match client.call(command) {
         Ok(Response::Snapshot(s)) if matches!(cli.command, Cmd::Midi) => {
             println!("{}", render_midi(&s));
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Snapshot(s)) if matches!(cli.command, Cmd::Scripts) => {
+            println!("{}", render_scripts(&s));
             ExitCode::SUCCESS
         }
         Ok(resp) => {
@@ -356,6 +413,7 @@ fn render_change(c: &Change) -> String {
             bindings.len(),
             learning.map(|(i, o)| format!(", learning {i} -> {o}")).unwrap_or_default()
         ),
+        Change::ScriptsChanged(s) => format!("{} scripts", s.len()),
         Change::ScenesChanged(s, current, morphing) => format!(
             "{} scenes, current: {}{}",
             s.len(),
@@ -507,12 +565,27 @@ v7  slot #3 removed"
                 output: 4,
             }],
             midi_learning: None,
+            scripts: Vec::new(),
         };
         let text = render_midi(&st);
         assert!(text.contains("nanoKONTROL2"), "{text}");
         assert!(text.contains("CC 7 ch 1 nanoKONTROL2 -> in 3 out 4"), "{text}");
         st.midi_learning = Some((3, 4));
         assert!(render_midi(&st).contains("learning: in 3 -> out 4"));
+    }
+
+    #[test]
+    fn set_script_reads_the_file() {
+        let dir = std::env::temp_dir().join(format!("confluence-cli-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("mute.luau");
+        std::fs::write(&file, "function on_midi(m) end").unwrap();
+        let cli = Cli::try_parse_from(["confluence-cli", "set-script", "mute", file.to_str().unwrap(), "--disabled"])
+            .unwrap();
+        assert_eq!(
+            script_command(&cli.command).unwrap(),
+            Command::SetScript { name: "mute".into(), source: "function on_midi(m) end".into(), enabled: false }
+        );
     }
 
     #[test]
@@ -538,6 +611,7 @@ v7  slot #3 removed"
         assert_eq!(parse(&["recall-scene", "Verse"]), Command::RecallScene { name: "Verse".into() });
         assert_eq!(parse(&["delete-scene", "Verse"]), Command::DeleteScene { name: "Verse".into() });
         assert_eq!(parse(&["learn-midi", "1", "2"]), Command::LearnMidi { input: 1, output: 2 });
+        assert_eq!(parse(&["delete-script", "mute"]), Command::DeleteScript { name: "mute".into() });
         assert_eq!(
             parse(&["inject-midi", "nanoKONTROL2", "0xB0", "7", "100"]),
             Command::InjectMidi { device: "nanoKONTROL2".into(), bytes: vec![0xB0, 7, 100] }

@@ -409,6 +409,7 @@ mod tests {
             midi_inputs: Vec::new(),
             midi_bindings: Vec::new(),
             midi_learning: None,
+            scripts: Vec::new(),
         }
     }
 

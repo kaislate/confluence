@@ -1109,6 +1109,9 @@ impl Engine {
                 Response::Error("subscriptions and status are served by the engine process".into())
             }
             Command::Shutdown => Response::Ok,
+            Command::SetScript { .. } | Command::DeleteScript { .. } => {
+                Response::Error("scripts are not available yet".into())
+            }
             Command::LearnMidi { .. }
             | Command::CancelMidiLearn
             | Command::SetMidiBinding { .. }
