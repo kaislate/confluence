@@ -9,7 +9,7 @@ mod state;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 4;
+pub const API_VERSION: u16 = 5;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -96,6 +96,59 @@ pub enum Command {
     HideEditor {
         bus: BusRef,
     },
+    /// Captures the current routes and plugin parameters as scene `name`
+    /// (replacing a scene of that name), with a morph time.
+    SaveScene {
+        name: String,
+        morph_ms: u32,
+    },
+    /// Stores a scene as given (the journal's form of `SaveScene`).
+    PutScene {
+        scene: Scene,
+    },
+    DeleteScene {
+        name: String,
+    },
+    SetSceneMorph {
+        name: String,
+        morph_ms: u32,
+    },
+    /// Glides to scene `name` over its morph time.
+    RecallScene {
+        name: String,
+    },
+    /// Replies `Scenes`.
+    ListScenes,
+}
+
+/// Most a morph can last.
+pub const MAX_MORPH_MS: u32 = 10_000;
+
+/// A saved mix: route values and plugin parameter values (parameter-only:
+/// recalling it creates or removes nothing).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Scene {
+    pub name: String,
+    pub morph_ms: u32,
+    pub points: Vec<PointState>,
+    pub params: Vec<SceneParam>,
+}
+
+/// One plugin parameter value in a scene; the bus is named by its first send column.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneParam {
+    pub bus_at: u32,
+    pub param: u32,
+    pub value: f64,
+}
+
+/// What clients see of a scene.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneInfo {
+    pub name: String,
+    pub morph_ms: u32,
+    pub routes: u32,
+    pub params: u32,
 }
 
 /// Which insert bus a command means.
@@ -118,6 +171,11 @@ impl Command {
                 | Command::UnloadPlugin { .. }
                 | Command::SetParam { .. }
                 | Command::SetPluginState { .. }
+                | Command::SaveScene { .. }
+                | Command::PutScene { .. }
+                | Command::DeleteScene { .. }
+                | Command::SetSceneMorph { .. }
+                | Command::RecallScene { .. }
         )
     }
 }
@@ -299,6 +357,9 @@ pub struct DeviceInfo {
     pub outputs: u32,
 }
 
+// A full `State` (a subscription's first reply) is much larger than the other
+// replies; replies are built once and moved rarely, so it is not boxed.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     Ok,
@@ -329,6 +390,7 @@ pub enum Response {
         version: u64,
     },
     Plugins(Vec<PluginInfo>),
+    Scenes(Vec<SceneInfo>),
 }
 
 /// Live engine numbers: in snapshots and in every telemetry event.
@@ -364,6 +426,12 @@ pub struct State {
     pub bad_plugins: Vec<(String, String)>,
     /// The plugin on each insert bus that has one, sorted by bus id.
     pub bus_plugins: Vec<LoadedPlugin>,
+    /// Scenes, in the order they were made.
+    pub scenes: Vec<SceneInfo>,
+    /// The scene last recalled, until something else changes the mix.
+    pub current_scene: Option<String>,
+    /// A recall is gliding to its scene.
+    pub morphing: bool,
 }
 
 /// One difference between two published states.
@@ -390,6 +458,8 @@ pub enum Change {
     BusPluginRemoved {
         bus: u32,
     },
+    /// The scenes, the current one, and whether a morph runs.
+    ScenesChanged(Vec<SceneInfo>, Option<String>, bool),
     /// Only a parameter's value (and its text) changed.
     ParamChanged {
         bus: u32,
@@ -502,6 +572,18 @@ mod tests {
             Command::SetPluginState { bus: BusRef::At(8), state: vec![1, 2, 3] },
             Command::ShowEditor { bus },
             Command::HideEditor { bus },
+            Command::SaveScene { name: "Verse".into(), morph_ms: 500 },
+            Command::PutScene {
+                scene: Scene {
+                    name: "Verse".into(),
+                    morph_ms: 500,
+                    points: vec![PointState { input: 1, output: 2, gain_db: -3.0, mute: false, invert: false }],
+                    params: vec![SceneParam { bus_at: 8, param: 1, value: -6.0 }],
+                },
+            },
+            Command::DeleteScene { name: "Verse".into() },
+            Command::SetSceneMorph { name: "Verse".into(), morph_ms: 2000 },
+            Command::RecallScene { name: "Verse".into() },
         ];
         for (n, c) in cmds.iter().enumerate() {
             assert_eq!(first(c), 11 + n as u8, "{c:?}");
@@ -511,6 +593,7 @@ mod tests {
         assert!(cmds[2].is_mutation() && cmds[3].is_mutation() && cmds[4].is_mutation() && cmds[5].is_mutation());
         assert!(!cmds[1].is_mutation());
         assert!(!cmds[6].is_mutation() && !cmds[7].is_mutation(), "editors are not saved");
+        assert!(cmds[8..].iter().all(Command::is_mutation), "scene commands are saved");
     }
 
     #[test]

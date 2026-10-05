@@ -37,6 +37,9 @@ pub fn diff(old: &State, new: &State) -> Vec<Change> {
     if old.notices != new.notices {
         out.push(Change::NoticesChanged(new.notices.clone()));
     }
+    if old.scenes != new.scenes || old.current_scene != new.current_scene || old.morphing != new.morphing {
+        out.push(Change::ScenesChanged(new.scenes.clone(), new.current_scene.clone(), new.morphing));
+    }
     if old.plugins != new.plugins || old.bad_plugins != new.bad_plugins {
         out.push(Change::PluginsChanged(new.plugins.clone(), new.bad_plugins.clone()));
     }
@@ -99,6 +102,11 @@ impl State {
                 }
                 Change::DevicesChanged(d) => self.devices = d.clone(),
                 Change::NoticesChanged(n) => self.notices = n.clone(),
+                Change::ScenesChanged(scenes, current, morphing) => {
+                    self.scenes = scenes.clone();
+                    self.current_scene = current.clone();
+                    self.morphing = *morphing;
+                }
                 Change::PluginsChanged(found, bad) => {
                     self.plugins = found.clone();
                     self.bad_plugins = bad.clone();
@@ -167,6 +175,9 @@ mod tests {
             plugins: Vec::new(),
             bad_plugins: Vec::new(),
             bus_plugins: Vec::new(),
+            scenes: Vec::new(),
+            current_scene: None,
+            morphing: false,
         }
     }
 
@@ -197,6 +208,21 @@ mod tests {
                 read_only: false,
             }],
         }
+    }
+
+    #[test]
+    fn scene_changes_are_found_and_applied() {
+        let a = state(vec![slot(1, true)], vec![]);
+        let mut b = a.clone();
+        b.scenes = vec![crate::SceneInfo { name: "Verse".into(), morph_ms: 500, routes: 3, params: 1 }];
+        b.current_scene = Some("Verse".into());
+        b.morphing = true;
+        let changes = diff(&a, &b);
+        assert_eq!(changes, vec![Change::ScenesChanged(b.scenes.clone(), Some("Verse".into()), true)]);
+        let mut applied = a.clone();
+        applied.apply(&changes);
+        assert_eq!(applied, b);
+        assert!(diff(&b, &b).is_empty());
     }
 
     #[test]

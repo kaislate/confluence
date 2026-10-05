@@ -403,6 +403,9 @@ mod tests {
             plugins: Vec::new(),
             bad_plugins: Vec::new(),
             bus_plugins: Vec::new(),
+            scenes: Vec::new(),
+            current_scene: None,
+            morphing: false,
         }
     }
 

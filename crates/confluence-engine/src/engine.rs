@@ -1045,6 +1045,12 @@ impl Engine {
                 Response::Error("subscriptions and status are served by the engine process".into())
             }
             Command::Shutdown => Response::Ok,
+            Command::SaveScene { .. }
+            | Command::PutScene { .. }
+            | Command::DeleteScene { .. }
+            | Command::SetSceneMorph { .. }
+            | Command::RecallScene { .. }
+            | Command::ListScenes => Response::Error("scenes are not available yet".into()),
             Command::ListPlugins
             | Command::LoadPlugin { .. }
             | Command::UnloadPlugin { .. }
