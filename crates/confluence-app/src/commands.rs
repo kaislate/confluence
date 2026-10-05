@@ -39,6 +39,8 @@ pub enum Edit {
     LearnMidi { input: u32, output: u32 },
     CancelMidiLearn,
     RemoveMidiBinding { device: String, channel: u8, cc: u8 },
+    SetScript { name: String, source: String, enabled: bool },
+    DeleteScript { name: String },
 }
 
 /// What a merged, rate-limited edit is about.
@@ -71,6 +73,10 @@ impl Edit {
                 Command::RemoveMidiBinding { device: device.clone(), channel: *channel, cc: *cc }
             }
             Edit::DeleteScene { name } => Command::DeleteScene { name: name.clone() },
+            Edit::SetScript { name, source, enabled } => {
+                Command::SetScript { name: name.clone(), source: source.clone(), enabled: *enabled }
+            }
+            Edit::DeleteScript { name } => Command::DeleteScript { name: name.clone() },
             Edit::SetSceneMorph { name, morph_ms } => {
                 Command::SetSceneMorph { name: name.clone(), morph_ms: *morph_ms }
             }

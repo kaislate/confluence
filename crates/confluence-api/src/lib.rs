@@ -10,7 +10,7 @@ pub mod taper;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 6;
+pub const API_VERSION: u16 = 7;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -140,6 +140,64 @@ pub enum Command {
         device: String,
         bytes: Vec<u8>,
     },
+    /// Stores a Luau script (replacing one with that name) and (re)starts it if enabled.
+    SetScript {
+        name: String,
+        source: String,
+        enabled: bool,
+    },
+    DeleteScript {
+        name: String,
+    },
+}
+
+/// Largest script source accepted.
+pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+/// Largest total of all scripts' sources (state must fit a message).
+pub const MAX_SCRIPTS_BYTES: usize = 512 * 1024;
+/// Longest script name, in characters.
+pub const MAX_SCRIPT_NAME: usize = 64;
+
+/// Why a script can't be stored, if it can't: `others` is the size of every
+/// other script (not one it replaces).
+pub fn script_problem(name: &str, source: &str, others: usize) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Some("a script needs a name".into());
+    }
+    if name.chars().count() > MAX_SCRIPT_NAME {
+        return Some(format!("script names are at most {MAX_SCRIPT_NAME} characters"));
+    }
+    if name.chars().any(char::is_control) {
+        return Some("script names are one line of text".into());
+    }
+    if source.len() > MAX_SCRIPT_BYTES {
+        return Some("scripts are at most 256 KB".into());
+    }
+    if others + source.len() > MAX_SCRIPTS_BYTES {
+        return Some("all scripts together are at most 512 KB".into());
+    }
+    None
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScriptStatus {
+    Running,
+    /// It failed to load, raised an error or ran out of time; saving or
+    /// enabling it again starts it.
+    Stopped(String),
+    Disabled,
+}
+
+/// A Luau script as clients see it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptInfo {
+    pub name: String,
+    pub source: String,
+    pub enabled: bool,
+    pub status: ScriptStatus,
+    /// Its last log lines (`confluence.log`, `print`), oldest first.
+    pub log: Vec<String>,
 }
 
 /// A hardware control (a CC on a channel of a MIDI input) bound to a route's gain.
@@ -212,6 +270,8 @@ impl Command {
                 | Command::RecallScene { .. }
                 | Command::SetMidiBinding { .. }
                 | Command::RemoveMidiBinding { .. }
+                | Command::SetScript { .. }
+                | Command::DeleteScript { .. }
         )
     }
 }
@@ -473,6 +533,8 @@ pub struct State {
     pub midi_bindings: Vec<MidiBinding>,
     /// The route waiting for a control to be moved (MIDI Learn).
     pub midi_learning: Option<(u32, u32)>,
+    /// Luau scripts, sorted by name.
+    pub scripts: Vec<ScriptInfo>,
 }
 
 /// One difference between two published states.
@@ -503,6 +565,7 @@ pub enum Change {
     ScenesChanged(Vec<SceneInfo>, Option<String>, bool),
     /// MIDI inputs, bindings, and the route being learned.
     MidiChanged(Vec<String>, Vec<MidiBinding>, Option<(u32, u32)>),
+    ScriptsChanged(Vec<ScriptInfo>),
     /// Only a parameter's value (and its text) changed.
     ParamChanged {
         bus: u32,
@@ -635,6 +698,8 @@ mod tests {
             },
             Command::RemoveMidiBinding { device: "nanoKONTROL2".into(), channel: 1, cc: 7 },
             Command::InjectMidi { device: "nanoKONTROL2".into(), bytes: vec![0xB0, 7, 100] },
+            Command::SetScript { name: "mute".into(), source: "-- hi".into(), enabled: true },
+            Command::DeleteScript { name: "mute".into() },
         ];
         for (n, c) in cmds.iter().enumerate() {
             assert_eq!(first(c), 11 + n as u8, "{c:?}");
@@ -647,7 +712,11 @@ mod tests {
         assert!(cmds[8..13].iter().all(Command::is_mutation), "scene commands are saved");
         assert!(!cmds[13].is_mutation(), "listing is not");
         let saved: Vec<bool> = cmds[14..].iter().map(Command::is_mutation).collect();
-        assert_eq!(saved, [false, false, true, true, false], "learn/cancel/inject are not saved; bindings are");
+        assert_eq!(
+            saved,
+            [false, false, true, true, false, true, true],
+            "learn/cancel/inject not saved; bindings, scripts are"
+        );
     }
 
     #[test]
@@ -723,5 +792,27 @@ mod tests {
         write_frame(&mut wire, &Envelope::new(1, Command::ListSlots)).unwrap();
         wire.truncate(wire.len() - 1);
         assert!(read_frame::<_, Envelope<Command>>(&mut &wire[..]).is_err());
+    }
+
+    #[test]
+    fn scripts_are_checked_against_the_limits() {
+        assert_eq!(script_problem("a", "", 0), None);
+        assert_eq!(script_problem(" ", "", 0), Some("a script needs a name".into()));
+        assert_eq!(script_problem(&"n".repeat(65), "", 0), Some("script names are at most 64 characters".into()));
+        assert_eq!(
+            script_problem(
+                "a
+b", "", 0
+            ),
+            Some("script names are one line of text".into())
+        );
+        let big = "-".repeat(MAX_SCRIPT_BYTES + 1);
+        assert_eq!(script_problem("a", &big, 0), Some("scripts are at most 256 KB".into()));
+        let half = "-".repeat(MAX_SCRIPT_BYTES / 2);
+        assert_eq!(script_problem("a", &half, MAX_SCRIPTS_BYTES - half.len()), None);
+        assert_eq!(
+            script_problem("a", &half, MAX_SCRIPTS_BYTES - half.len() + 1),
+            Some("all scripts together are at most 512 KB".into())
+        );
     }
 }

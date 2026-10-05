@@ -182,6 +182,8 @@ pub struct ConfluenceApp {
     /// A bus whose plugin is being loaded.
     plugin_loading: Option<u32>,
     scene_bar: crate::scenes::SceneBar,
+    scripts_open: bool,
+    scripts: crate::scripts::ScriptsUi,
 }
 
 /// The engine owns plugin editor windows; Windows lets a background process
@@ -248,6 +250,8 @@ impl ConfluenceApp {
             param_pending: HashMap::new(),
             plugin_loading: None,
             scene_bar: crate::scenes::SceneBar::default(),
+            scripts_open: false,
+            scripts: crate::scripts::ScriptsUi::default(),
         }
     }
 
@@ -495,6 +499,7 @@ impl ConfluenceApp {
     fn top_bar_buttons(&mut self, ui: &mut egui::Ui) {
         ui.toggle_value(&mut self.inspector_open, "Inspector");
         ui.toggle_value(&mut self.devices_open, "Devices…");
+        ui.toggle_value(&mut self.scripts_open, "Scripts…");
     }
 
     fn side_panels(&mut self, ui: &mut egui::Ui, view: &StoreView, _now: Instant) {
@@ -567,6 +572,19 @@ impl ConfluenceApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
+        if let (true, Some(state)) = (self.scripts_open, view.state.as_ref()) {
+            let editable = self.live();
+            let scripts = &mut self.scripts;
+            let edits = egui::Window::new("Scripts")
+                .open(&mut self.scripts_open)
+                .default_width(520.0)
+                .show(ctx, |ui| crate::scripts::show(ui, state, scripts, editable))
+                .and_then(|r| r.inner)
+                .unwrap_or_default();
+            for e in edits {
+                self.send(e);
+            }
+        }
         if let (Some(picker), Some(state)) = (self.picker.as_mut(), view.state.as_ref()) {
             match crate::plugins::show(ctx, state, picker) {
                 Some(crate::plugins::Choice::Load(edit)) => {

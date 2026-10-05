@@ -92,22 +92,36 @@ impl Engine {
         &self.midi.inputs
     }
 
-    /// Handles a message from a MIDI input; returns what to journal. Only
-    /// control changes matter: while learning, the first one binds; otherwise
-    /// each binding of that control sets its route's gain (mute and phase
-    /// kept; a route that is gone is left alone).
+    /// Handles a message from a MIDI input; returns what to journal. While
+    /// learning, the first control change binds (and goes no further);
+    /// otherwise each binding of that control sets its route's gain (mute and
+    /// phase kept; a route that is gone is left alone), then scripts run.
     pub fn midi_event(&mut self, ev: &MidiEvent) -> Vec<Command> {
-        let [status, number, value] = match ev.bytes[..] {
-            [s, n, v] if s & 0xF0 == 0xB0 => [s, n, v & 0x7F],
-            _ => return Vec::new(),
-        };
-        let channel = (status & 0x0F) + 1;
-        let control: Control = (ev.device.clone(), channel, number);
-        if let Some((input, output)) = self.midi.learning.take() {
-            let binding = MidiBinding { device: ev.device.clone(), channel, cc: number, input, output };
-            self.set_midi_binding(binding.clone());
-            return vec![Command::SetMidiBinding { binding }];
+        let mut out = Vec::new();
+        if let [status, number, value] = ev.bytes[..] {
+            if status & 0xF0 == 0xB0 {
+                let control: Control = (ev.device.clone(), (status & 0x0F) + 1, number);
+                if let Some(learned) = self.midi_learned(&control) {
+                    return vec![learned];
+                }
+                out = self.midi_control(control, value & 0x7F);
+            }
         }
+        out.extend(self.scripts_on_midi(ev));
+        out
+    }
+
+    /// While learning: binds `control` and returns the binding to journal.
+    fn midi_learned(&mut self, control: &Control) -> Option<Command> {
+        let (input, output) = self.midi.learning.take()?;
+        let (device, channel, cc) = control.clone();
+        let binding = MidiBinding { device, channel, cc, input, output };
+        self.set_midi_binding(binding.clone());
+        Some(Command::SetMidiBinding { binding })
+    }
+
+    /// A bound control moved: its routes' gains, as journal records.
+    fn midi_control(&mut self, control: Control, value: u8) -> Vec<Command> {
         let routes: Vec<(u32, u32)> =
             self.midi.bindings.iter().filter(|b| key(b) == control).map(|b| (b.input, b.output)).collect();
         if routes.is_empty() {

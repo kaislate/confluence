@@ -23,6 +23,7 @@ use crate::alloc::ChannelAllocator;
 
 mod midi_map;
 mod scenes;
+mod scripts;
 use crate::audio::{
     AudioEngine, AudioMsg, BusEntry, InputEntry, LoadMeter, OutputEntry, Returned, StrictEntry, StrictSide, MAX_BUSES,
     MAX_SLOTS,
@@ -284,6 +285,8 @@ pub struct Engine {
     scenes: scenes::Scenes,
     /// MIDI bindings and learn.
     midi: midi_map::Midi,
+    /// Luau scripts.
+    scripts: confluence_script::ScriptHost,
     /// Editor changes not saved yet, by (send column, param).
     edits_held: std::collections::BTreeMap<(u32, u32), f64>,
     /// When each (send column, param) was last saved.
@@ -345,6 +348,7 @@ impl Engine {
             edits_held: std::collections::BTreeMap::new(),
             scenes: scenes::Scenes::default(),
             midi: midi_map::Midi::default(),
+            scripts: confluence_script::ScriptHost::new(),
             edits_saved: std::collections::HashMap::new(),
             blocks,
             master_ppm,
@@ -1109,6 +1113,7 @@ impl Engine {
                 Response::Error("subscriptions and status are served by the engine process".into())
             }
             Command::Shutdown => Response::Ok,
+            Command::SetScript { .. } | Command::DeleteScript { .. } => self.script_command(cmd),
             Command::LearnMidi { .. }
             | Command::CancelMidiLearn
             | Command::SetMidiBinding { .. }
@@ -2239,6 +2244,94 @@ mod tests {
 
     fn binding(device: &str, channel: u8, cc: u8, input: u32, output: u32) -> confluence_api::MidiBinding {
         confluence_api::MidiBinding { device: device.into(), channel, cc, input, output }
+    }
+
+    fn script(e: &mut Engine, name: &str, source: &str) {
+        let r = e.handle(&Command::SetScript { name: name.into(), source: source.into(), enabled: true });
+        assert_eq!(r, Response::Ok);
+    }
+
+    fn note(device: &str, note: u8) -> crate::midi::MidiEvent {
+        crate::midi::MidiEvent { device: device.into(), bytes: vec![0x90, note, 100] }
+    }
+
+    #[test]
+    fn a_script_sets_routes_on_midi_and_its_edits_are_journaled() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, -6.0, false);
+        e.handle(&Command::SaveScene { name: "Live".into(), morph_ms: 0 });
+        script(
+            &mut e,
+            "toggle",
+            "function on_midi(m)
+            if m.kind == 'note_on' and m.note == 36 then
+                local r = confluence.route(0, 1)
+                confluence.set_route(0, 1, r.gain, not r.mute)
+                confluence.set_route(2, 3, -12)
+            end
+        end",
+        );
+        let journal = e.midi_event(&note("Pad", 36));
+        assert_eq!(
+            journal,
+            vec![
+                Command::SetPoint { input: 0, output: 1, gain_db: -6.0, mute: true, invert: false },
+                Command::SetPoint { input: 2, output: 3, gain_db: -12.0, mute: false, invert: false },
+            ]
+        );
+        assert_eq!(level(&mut e, 0, 1), (-6.0, true));
+        assert_eq!(level(&mut e, 2, 3), (-12.0, false), "a new route");
+        assert_eq!(e.current_scene(), None, "a user edit");
+        assert!(e.midi_event(&note("Pad", 37)).is_empty(), "other notes: nothing");
+    }
+
+    #[test]
+    fn a_script_cannot_loop_a_bus() {
+        let (mut e, _a) = small();
+        e.add_bus(&bus_at("A", 1, 4)).unwrap();
+        script(
+            &mut e,
+            "loop",
+            "function on_midi(m)
+            local ok, err = pcall(confluence.set_route, 4, 4, 0)
+            confluence.log(tostring(ok), err)
+        end",
+        );
+        assert!(e.midi_event(&note("Pad", 1)).is_empty(), "nothing journaled");
+        let Response::Points(p) = e.handle(&Command::ListPoints) else { panic!() };
+        assert!(p.is_empty(), "nothing changed");
+        let info = &e.script_infos()[0];
+        assert_eq!(info.status, confluence_api::ScriptStatus::Running);
+        assert!(info.log[0].contains("back into itself"), "{:?}", info.log);
+    }
+
+    #[test]
+    fn learning_takes_the_message_before_scripts() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, 0.0, false);
+        script(&mut e, "s", "function on_midi(m) confluence.set_route(5, 5, 0) end");
+        e.learn_midi(0, 1).unwrap();
+        let journal = e.midi_event(&cc("Pad", 1, 7, 64));
+        assert!(matches!(journal[..], [Command::SetMidiBinding { .. }]), "{journal:?}");
+        assert!(e.matrix.point(5, 5).is_none(), "the script did not see it");
+        assert_eq!(e.midi_event(&cc("Pad", 1, 9, 1)).len(), 1, "afterwards scripts run");
+    }
+
+    #[test]
+    fn scripts_are_managed_and_saved() {
+        let (mut e, _a) = small();
+        let bad = Command::SetScript { name: " ".into(), source: String::new(), enabled: true };
+        assert_eq!(e.handle(&bad), Response::Error("a script needs a name".into()));
+        assert_eq!(e.handle(&Command::DeleteScript { name: "x".into() }), Response::Error("no script named x".into()));
+        script(&mut e, "b", "-- b");
+        let off = Command::SetScript { name: "a".into(), source: "-- a".into(), enabled: false };
+        assert_eq!(e.handle(&off), Response::Ok);
+        assert_eq!(
+            e.script_commands(),
+            vec![off.clone(), Command::SetScript { name: "b".into(), source: "-- b".into(), enabled: true }]
+        );
+        assert_eq!(e.handle(&Command::DeleteScript { name: "b".into() }), Response::Ok);
+        assert_eq!(e.script_commands(), vec![off]);
     }
 
     #[test]

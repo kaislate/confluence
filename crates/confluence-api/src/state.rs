@@ -46,6 +46,9 @@ pub fn diff(old: &State, new: &State) -> Vec<Change> {
     {
         out.push(Change::MidiChanged(new.midi_inputs.clone(), new.midi_bindings.clone(), new.midi_learning));
     }
+    if old.scripts != new.scripts {
+        out.push(Change::ScriptsChanged(new.scripts.clone()));
+    }
     if old.plugins != new.plugins || old.bad_plugins != new.bad_plugins {
         out.push(Change::PluginsChanged(new.plugins.clone(), new.bad_plugins.clone()));
     }
@@ -118,6 +121,7 @@ impl State {
                     self.midi_bindings = bindings.clone();
                     self.midi_learning = *learning;
                 }
+                Change::ScriptsChanged(scripts) => self.scripts = scripts.clone(),
                 Change::PluginsChanged(found, bad) => {
                     self.plugins = found.clone();
                     self.bad_plugins = bad.clone();
@@ -192,6 +196,7 @@ mod tests {
             midi_inputs: Vec::new(),
             midi_bindings: Vec::new(),
             midi_learning: None,
+            scripts: Vec::new(),
         }
     }
 
@@ -222,6 +227,24 @@ mod tests {
                 read_only: false,
             }],
         }
+    }
+
+    #[test]
+    fn script_changes_are_found_and_applied() {
+        let a = state(vec![slot(1, true)], vec![]);
+        let mut b = a.clone();
+        b.scripts = vec![crate::ScriptInfo {
+            name: "mute".into(),
+            source: "function on_midi(m) end".into(),
+            enabled: true,
+            status: crate::ScriptStatus::Stopped("boom".into()),
+            log: vec!["hello".into()],
+        }];
+        let changes = diff(&a, &b);
+        assert_eq!(changes, vec![Change::ScriptsChanged(b.scripts.clone())]);
+        let mut applied = a.clone();
+        applied.apply(&changes);
+        assert_eq!(applied, b);
     }
 
     #[test]
