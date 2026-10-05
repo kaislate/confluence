@@ -1,0 +1,23 @@
+[package]
+name = "confluence-test-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "CLAP plugins for Confluence's tests: a gain, and one that crashes when created"
+
+[lib]
+# cdylib: the .clap file the engine loads. rlib: in-process tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+clack-plugin = { workspace = true }
+clack-extensions = { workspace = true, features = ["clack-plugin"] }
+
+[dev-dependencies]
+clack-host = { workspace = true, features = ["clack-plugin"] }
+clack-extensions = { workspace = true, features = ["clack-host", "clack-plugin"] }
+
+[lints]
+workspace = true

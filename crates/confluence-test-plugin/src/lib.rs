@@ -1,0 +1,344 @@
+//! Two CLAP plugins for Confluence's tests, in one file:
+//!
+//! - **Confluence Test Gain** (`dev.confluence.test.gain`): stereo gain with a
+//!   `Gain` parameter (dB), a `Fail` switch that makes processing fail, and a
+//!   read-only `Peak` parameter the plugin reports itself. Its state is the
+//!   parameter values.
+//! - **Confluence Test Crash** (`dev.confluence.test.crash`): aborts the process
+//!   when created, for the engine's load-check tests. Never create it in-process.
+
+use std::ffi::CStr;
+use std::fmt::Write as _;
+use std::io::{Read, Write as _};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use clack_extensions::audio_ports::{
+    AudioPortFlags, AudioPortInfo, AudioPortInfoWriter, AudioPortType, PluginAudioPorts, PluginAudioPortsImpl,
+};
+use clack_extensions::latency::{PluginLatency, PluginLatencyImpl};
+use clack_extensions::params::{
+    ParamDisplayWriter, ParamInfo, ParamInfoFlags, ParamInfoWriter, PluginAudioProcessorParams, PluginMainThreadParams,
+    PluginParams,
+};
+use clack_extensions::state::{PluginState, PluginStateImpl};
+use clack_plugin::entry::prelude::*;
+use clack_plugin::events::event_types::ParamValueEvent;
+use clack_plugin::events::spaces::CoreEventSpace;
+use clack_plugin::prelude::*;
+use clack_plugin::stream::{InputStream, OutputStream};
+
+pub const GAIN_ID: &str = "dev.confluence.test.gain";
+pub const CRASH_ID: &str = "dev.confluence.test.crash";
+/// Gain in dB, −60…+12.
+pub const PARAM_GAIN: u32 = 1;
+/// 0 or 1: at 1, processing fails.
+pub const PARAM_FAIL: u32 = 2;
+/// Read-only: the last block's peak (0…1), reported by the plugin.
+pub const PARAM_PEAK: u32 = 3;
+
+/// Gain processors deactivated so far (in this process), for host tests.
+pub static DEACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// An `f64` shared between threads.
+struct AtomicF64(AtomicU64);
+
+impl AtomicF64 {
+    const fn zero() -> Self {
+        AtomicF64(AtomicU64::new(0))
+    }
+    fn get(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::Relaxed))
+    }
+    fn set(&self, v: f64) {
+        self.0.store(v.to_bits(), Ordering::Relaxed)
+    }
+}
+
+pub struct GainShared {
+    gain_db: AtomicF64,
+    fail: AtomicF64,
+    peak: AtomicF64,
+}
+
+impl PluginShared<'_> for GainShared {}
+
+impl GainShared {
+    fn get(&self, id: u32) -> Option<f64> {
+        match id {
+            PARAM_GAIN => Some(self.gain_db.get()),
+            PARAM_FAIL => Some(self.fail.get()),
+            PARAM_PEAK => Some(self.peak.get()),
+            _ => None,
+        }
+    }
+
+    fn set(&self, id: u32, v: f64) {
+        match id {
+            PARAM_GAIN => self.gain_db.set(v.clamp(-60.0, 12.0)),
+            PARAM_FAIL => self.fail.set(if v >= 0.5 { 1.0 } else { 0.0 }),
+            _ => {}
+        }
+    }
+
+    fn handle(&self, event: &UnknownEvent) {
+        if let Some(CoreEventSpace::ParamValue(e)) = event.as_core_event() {
+            if let Some(id) = e.param_id() {
+                self.set(id.get(), e.value());
+            }
+        }
+    }
+}
+
+pub struct GainMain<'a> {
+    shared: &'a GainShared,
+}
+
+impl<'a> PluginMainThread<'a, GainShared> for GainMain<'a> {}
+
+pub struct GainProcessor<'a> {
+    shared: &'a GainShared,
+}
+
+pub struct TestGain;
+
+impl Plugin for TestGain {
+    type AudioProcessor<'a> = GainProcessor<'a>;
+    type Shared<'a> = GainShared;
+    type MainThread<'a> = GainMain<'a>;
+
+    fn declare_extensions(builder: &mut PluginExtensions<Self>, _shared: Option<&GainShared>) {
+        builder
+            .register::<PluginAudioPorts>()
+            .register::<PluginParams>()
+            .register::<PluginState>()
+            .register::<PluginLatency>();
+    }
+}
+
+impl<'a> PluginAudioProcessor<'a, GainShared, GainMain<'a>> for GainProcessor<'a> {
+    fn activate(
+        _host: HostAudioProcessorHandle<'a>,
+        _main_thread: &GainMain<'a>,
+        shared: &'a GainShared,
+        _config: PluginAudioConfiguration,
+    ) -> Result<Self, PluginError> {
+        Ok(GainProcessor { shared })
+    }
+
+    fn process(&mut self, _process: Process, mut audio: Audio, events: Events) -> Result<ProcessStatus, PluginError> {
+        for e in events.input {
+            self.shared.handle(e);
+        }
+        if self.shared.fail.get() >= 0.5 {
+            return Err(PluginError::Message("test failure"));
+        }
+        let g = 10f32.powf(self.shared.gain_db.get() as f32 / 20.0);
+        let mut peak = 0f32;
+        let mut pair = audio.port_pair(0).ok_or(PluginError::Message("no audio port"))?;
+        let mut channels = pair.channels()?.into_f32().ok_or(PluginError::Message("expected f32 audio"))?;
+        for ch in channels.iter_mut() {
+            let out = match ch {
+                ChannelPair::InPlace(b) => b,
+                ChannelPair::InputOutput(i, o) => {
+                    o.copy_from_slice(i);
+                    o
+                }
+                ChannelPair::InputOnly(_) | ChannelPair::OutputOnly(_) => continue,
+            };
+            for x in out.iter_mut() {
+                *x *= g;
+                peak = peak.max(x.abs());
+            }
+        }
+        let peak = f64::from(peak.min(1.0));
+        if (peak - self.shared.peak.get()).abs() > 0.01 {
+            self.shared.peak.set(peak);
+            let ev = ParamValueEvent::new(0, ClapId::new(PARAM_PEAK), Pckn::match_all(), peak);
+            let _ = events.output.try_push(ev);
+        }
+        Ok(ProcessStatus::Continue)
+    }
+
+    fn deactivate(self, _main_thread: &GainMain<'a>) {
+        DEACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl PluginAudioPortsImpl for GainMain<'_> {
+    fn count(&self, _is_input: bool) -> u32 {
+        1
+    }
+
+    fn get(&self, index: u32, _is_input: bool, writer: &mut AudioPortInfoWriter) {
+        if index == 0 {
+            writer.set(&AudioPortInfo {
+                id: ClapId::new(0),
+                name: b"main",
+                channel_count: 2,
+                flags: AudioPortFlags::IS_MAIN,
+                port_type: Some(AudioPortType::STEREO),
+                in_place_pair: None,
+            });
+        }
+    }
+}
+
+impl PluginLatencyImpl for GainMain<'_> {
+    fn get(&self) -> u32 {
+        0
+    }
+}
+
+impl PluginStateImpl for GainMain<'_> {
+    fn save(&self, output: &mut OutputStream) -> Result<(), PluginError> {
+        output.write_all(&self.shared.gain_db.get().to_le_bytes())?;
+        output.write_all(&self.shared.fail.get().to_le_bytes())?;
+        Ok(())
+    }
+
+    fn load(&self, input: &mut InputStream) -> Result<(), PluginError> {
+        let mut b = [0u8; 8];
+        input.read_exact(&mut b)?;
+        self.shared.set(PARAM_GAIN, f64::from_le_bytes(b));
+        input.read_exact(&mut b)?;
+        self.shared.set(PARAM_FAIL, f64::from_le_bytes(b));
+        Ok(())
+    }
+}
+
+impl PluginMainThreadParams for GainMain<'_> {
+    fn count(&self) -> u32 {
+        3
+    }
+
+    fn get_info(&self, index: u32, info: &mut ParamInfoWriter) {
+        let (id, name, min, max, default, flags): (u32, &[u8], f64, f64, f64, ParamInfoFlags) = match index {
+            0 => (PARAM_GAIN, b"Gain", -60.0, 12.0, 0.0, ParamInfoFlags::IS_AUTOMATABLE),
+            1 => (PARAM_FAIL, b"Fail", 0.0, 1.0, 0.0, ParamInfoFlags::IS_STEPPED),
+            2 => (PARAM_PEAK, b"Peak", 0.0, 1.0, 0.0, ParamInfoFlags::IS_READONLY),
+            _ => return,
+        };
+        info.set(&ParamInfo {
+            id: ClapId::new(id),
+            flags,
+            cookie: Default::default(),
+            name,
+            module: b"",
+            min_value: min,
+            max_value: max,
+            default_value: default,
+        });
+    }
+
+    fn get_value(&self, id: ClapId) -> Option<f64> {
+        self.shared.get(id.get())
+    }
+
+    fn value_to_text(&self, id: ClapId, value: f64, writer: &mut ParamDisplayWriter) -> std::fmt::Result {
+        match id.get() {
+            PARAM_GAIN => write!(writer, "{value:.1} dB"),
+            PARAM_FAIL => write!(writer, "{}", if value >= 0.5 { "on" } else { "off" }),
+            PARAM_PEAK => write!(writer, "{value:.2}"),
+            _ => Err(std::fmt::Error),
+        }
+    }
+
+    fn text_to_value(&self, id: ClapId, text: &CStr) -> Option<f64> {
+        let t = text.to_str().ok()?.trim();
+        match id.get() {
+            PARAM_GAIN => t.trim_end_matches("dB").trim().parse().ok(),
+            _ => t.parse().ok(),
+        }
+    }
+
+    fn flush(&self, input: &InputEvents, _output: &mut OutputEvents) {
+        for e in input {
+            self.shared.handle(e);
+        }
+    }
+}
+
+impl PluginAudioProcessorParams for GainProcessor<'_> {
+    fn flush(&mut self, input: &InputEvents, _output: &mut OutputEvents) {
+        for e in input {
+            self.shared.handle(e);
+        }
+    }
+}
+
+/// Aborts the process when created.
+pub struct TestCrash;
+
+impl Plugin for TestCrash {
+    type AudioProcessor<'a> = ();
+    type Shared<'a> = ();
+    type MainThread<'a> = ();
+}
+
+pub struct Factory {
+    gain: PluginDescriptor,
+    crash: PluginDescriptor,
+}
+
+impl PluginFactoryImpl for Factory {
+    fn plugin_count(&self) -> u32 {
+        2
+    }
+
+    fn plugin_descriptor(&self, index: u32) -> Option<&PluginDescriptor> {
+        match index {
+            0 => Some(&self.gain),
+            1 => Some(&self.crash),
+            _ => None,
+        }
+    }
+
+    fn create_plugin<'a>(&'a self, host_info: HostInfo<'a>, plugin_id: &CStr) -> Option<PluginInstance<'a>> {
+        if plugin_id.to_bytes() == GAIN_ID.as_bytes() {
+            Some(PluginInstance::new::<TestGain>(
+                host_info,
+                &self.gain,
+                |_host| Ok(GainShared { gain_db: AtomicF64::zero(), fail: AtomicF64::zero(), peak: AtomicF64::zero() }),
+                |_host, shared| Ok(GainMain { shared }),
+            ))
+        } else if plugin_id.to_bytes() == CRASH_ID.as_bytes() {
+            Some(PluginInstance::new::<TestCrash>(
+                host_info,
+                &self.crash,
+                |_host| std::process::abort(),
+                |_host, _shared| Ok(()),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// The file's entry: one factory with both plugins.
+pub struct Entry {
+    factory: PluginFactoryWrapper<Factory>,
+}
+
+impl clack_plugin::entry::Entry for Entry {
+    fn new(_bundle_path: Option<&CStr>) -> Result<Self, EntryLoadError> {
+        use clack_plugin::plugin::features::{AUDIO_EFFECT, STEREO, UTILITY};
+        Ok(Entry {
+            factory: PluginFactoryWrapper::new(Factory {
+                gain: PluginDescriptor::new(GAIN_ID, "Confluence Test Gain")
+                    .with_vendor("Confluence")
+                    .with_version("1.0.0")
+                    .with_features([AUDIO_EFFECT, STEREO]),
+                crash: PluginDescriptor::new(CRASH_ID, "Confluence Test Crash")
+                    .with_vendor("Confluence")
+                    .with_version("1.0.0")
+                    .with_features([AUDIO_EFFECT, UTILITY]),
+            }),
+        })
+    }
+
+    fn declare_factories<'a>(&'a self, builder: &mut EntryFactories<'a>) {
+        builder.register_factory(&self.factory);
+    }
+}
+
+clack_export_entry!(Entry);
