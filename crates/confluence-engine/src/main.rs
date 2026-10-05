@@ -38,6 +38,7 @@ mod app {
     use confluence_engine::devices::{start_asio_master, DeviceManager};
     use confluence_engine::ipc::{default_pipe_name, pipe_path, PipeServer, Service};
     use confluence_engine::journal::Journal;
+    use confluence_engine::midi::{MidiEvent, MidiHub, WinmmProvider};
     use confluence_engine::plugins::{self, Scanner};
     use confluence_engine::publish::{published_state, Publisher};
     use confluence_engine::rt::disable_power_throttling;
@@ -76,6 +77,9 @@ mod app {
         /// With `--scan`: instead, load, start and run this plugin once (the load check).
         #[arg(long, requires = "scan")]
         plugin: Option<String>,
+        /// Do not open MIDI devices (tests; MIDI can still be injected over the pipe).
+        #[arg(long)]
+        no_midi: bool,
     }
 
     /// `--scan`: runs in a throwaway process, so a plugin that crashes takes
@@ -117,6 +121,8 @@ mod app {
         scanner: Scanner,
         /// This program, run as the load-check process.
         exe: PathBuf,
+        /// MIDI inputs and feedback outputs (`None` with `--no-midi`).
+        midi: Option<MidiHub>,
     }
 
     /// A plugin as the engine controls it.
@@ -275,11 +281,44 @@ mod app {
         Response::Applied { version: publish(&mut s) }
     }
 
+    /// MIDI each control tick: devices that came or went, messages received,
+    /// and feedback for gains that changed.
+    fn midi_tick(s: &mut State) {
+        let Some(mut hub) = s.midi.take() else {
+            // Injected messages still produce feedback state; there is nowhere to send it.
+            let _ = s.engine.midi_feedback();
+            return;
+        };
+        if hub.tick(Instant::now()) {
+            s.engine.set_midi_inputs(hub.input_names());
+        }
+        for ev in hub.events() {
+            if let Err(e) = midi_in(s, &ev) {
+                eprintln!("confluence-engine: warning: a MIDI change was not saved: {e}");
+            }
+        }
+        for (device, bytes) in s.engine.midi_feedback() {
+            hub.send(&device, &bytes);
+        }
+        s.midi = Some(hub);
+    }
+
+    /// A MIDI message, from a device or injected: applied, and what it changed journaled.
+    fn midi_in(s: &mut State, ev: &MidiEvent) -> std::io::Result<()> {
+        for c in s.engine.midi_event(ev) {
+            s.journal.append(&c)?;
+        }
+        Ok(())
+    }
+
     /// Adds what `published_state` does not know about: plugins.
     fn with_plugins(mut st: confluence_api::State, engine: &mut Engine, scanner: &Scanner) -> confluence_api::State {
         (st.plugins, st.bad_plugins) = scanner.list();
         st.bus_plugins = engine.bus_plugins();
         st.notices.extend(engine.plugin_notices());
+        st.midi_inputs = engine.midi_inputs().to_vec();
+        st.midi_bindings = engine.midi_bindings().to_vec();
+        st.midi_learning = engine.midi_learning();
         st.scenes = engine.scene_infos();
         st.current_scene = engine.current_scene().map(String::from);
         st.morphing = engine.morphing();
@@ -348,6 +387,14 @@ mod app {
             // engine keeps ticking and other clients keep being answered.
             match cmd {
                 Command::ListPlugins => return Response::Plugins(lock(state).scanner.list().0),
+                Command::InjectMidi { device, bytes } if (1..=3).contains(&bytes.len()) => {
+                    let mut s = lock(state);
+                    let ev = MidiEvent { device: device.clone(), bytes: bytes.clone() };
+                    return match midi_in(&mut s, &ev) {
+                        Ok(()) => Response::Applied { version: publish(&mut s) },
+                        Err(e) => Response::Error(format!("applied but not saved: {e}")),
+                    };
+                }
                 Command::LoadPlugin { bus, path, plugin_id } => return load_plugin(state, bus, path, plugin_id),
                 Command::ListDevices => {
                     return match DeviceManager::list_devices() {
@@ -427,6 +474,16 @@ mod app {
                     // Published before the reply, so its version includes this change.
                     return Response::Applied { version: publish(&mut s) };
                 }
+                // Not saved, but shown: published at once so the window follows.
+                if matches!(
+                    cmd,
+                    Command::LearnMidi { .. }
+                        | Command::CancelMidiLearn
+                        | Command::ShowEditor { .. }
+                        | Command::HideEditor { .. }
+                ) {
+                    publish(&mut s);
+                }
             }
             resp
         }
@@ -467,6 +524,7 @@ mod app {
             .collect();
         out.extend(engine.plugin_commands());
         out.extend(engine.scene_commands());
+        out.extend(engine.midi_commands());
         // Mid-morph, the routes are saved where the morph is taking them.
         out.extend(engine.settled_points().into_iter().map(|p| Command::SetPoint {
             input: p.input,
@@ -574,6 +632,7 @@ mod app {
             plugin_thread,
             scanner,
             exe,
+            midi: (!args.no_midi).then(|| MidiHub::new(Box::new(WinmmProvider))),
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         {
@@ -604,6 +663,7 @@ mod app {
             for p in s.engine.take_returned_processors() {
                 s.plugin_thread.reclaim(p);
             }
+            midi_tick(&mut s);
             ticks += 1;
             if ticks.is_multiple_of(PUBLISH_TICKS) {
                 // Catches changes no command made: devices lost or back, a DAW attaching.

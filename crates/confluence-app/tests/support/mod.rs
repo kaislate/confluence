@@ -41,6 +41,8 @@ impl EngineDir {
             // Never the user's own plugins: only what a test puts in this folder.
             "--clap-path".into(),
             self.clap_dir().display().to_string(),
+            // Never this PC's MIDI devices (tests inject MIDI over the pipe).
+            "--no-midi".into(),
         ]
     }
 

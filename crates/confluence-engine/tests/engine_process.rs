@@ -29,21 +29,34 @@ impl Drop for Engine {
 
 /// The engine binary with this test's journal and a devices file next to it,
 /// so tests never open the devices saved in the user's own `devices.json`.
+/// (Never this PC's MIDI devices.)
 fn engine_command(pipe: &str, journal: &std::path::Path) -> Process {
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
     cmd.args(["--pipe", pipe, "--journal"]).arg(journal).arg("--devices").arg(journal.with_file_name("devices.json"));
+    cmd.arg("--no-midi");
     cmd
 }
 
+/// An empty plugin folder next to the journal: never this PC's own plugins.
+fn no_plugins(journal: &std::path::Path) -> std::path::PathBuf {
+    let d = journal.with_file_name("no-plugins");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
 fn spawn(pipe: &str, journal: &std::path::Path) -> Engine {
-    Engine(Some(engine_command(pipe, journal).spawn().unwrap()))
+    let mut cmd = engine_command(pipe, journal);
+    cmd.arg("--clap-path").arg(no_plugins(journal));
+    Engine(Some(cmd.spawn().unwrap()))
 }
 
 /// Runs a second engine that is expected to refuse to start. If it is still
 /// running after 10 s it wrongly started: kill it and return `None`.
 fn run_expecting_exit(pipe: &str, journal: &std::path::Path) -> Option<(std::process::ExitStatus, String)> {
     use std::io::Read;
-    let mut child = engine_command(pipe, journal).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let mut cmd = engine_command(pipe, journal);
+    cmd.arg("--clap-path").arg(no_plugins(journal));
+    let mut child = cmd.stderr(std::process::Stdio::piped()).spawn().unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -513,5 +526,40 @@ fn scenes_and_recalls_survive_restarts() {
     let child = spawn(&pipe, &journal);
     let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     assert!(scenes_now(&pipe).scenes.is_empty(), "deleting is saved too");
+    shutdown(child, &mut c);
+}
+
+/// MIDI Learn and a bound control over the pipe (messages injected: no MIDI
+/// hardware needed); the binding survives a restart.
+#[test]
+fn a_learned_midi_control_drives_a_route_and_is_kept() {
+    use confluence_api::MidiBinding;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let pipe = format!("confluence-midi-{}", std::process::id());
+    let set = Command::SetPoint { input: 1, output: 2, gain_db: -6.0, mute: false, invert: false };
+    let inject = |v: u8| Command::InjectMidi { device: "nanoKONTROL2".into(), bytes: vec![0xB0, 7, v] };
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert!(matches!(c.call(set).unwrap(), Response::Applied { .. }));
+    assert_eq!(c.call(Command::LearnMidi { input: 1, output: 2 }).unwrap(), Response::Ok);
+    assert_eq!(scenes_now(&pipe).midi_learning, Some((1, 2)));
+    assert!(matches!(c.call(inject(90)).unwrap(), Response::Applied { .. }));
+    let st = scenes_now(&pipe);
+    let bound = MidiBinding { device: "nanoKONTROL2".into(), channel: 1, cc: 7, input: 1, output: 2 };
+    assert_eq!(st.midi_bindings, vec![bound.clone()]);
+    assert_eq!(st.midi_learning, None);
+    assert!(matches!(c.call(inject(127)).unwrap(), Response::Applied { .. }));
+    assert_eq!(scenes_now(&pipe).points[0].gain_db, 12.0);
+    let bad = Command::InjectMidi { device: "x".into(), bytes: vec![1, 2, 3, 4] };
+    assert!(matches!(c.call(bad).unwrap(), Response::Error(_)));
+    shutdown(child, &mut c);
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let st = scenes_now(&pipe);
+    assert_eq!(st.midi_bindings, vec![bound]);
+    assert_eq!(st.points[0].gain_db, 12.0);
     shutdown(child, &mut c);
 }
