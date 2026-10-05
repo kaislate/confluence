@@ -47,13 +47,26 @@ pub enum Source {
     InProcess(fn() -> Result<PluginEntry, String>),
 }
 
+thread_local! {
+    /// Every plugin file loaded, kept loaded until the engine exits. Many
+    /// plugins do not survive being unloaded and loaded again (e.g. a window
+    /// class left registered to code that is gone), so a file is loaded once.
+    static ENTRIES: std::cell::RefCell<HashMap<PathBuf, PluginEntry>> = std::cell::RefCell::new(HashMap::new());
+}
+
 impl Source {
     fn entry(&self) -> Result<PluginEntry, String> {
         match self {
             Source::File(p) => {
+                if let Some(e) = ENTRIES.with(|m| m.borrow().get(p).cloned()) {
+                    return Ok(e);
+                }
                 // SAFETY: loading a CLAP file runs its code; the engine only loads
                 // files that passed the load check in a separate process.
-                unsafe { PluginEntry::load(p) }.map_err(|e| format!("{} could not be loaded: {e}", p.display()))
+                let e =
+                    unsafe { PluginEntry::load(p) }.map_err(|e| format!("{} could not be loaded: {e}", p.display()))?;
+                ENTRIES.with(|m| m.borrow_mut().insert(p.clone(), e.clone()));
+                Ok(e)
             }
             Source::InProcess(f) => f(),
         }

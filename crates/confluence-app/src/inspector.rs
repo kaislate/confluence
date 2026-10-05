@@ -439,6 +439,8 @@ mod display_tests {
             },
             status,
             latency: 0,
+            has_editor: false,
+            editor_open: false,
             params: vec![confluence_api::ParamState {
                 id: 1,
                 name: "Gain".into(),

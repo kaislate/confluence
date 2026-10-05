@@ -100,6 +100,23 @@ pub trait PluginControl: Send {
     fn poll(&mut self) -> bool;
     fn save_state(&mut self) -> Result<Vec<u8>, String>;
     fn load_state(&mut self, state: &[u8]) -> Result<(), String>;
+
+    /// The plugin has an editor of its own.
+    fn has_editor(&self) -> bool {
+        false
+    }
+    fn editor_open(&self) -> bool {
+        false
+    }
+    /// Opens its editor in a window titled `title` (or brings it to the front).
+    fn show_editor(&mut self, _title: &str) -> Result<(), String> {
+        Err(format!("{} has no editor", self.info().name))
+    }
+    fn hide_editor(&mut self) {}
+    /// Values the plugin changed itself (in its editor) since the last call.
+    fn take_edited(&mut self) -> Vec<(u32, f64)> {
+        Vec::new()
+    }
 }
 
 /// A loaded plugin: the engine's control of it and its processor for the bus.
@@ -611,6 +628,8 @@ impl Engine {
                         info: control.info(),
                         status: if faults > *faults_before { PluginStatus::Faulted } else { PluginStatus::Running },
                         latency: control.latency(),
+                        has_editor: control.has_editor(),
+                        editor_open: control.editor_open(),
                         params: control.params(),
                     }
                 }
@@ -619,6 +638,8 @@ impl Engine {
                     info: info.clone(),
                     status: PluginStatus::Failed(why.clone()),
                     latency: 0,
+                    has_editor: false,
+                    editor_open: false,
                     params: Vec::new(),
                 },
             });
@@ -684,6 +705,29 @@ impl Engine {
         out
     }
 
+    /// Values plugins changed themselves (in their editors) since the last
+    /// call, as journal records (buses by send column).
+    pub fn take_edited_values(&mut self) -> Vec<Command> {
+        let places: Vec<(u32, u32)> = self
+            .slots
+            .iter()
+            .filter(|s| matches!(s.stats, SlotStats::Bus(_)))
+            .map(|s| (s.state.id, s.state.first_output))
+            .collect();
+        let mut out = Vec::new();
+        for (bus, at) in places {
+            if let Some(BusPlugin::Loaded { control, .. }) = self.plugins.get_mut(&bus) {
+                control.poll();
+                out.extend(control.take_edited().into_iter().map(|(param, value)| Command::SetParam {
+                    bus: BusRef::At(at),
+                    param,
+                    value,
+                }));
+            }
+        }
+        out
+    }
+
     /// Plugin trouble the user should know about.
     pub fn plugin_notices(&self) -> Vec<String> {
         self.plugin_notices.values().cloned().collect()
@@ -733,6 +777,25 @@ impl Engine {
                         *kept = Some(state.clone());
                         Ok(())
                     }
+                    None => Err(format!("insert bus {bus} has no plugin")),
+                }
+            }
+            Command::ShowEditor { bus } | Command::HideEditor { bus } => {
+                let bus = self.resolve_bus(bus).map_err(|e| e.to_string())?;
+                let title_bus = self.slots.iter().find(|s| s.state.id == bus).map(|s| s.state.name.clone());
+                match self.plugins.get_mut(&bus) {
+                    Some(BusPlugin::Loaded { control, .. }) => {
+                        if matches!(cmd, Command::HideEditor { .. }) {
+                            control.hide_editor();
+                            return Ok(());
+                        }
+                        if !control.has_editor() {
+                            return Err(format!("{} has no editor", control.info().name));
+                        }
+                        let title = format!("{} — {}", control.info().name, title_bus.unwrap_or_default());
+                        control.show_editor(&title)
+                    }
+                    Some(BusPlugin::Failed { info, .. }) => Err(format!("{} is not loaded", info.name)),
                     None => Err(format!("insert bus {bus} has no plugin")),
                 }
             }
@@ -963,7 +1026,9 @@ impl Engine {
             | Command::LoadPlugin { .. }
             | Command::UnloadPlugin { .. }
             | Command::SetParam { .. }
-            | Command::SetPluginState { .. } => match self.plugin_command(cmd) {
+            | Command::SetPluginState { .. }
+            | Command::ShowEditor { .. }
+            | Command::HideEditor { .. } => match self.plugin_command(cmd) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error(e),
             },
@@ -1595,6 +1660,91 @@ mod tests {
         e.set_plugin(b, Some((stale(Some(vec![1])), halves()))).unwrap();
         e.plugin_commands();
         assert!(e.plugin_notices().is_empty(), "cleared once it fits");
+    }
+
+    /// A plugin with an editor: records the titles it was shown with, and
+    /// reports `edited` values as if changed in its editor.
+    struct WithEditor {
+        inner: FakePlugin,
+        open: bool,
+        titles: Arc<Mutex<Vec<String>>>,
+        edited: Vec<(u32, f64)>,
+    }
+
+    impl PluginControl for WithEditor {
+        fn info(&self) -> PluginInfo {
+            self.inner.info()
+        }
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn params(&self) -> Vec<ParamState> {
+            self.inner.params()
+        }
+        fn set_param(&mut self, id: u32, value: f64) -> Result<(), String> {
+            self.inner.set_param(id, value)
+        }
+        fn poll(&mut self) -> bool {
+            false
+        }
+        fn save_state(&mut self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn load_state(&mut self, _state: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn has_editor(&self) -> bool {
+            true
+        }
+        fn editor_open(&self) -> bool {
+            self.open
+        }
+        fn show_editor(&mut self, title: &str) -> Result<(), String> {
+            self.titles.lock().unwrap().push(title.to_string());
+            self.open = true;
+            Ok(())
+        }
+        fn hide_editor(&mut self) {
+            self.open = false;
+        }
+        fn take_edited(&mut self) -> Vec<(u32, f64)> {
+            std::mem::take(&mut self.edited)
+        }
+    }
+
+    #[test]
+    fn a_plugins_editor_opens_titled_after_plugin_and_bus() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("Vocal FX", 1, 8)).unwrap();
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let plugin = WithEditor {
+            inner: FakePlugin { gain: 0.0, state: Arc::new(Mutex::new(Vec::new())) },
+            open: false,
+            titles: titles.clone(),
+            edited: vec![(1, -12.0)],
+        };
+        e.set_plugin(b, Some((Box::new(plugin), halves()))).unwrap();
+        assert!(e.bus_plugins()[0].has_editor && !e.bus_plugins()[0].editor_open);
+        assert_eq!(e.handle(&Command::ShowEditor { bus: BusRef::Id(b) }), Response::Ok);
+        assert_eq!(*titles.lock().unwrap(), ["Fake — Vocal FX"]);
+        assert!(e.bus_plugins()[0].editor_open);
+        assert_eq!(e.take_edited_values(), vec![set_param_at(8, 1, -12.0)], "saved by send column");
+        assert!(e.take_edited_values().is_empty());
+        assert_eq!(e.handle(&Command::HideEditor { bus: BusRef::At(8) }), Response::Ok);
+        assert!(!e.bus_plugins()[0].editor_open);
+    }
+
+    #[test]
+    fn editors_need_a_loaded_plugin_with_one() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("FX", 1, 8)).unwrap();
+        let show = Command::ShowEditor { bus: BusRef::Id(b) };
+        assert_eq!(e.handle(&show), Response::Error(format!("insert bus {b} has no plugin")));
+        e.set_plugin(b, Some((fake(), halves()))).unwrap();
+        assert!(!e.bus_plugins()[0].has_editor);
+        assert_eq!(e.handle(&show), Response::Error("Fake has no editor".into()));
+        e.set_failed_plugin(b, fake().info(), "gone".into()).unwrap();
+        assert_eq!(e.handle(&show), Response::Error("Fake is not loaded".into()));
     }
 
     #[test]

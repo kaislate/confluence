@@ -53,6 +53,10 @@ enum Cmd {
     LoadPlugin { bus: u32, path: String, id: String },
     /// Take the plugin off insert bus BUS.
     UnloadPlugin { bus: u32 },
+    /// Open the editor of the plugin on insert bus BUS.
+    ShowEditor { bus: u32 },
+    /// Close the editor of the plugin on insert bus BUS.
+    HideEditor { bus: u32 },
     /// Set parameter PARAM of the plugin on insert bus BUS.
     SetParam {
         bus: u32,
@@ -111,6 +115,8 @@ impl Cmd {
                 Command::LoadPlugin { bus: BusRef::Id(bus), path: path.clone(), plugin_id: id.clone() }
             }
             Cmd::UnloadPlugin { bus } => Command::UnloadPlugin { bus: BusRef::Id(bus) },
+            Cmd::ShowEditor { bus } => Command::ShowEditor { bus: BusRef::Id(bus) },
+            Cmd::HideEditor { bus } => Command::HideEditor { bus: BusRef::Id(bus) },
             Cmd::SetParam { bus, param, value } => Command::SetParam { bus: BusRef::Id(bus), param, value },
             Cmd::Status => Command::Status,
             Cmd::Watch => Command::Subscribe,
@@ -391,6 +397,8 @@ v7  slot #3 removed"
             Command::LoadPlugin { bus: BusRef::Id(4), path: "C:\\x.clap".into(), plugin_id: "dev.x".into() }
         );
         assert_eq!(parse(&["unload-plugin", "4"]), Command::UnloadPlugin { bus: BusRef::Id(4) });
+        assert_eq!(parse(&["show-editor", "4"]), Command::ShowEditor { bus: BusRef::Id(4) });
+        assert_eq!(parse(&["hide-editor", "4"]), Command::HideEditor { bus: BusRef::Id(4) });
         assert_eq!(
             parse(&["set-param", "4", "1", "-6.5"]),
             Command::SetParam { bus: BusRef::Id(4), param: 1, value: -6.5 }

@@ -48,6 +48,11 @@ pub const PARAM_FAIL: u32 = 2;
 /// Read-only: the last block's peak (0…1), reported by the plugin.
 pub const PARAM_PEAK: u32 = 3;
 
+/// Test hook: milliseconds this file takes to load.
+pub const SLOW_LOAD_ENV: &str = "CONFLUENCE_TEST_PLUGIN_SLOW_LOAD_MS";
+/// Test hook: a file written when a slow load finishes.
+pub const SLOW_LOAD_MARK_ENV: &str = "CONFLUENCE_TEST_PLUGIN_SLOW_LOAD_MARK";
+
 /// Gain processors deactivated so far (in this process), for host tests.
 pub static DEACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -391,6 +396,14 @@ pub struct Entry {
 impl clack_plugin::entry::Entry for Entry {
     fn new(_bundle_path: Option<&CStr>) -> Result<Self, EntryLoadError> {
         use clack_plugin::plugin::features::{AUDIO_EFFECT, STEREO, UTILITY};
+        // Test hook: a slow load, which then leaves a mark (a load that was
+        // stopped part-way never does).
+        if let Ok(ms) = std::env::var(SLOW_LOAD_ENV) {
+            std::thread::sleep(std::time::Duration::from_millis(ms.parse().unwrap_or(0)));
+            if let Ok(mark) = std::env::var(SLOW_LOAD_MARK_ENV) {
+                let _ = std::fs::write(mark, b"finished");
+            }
+        }
         Ok(Entry {
             factory: PluginFactoryWrapper::new(Factory {
                 gain: PluginDescriptor::new(GAIN_ID, "Confluence Test Gain")

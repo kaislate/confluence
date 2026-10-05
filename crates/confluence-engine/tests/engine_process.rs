@@ -369,3 +369,103 @@ fn a_plugin_setting_survives_an_engine_killed_twice() {
     assert_eq!(bus_plugins(&pipe)[0].params[0].value, -20.0, "kept through the second kill too");
     shutdown(child, &mut c);
 }
+
+fn editor_window(title: &str) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    // SAFETY: a read-only lookup.
+    unsafe { FindWindowW(None, &HSTRING::from(title)) }.ok()
+}
+
+fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The engine opens a plugin's editor; it closes when asked, when the plugin
+/// is unloaded, and when the engine exits; a change made in it is saved.
+#[test]
+fn a_plugins_editor_is_opened_by_the_engine_and_its_changes_are_saved() {
+    use confluence_api::BusRef;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, SendMessageW, WM_LBUTTONDOWN};
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let clap_dir = dir.path().join("clap");
+    std::fs::create_dir(&clap_dir).unwrap();
+    let file = clap_dir.join("Test.clap");
+    std::fs::copy(test_plugin_dll(), &file).unwrap();
+    let pipe = format!("confluence-plugin-editor-{}", std::process::id());
+    let title = format!("Confluence Test Gain — Editor bus {}", std::process::id());
+    let bus_name = format!("Editor bus {}", std::process::id());
+
+    let mut child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let add = Command::AddBus { name: bus_name, channels: 2, first_input: None, first_output: None };
+    let Response::Added { ids, .. } = c.call(add).unwrap() else { panic!() };
+    let bus = BusRef::Id(ids[0]);
+    let load =
+        Command::LoadPlugin { bus, path: file.display().to_string(), plugin_id: "dev.confluence.test.gain".into() };
+    assert!(matches!(c.call(load.clone()).unwrap(), Response::Applied { .. }));
+    assert!(bus_plugins(&pipe)[0].has_editor);
+
+    assert_eq!(c.call(Command::ShowEditor { bus }).unwrap(), Response::Ok);
+    let w = editor_window(&title).expect("the editor window");
+    wait_until("editor_open", || bus_plugins(&pipe)[0].editor_open);
+    assert_eq!(c.call(Command::HideEditor { bus }).unwrap(), Response::Ok);
+    assert!(editor_window(&title).is_none());
+
+    // Unloading with the editor open closes it.
+    assert_eq!(c.call(Command::ShowEditor { bus }).unwrap(), Response::Ok);
+    assert!(matches!(c.call(Command::UnloadPlugin { bus }).unwrap(), Response::Applied { .. }));
+    wait_until("the window gone after unloading", || editor_window(&title).is_none());
+    let _ = w;
+    // Let the old instance be destroyed entirely (nothing else holds its file),
+    // so loading it again really loads the file again.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // A click in the editor (Gain −12 dB) is saved even if the engine is killed.
+    assert!(matches!(c.call(load).unwrap(), Response::Applied { .. }));
+    assert_eq!(c.call(Command::ShowEditor { bus }).unwrap(), Response::Ok);
+    let w = editor_window(&title).unwrap();
+    // SAFETY: a lookup, then a click on the plugin's own window in the engine process.
+    let inner = unsafe { FindWindowExW(Some(w), None, windows::core::w!("ConfluenceTestGainEditor"), None) }.unwrap();
+    unsafe { SendMessageW(inner, WM_LBUTTONDOWN, Some(WPARAM(0)), Some(LPARAM(0))) };
+    wait_until("the edit in the engine", || bus_plugins(&pipe)[0].params[0].value == -12.0);
+    std::thread::sleep(Duration::from_millis(300)); // the next publish journals it
+    child.kill();
+    wait_until("the window gone with the engine", || editor_window(&title).is_none());
+
+    let child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(bus_plugins(&pipe)[0].params[0].value, -12.0, "the editor's change was saved");
+    // A clean exit with the editor open.
+    let bus = BusRef::Id(bus_plugins(&pipe)[0].bus);
+    assert_eq!(c.call(Command::ShowEditor { bus }).unwrap(), Response::Ok);
+    shutdown(child, &mut c);
+    assert!(editor_window(&title).is_none());
+}
+
+/// A plugin scan running when the engine dies must not outlive it.
+#[test]
+fn scan_processes_end_with_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let clap_dir = dir.path().join("clap");
+    std::fs::create_dir(&clap_dir).unwrap();
+    std::fs::copy(test_plugin_dll(), clap_dir.join("Slow.clap")).unwrap();
+    let mark = dir.path().join("scan-finished");
+    let pipe = format!("confluence-scan-orphan-{}", std::process::id());
+    let mut cmd = engine_command(&pipe, &journal);
+    cmd.arg("--clap-path").arg(&clap_dir);
+    cmd.env("CONFLUENCE_TEST_PLUGIN_SLOW_LOAD_MS", "4000").env("CONFLUENCE_TEST_PLUGIN_SLOW_LOAD_MARK", &mark);
+    let mut child = Engine(Some(cmd.spawn().unwrap()));
+    let _c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    std::thread::sleep(Duration::from_millis(1000)); // the scan of Slow.clap is under way
+    child.kill();
+    std::thread::sleep(Duration::from_millis(5000));
+    assert!(!mark.exists(), "the scan process outlived its engine");
+}
