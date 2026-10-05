@@ -400,6 +400,9 @@ mod tests {
             points: Vec::new(),
             devices: Vec::new(),
             notices: Vec::new(),
+            plugins: Vec::new(),
+            bad_plugins: Vec::new(),
+            bus_plugins: Vec::new(),
         }
     }
 

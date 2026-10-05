@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{Change, PointState, SlotState, State};
+use crate::{Change, LoadedPlugin, PointState, SlotState, State};
 
 /// The changes that turn `old` into `new`. Version and status are not compared.
 pub fn diff(old: &State, new: &State) -> Vec<Change> {
@@ -37,7 +37,41 @@ pub fn diff(old: &State, new: &State) -> Vec<Change> {
     if old.notices != new.notices {
         out.push(Change::NoticesChanged(new.notices.clone()));
     }
+    if old.plugins != new.plugins || old.bad_plugins != new.bad_plugins {
+        out.push(Change::PluginsChanged(new.plugins.clone(), new.bad_plugins.clone()));
+    }
+    let old_bp: BTreeMap<u32, &LoadedPlugin> = old.bus_plugins.iter().map(|p| (p.bus, p)).collect();
+    for p in &new.bus_plugins {
+        match old_bp.get(&p.bus) {
+            None => out.push(Change::BusPluginSet(p.clone())),
+            Some(o) if *o == p => {}
+            Some(o) if only_values_differ(o, p) => {
+                for (a, b) in o.params.iter().zip(&p.params) {
+                    if a != b {
+                        out.push(Change::ParamChanged { bus: p.bus, id: b.id, value: b.value, text: b.text.clone() });
+                    }
+                }
+            }
+            Some(_) => out.push(Change::BusPluginSet(p.clone())),
+        }
+    }
+    for bus in old_bp.keys().filter(|b| !new.bus_plugins.iter().any(|p| p.bus == **b)) {
+        out.push(Change::BusPluginRemoved { bus: *bus });
+    }
     out
+}
+
+/// Same plugin, status and parameter list; only values and their texts differ.
+fn only_values_differ(a: &LoadedPlugin, b: &LoadedPlugin) -> bool {
+    a.info == b.info
+        && a.status == b.status
+        && a.latency == b.latency
+        && a.params.len() == b.params.len()
+        && a.params.iter().zip(&b.params).all(|(x, y)| {
+            let (mut x, mut y) = (x.clone(), y.clone());
+            (x.value, x.text, y.value, y.text) = (0.0, String::new(), 0.0, String::new());
+            x == y
+        })
 }
 
 impl State {
@@ -63,6 +97,23 @@ impl State {
                 }
                 Change::DevicesChanged(d) => self.devices = d.clone(),
                 Change::NoticesChanged(n) => self.notices = n.clone(),
+                Change::PluginsChanged(found, bad) => {
+                    self.plugins = found.clone();
+                    self.bad_plugins = bad.clone();
+                }
+                Change::BusPluginSet(p) => match self.bus_plugins.binary_search_by_key(&p.bus, |x| x.bus) {
+                    Ok(i) => self.bus_plugins[i] = p.clone(),
+                    Err(i) => self.bus_plugins.insert(i, p.clone()),
+                },
+                Change::BusPluginRemoved { bus } => self.bus_plugins.retain(|p| p.bus != *bus),
+                Change::ParamChanged { bus, id, value, text } => {
+                    if let Some(p) = self.bus_plugins.iter_mut().find(|p| p.bus == *bus) {
+                        if let Some(q) = p.params.iter_mut().find(|q| q.id == *id) {
+                            q.value = *value;
+                            q.text = text.clone();
+                        }
+                    }
+                }
             }
         }
     }
@@ -104,7 +155,70 @@ mod tests {
     }
 
     fn state(slots: Vec<SlotState>, points: Vec<PointState>) -> State {
-        State { version: 0, status: status(), slots, points, devices: Vec::new(), notices: Vec::new() }
+        State {
+            version: 0,
+            status: status(),
+            slots,
+            points,
+            devices: Vec::new(),
+            notices: Vec::new(),
+            plugins: Vec::new(),
+            bad_plugins: Vec::new(),
+            bus_plugins: Vec::new(),
+        }
+    }
+
+    fn plugin(bus: u32, gain: f64) -> crate::LoadedPlugin {
+        crate::LoadedPlugin {
+            bus,
+            info: crate::PluginInfo {
+                path: "t.clap".into(),
+                id: "t".into(),
+                name: "T".into(),
+                vendor: "V".into(),
+                version: "1".into(),
+            },
+            status: crate::PluginStatus::Running,
+            latency: 0,
+            params: vec![crate::ParamState {
+                id: 1,
+                name: "Gain".into(),
+                module: String::new(),
+                min: -60.0,
+                max: 12.0,
+                default: 0.0,
+                value: gain,
+                text: format!("{gain:.1} dB"),
+                stepped: false,
+                read_only: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_value_change_is_sent_alone_and_other_changes_resend_the_plugin() {
+        let mut a = state(vec![slot(1, true)], vec![]);
+        a.bus_plugins = vec![plugin(1, 0.0)];
+        let mut b = a.clone();
+        b.bus_plugins = vec![plugin(1, -6.0)];
+        let changes = diff(&a, &b);
+        assert_eq!(changes, vec![Change::ParamChanged { bus: 1, id: 1, value: -6.0, text: "-6.0 dB".into() }]);
+        let mut applied = a.clone();
+        applied.apply(&changes);
+        assert_eq!(applied.bus_plugins, b.bus_plugins);
+
+        let mut c = b.clone();
+        c.bus_plugins[0].status = crate::PluginStatus::Faulted;
+        assert_eq!(diff(&b, &c), vec![Change::BusPluginSet(c.bus_plugins[0].clone())]);
+        let mut d = c.clone();
+        d.bus_plugins.clear();
+        d.plugins = vec![plugin(1, 0.0).info];
+        let changes = diff(&c, &d);
+        assert!(changes.contains(&Change::BusPluginRemoved { bus: 1 }));
+        assert!(changes.contains(&Change::PluginsChanged(d.plugins.clone(), Vec::new())));
+        let mut applied = c.clone();
+        applied.apply(&changes);
+        assert_eq!(applied, d);
     }
 
     #[test]

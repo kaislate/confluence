@@ -721,6 +721,11 @@ impl Engine {
                 Response::Error("subscriptions and status are served by the engine process".into())
             }
             Command::Shutdown => Response::Ok,
+            Command::ListPlugins
+            | Command::LoadPlugin { .. }
+            | Command::UnloadPlugin { .. }
+            | Command::SetParam { .. }
+            | Command::SetPluginState { .. } => Response::Error("plugins are not available yet".into()),
             Command::AddBus { ref name, channels, first_input, first_output } => {
                 let spec = BusSpec { name: name.clone(), channels, first_input, first_output };
                 match self.add_bus(&spec) {

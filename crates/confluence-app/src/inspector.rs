@@ -264,6 +264,9 @@ mod tests {
             points: vec![p(0, 2), p(1, 1), p(3, 3)],
             devices: Vec::new(),
             notices: Vec::new(),
+            plugins: Vec::new(),
+            bad_plugins: Vec::new(),
+            bus_plugins: Vec::new(),
         };
         assert_eq!(routes_of(&state, &a), 2, "0→2 (its input) and 1→1 (both)");
         assert_eq!(routes_of(&state, &b), 2, "0→2 (its output) and 3→3");
@@ -305,6 +308,9 @@ mod display_tests {
                 points: vec![point],
                 devices: Vec::new(),
                 notices: Vec::new(),
+                plugins: Vec::new(),
+                bad_plugins: Vec::new(),
+                bus_plugins: Vec::new(),
             }),
             conn: ConnState::Live,
             status: None,

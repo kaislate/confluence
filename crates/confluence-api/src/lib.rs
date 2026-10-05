@@ -9,7 +9,7 @@ mod state;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 2;
+pub const API_VERSION: u16 = 3;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -63,12 +63,53 @@ pub enum Command {
         first_input: Option<u32>,
         first_output: Option<u32>,
     },
+    /// Lists the CLAP plugins found on this PC. Replies `Plugins`.
+    ListPlugins,
+    /// Loads plugin `plugin_id` from the CLAP file `path` into an insert bus,
+    /// replacing any plugin there. The file is checked in a separate process first.
+    LoadPlugin {
+        bus: BusRef,
+        path: String,
+        plugin_id: String,
+    },
+    /// Takes the plugin off a bus (it becomes a summing bus again).
+    UnloadPlugin {
+        bus: BusRef,
+    },
+    /// Sets a plugin parameter (clamped to its range).
+    SetParam {
+        bus: BusRef,
+        param: u32,
+        value: f64,
+    },
+    /// Loads a saved state chunk into a bus's plugin.
+    SetPluginState {
+        bus: BusRef,
+        state: Vec<u8>,
+    },
+}
+
+/// Which insert bus a command means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BusRef {
+    /// By slot id (what clients use; ids change between engine runs).
+    Id(u32),
+    /// By its first send column (stable across runs; what the journal uses).
+    At(u32),
 }
 
 impl Command {
     /// True for commands that change engine state (and are journaled).
     pub fn is_mutation(&self) -> bool {
-        matches!(self, Command::SetPoint { .. } | Command::RemovePoint { .. })
+        matches!(
+            self,
+            Command::SetPoint { .. }
+                | Command::RemovePoint { .. }
+                | Command::LoadPlugin { .. }
+                | Command::UnloadPlugin { .. }
+                | Command::SetParam { .. }
+                | Command::SetPluginState { .. }
+        )
     }
 }
 
@@ -185,6 +226,58 @@ impl DeviceKind {
     }
 }
 
+/// A CLAP plugin found on this PC.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInfo {
+    /// The `.clap` file.
+    pub path: String,
+    pub id: String,
+    pub name: String,
+    pub vendor: String,
+    pub version: String,
+}
+
+/// One parameter of a loaded plugin.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParamState {
+    pub id: u32,
+    pub name: String,
+    /// Grouping path the plugin gives (e.g. `Filter/Envelope`), may be empty.
+    pub module: String,
+    pub min: f64,
+    pub max: f64,
+    pub default: f64,
+    pub value: f64,
+    /// The value as the plugin shows it (e.g. `-6.0 dB`).
+    pub text: String,
+    /// Takes whole-number values only.
+    pub stepped: bool,
+    /// The plugin reports it; it cannot be set.
+    pub read_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginStatus {
+    Running,
+    /// It reported an error or crashed while processing; its bus is silent
+    /// until the plugin is loaded again.
+    Faulted,
+    /// It could not be loaded (e.g. its file is missing); its bus is silent.
+    Failed(String),
+}
+
+/// The plugin on an insert bus.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoadedPlugin {
+    /// The bus's slot id.
+    pub bus: u32,
+    pub info: PluginInfo,
+    pub status: PluginStatus,
+    /// Samples of delay the plugin reports (not compensated yet).
+    pub latency: u32,
+    pub params: Vec<ParamState>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub kind: DeviceKind,
@@ -222,6 +315,7 @@ pub enum Response {
         ids: Vec<u32>,
         version: u64,
     },
+    Plugins(Vec<PluginInfo>),
 }
 
 /// Live engine numbers: in snapshots and in every telemetry event.
@@ -251,6 +345,12 @@ pub struct State {
     /// Devices that can be added.
     pub devices: Vec<DeviceInfo>,
     pub notices: Vec<String>,
+    /// CLAP plugins found on this PC, sorted by name.
+    pub plugins: Vec<PluginInfo>,
+    /// CLAP files that failed the load check: (path, why).
+    pub bad_plugins: Vec<(String, String)>,
+    /// The plugin on each insert bus that has one, sorted by bus id.
+    pub bus_plugins: Vec<LoadedPlugin>,
 }
 
 /// One difference between two published states.
@@ -270,6 +370,20 @@ pub enum Change {
     },
     DevicesChanged(Vec<DeviceInfo>),
     NoticesChanged(Vec<String>),
+    /// The discovered plugins and the files that failed the load check.
+    PluginsChanged(Vec<PluginInfo>, Vec<(String, String)>),
+    /// A bus's plugin was loaded, replaced, or changed other than by values.
+    BusPluginSet(LoadedPlugin),
+    BusPluginRemoved {
+        bus: u32,
+    },
+    /// Only a parameter's value (and its text) changed.
+    ParamChanged {
+        bus: u32,
+        id: u32,
+        value: f64,
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -360,6 +474,28 @@ pub fn read_envelope_since<R: Read, T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_commands_come_after_the_older_ones() {
+        let first = |c: &Command| postcard::to_allocvec(c).unwrap()[0];
+        assert_eq!(first(&Command::Status), 10);
+        let bus = BusRef::Id(3);
+        let cmds = [
+            Command::AddBus { name: "b".into(), channels: 2, first_input: None, first_output: None },
+            Command::ListPlugins,
+            Command::LoadPlugin { bus, path: "p.clap".into(), plugin_id: "x".into() },
+            Command::UnloadPlugin { bus },
+            Command::SetParam { bus, param: 1, value: -6.0 },
+            Command::SetPluginState { bus: BusRef::At(8), state: vec![1, 2, 3] },
+        ];
+        for (n, c) in cmds.iter().enumerate() {
+            assert_eq!(first(c), 11 + n as u8, "{c:?}");
+            let bytes = postcard::to_allocvec(c).unwrap();
+            assert_eq!(&postcard::from_bytes::<Command>(&bytes).unwrap(), c);
+        }
+        assert!(cmds[2].is_mutation() && cmds[3].is_mutation() && cmds[4].is_mutation() && cmds[5].is_mutation());
+        assert!(!cmds[1].is_mutation());
+    }
 
     #[test]
     fn add_bus_round_trips_and_older_variants_keep_their_index() {

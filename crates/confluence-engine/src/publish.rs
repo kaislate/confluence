@@ -79,7 +79,17 @@ pub fn published_state(
         _ => Vec::new(),
     };
     points.sort_by_key(|p| (p.input, p.output));
-    State { version: 0, status, slots, points, devices: device_list.to_vec(), notices: devices.notices() }
+    State {
+        version: 0,
+        status,
+        slots,
+        points,
+        devices: device_list.to_vec(),
+        notices: devices.notices(),
+        plugins: Vec::new(),
+        bad_plugins: Vec::new(),
+        bus_plugins: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +119,9 @@ mod tests {
                 .collect(),
             devices: Vec::new(),
             notices: Vec::new(),
+            plugins: Vec::new(),
+            bad_plugins: Vec::new(),
+            bus_plugins: Vec::new(),
         }
     }
 
