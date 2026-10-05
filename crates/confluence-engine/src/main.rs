@@ -324,6 +324,7 @@ mod app {
         st.midi_inputs = engine.midi_inputs().to_vec();
         st.midi_bindings = engine.midi_bindings().to_vec();
         st.midi_learning = engine.midi_learning();
+        st.scripts = engine.script_infos();
         st.scenes = engine.scene_infos();
         st.current_scene = engine.current_scene().map(String::from);
         st.morphing = engine.morphing();
@@ -530,6 +531,7 @@ mod app {
         out.extend(engine.plugin_commands());
         out.extend(engine.scene_commands());
         out.extend(engine.midi_commands());
+        out.extend(engine.script_commands());
         // Mid-morph, the routes are saved where the morph is taking them.
         out.extend(engine.settled_points().into_iter().map(|p| Command::SetPoint {
             input: p.input,

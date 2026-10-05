@@ -563,3 +563,44 @@ fn a_learned_midi_control_drives_a_route_and_is_kept() {
     assert_eq!(st.points[0].gain_db, 12.0);
     shutdown(child, &mut c);
 }
+
+#[test]
+fn a_script_reacts_to_midi_and_survives_a_restart() {
+    use confluence_api::ScriptStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let pipe = format!("confluence-script-{}", std::process::id());
+    let source = "function on_midi(m)
+        if m.kind == 'note_on' then confluence.set_route(1, 2, -m.note) end
+    end";
+    let note = |n: u8| Command::InjectMidi { device: "Pad".into(), bytes: vec![0x90, n, 100] };
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let set = Command::SetScript { name: "notes".into(), source: source.into(), enabled: true };
+    assert!(matches!(c.call(set).unwrap(), Response::Applied { .. }));
+    let broken = Command::SetScript { name: "broken".into(), source: "function (".into(), enabled: true };
+    assert!(matches!(c.call(broken).unwrap(), Response::Applied { .. }));
+    assert!(matches!(c.call(note(10)).unwrap(), Response::Applied { .. }));
+    let st = scenes_now(&pipe);
+    assert_eq!((st.points.len(), st.points[0].gain_db), (1, -10.0));
+    assert_eq!(st.scripts.len(), 2);
+    assert!(matches!(&st.scripts[0].status, ScriptStatus::Stopped(why) if !why.is_empty()), "broken");
+    assert_eq!(st.scripts[1].status, ScriptStatus::Running);
+    shutdown(child, &mut c);
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let st = scenes_now(&pipe);
+    assert_eq!(st.points[0].gain_db, -10.0, "the script's edit was saved");
+    assert_eq!(st.scripts[1].status, ScriptStatus::Running, "the script came back");
+    assert!(matches!(c.call(note(20)).unwrap(), Response::Applied { .. }));
+    assert_eq!(scenes_now(&pipe).points[0].gain_db, -20.0, "and runs");
+    shutdown(child, &mut c);
+
+    // That start rewrote the journal as the current state: scripts kept.
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(scenes_now(&pipe).scripts.len(), 2, "kept by compaction");
+    shutdown(child, &mut c);
+}
