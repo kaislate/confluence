@@ -118,6 +118,7 @@ fn point_panel(
             if ui.button("Remove route").clicked() {
                 actions.push(Action::Edit(Edit::RemovePoint { input, output }));
             }
+            midi_section(ui, state, input, output, actions);
         }
         None => {
             ui.label("No route");
@@ -125,6 +126,35 @@ fn point_panel(
                 actions.push(set(0.0, false, false));
             }
         }
+    }
+}
+
+/// The route's MIDI controls: bindings (with Forget) and MIDI Learn.
+fn midi_section(ui: &mut egui::Ui, state: &State, input: u32, output: u32, actions: &mut Vec<Action>) {
+    ui.separator();
+    ui.label(RichText::new("MIDI").strong());
+    for b in state.midi_bindings.iter().filter(|b| (b.input, b.output) == (input, output)) {
+        ui.horizontal(|ui| {
+            ui.label(format!("CC {} · ch {} · {}", b.cc, b.channel, b.device));
+            if ui.small_button("Forget").clicked() {
+                actions.push(Action::Edit(Edit::RemoveMidiBinding {
+                    device: b.device.clone(),
+                    channel: b.channel,
+                    cc: b.cc,
+                }));
+            }
+        });
+    }
+    if state.midi_learning == Some((input, output)) {
+        ui.label(RichText::new("Move a control on your MIDI device…").italics());
+        if ui.button("Cancel").clicked() {
+            actions.push(Action::Edit(Edit::CancelMidiLearn));
+        }
+    } else if ui.button("MIDI Learn").clicked() {
+        actions.push(Action::Edit(Edit::LearnMidi { input, output }));
+    }
+    if state.midi_inputs.is_empty() {
+        ui.label(RichText::new("No MIDI inputs found").weak());
     }
 }
 
@@ -582,6 +612,46 @@ mod display_tests {
         bus_panel_actions(&failed, |h| {
             assert!(h.query_by_label_contains("Missing: t.clap was not found").is_some());
         });
+    }
+
+    /// The route panel's actions with route 0→0, after `setup`.
+    fn route_panel_actions(view: &StoreView, setup: impl Fn(&mut Harness<'_>)) -> Vec<Action> {
+        let look = Look::builtin();
+        let pending = std::collections::HashMap::new();
+        let sel = Selection::Cell { input: 0, output: 0 };
+        let pt = view.state.as_ref().and_then(|s| s.points.first().cloned());
+        let mut out = Vec::new();
+        {
+            let mut h = Harness::new_ui(|ui| {
+                let ui_state = PluginUi { pending: &pending, loading: None };
+                out.extend(show(ui, view, &look, &sel, pt.clone(), None, true, &ui_state));
+            });
+            h.run();
+            setup(&mut h);
+            h.run();
+        }
+        out
+    }
+
+    #[test]
+    fn a_routes_midi_controls_are_shown_learned_and_forgotten() {
+        let pt = PointState { input: 0, output: 0, gain_db: 0.0, mute: false, invert: false };
+        let mut view = view_with(pt.clone());
+        let none = route_panel_actions(&view, |h| h.get_by_label("MIDI Learn").click());
+        assert_eq!(edits(&none), [&Edit::LearnMidi { input: 0, output: 0 }]);
+        view.state.as_mut().unwrap().midi_bindings =
+            vec![confluence_api::MidiBinding { device: "nanoKONTROL2".into(), channel: 1, cc: 7, input: 0, output: 0 }];
+        let bound = route_panel_actions(&view, |h| {
+            assert!(h.query_by_label("CC 7 · ch 1 · nanoKONTROL2").is_some());
+            h.get_by_label("Forget").click();
+        });
+        assert_eq!(edits(&bound), [&Edit::RemoveMidiBinding { device: "nanoKONTROL2".into(), channel: 1, cc: 7 }]);
+        view.state.as_mut().unwrap().midi_learning = Some((0, 0));
+        let learning = route_panel_actions(&view, |h| {
+            assert!(h.query_by_label_contains("Move a control").is_some());
+            h.get_by_label("Cancel").click();
+        });
+        assert_eq!(edits(&learning), [&Edit::CancelMidiLearn]);
     }
 
     /// A route quieter than the slider's range must still show its real gain
