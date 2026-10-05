@@ -276,7 +276,12 @@ fn a_plugin_on_a_bus_keeps_its_settings_across_restarts() {
     let shown = bus_plugins(&pipe);
     assert_eq!(shown.len(), 1);
     assert_eq!((shown[0].info.name.as_str(), &shown[0].status), ("Confluence Test Gain", &PluginStatus::Running));
-    assert_eq!(shown[0].params[0].text, "-6.0 dB");
+    // The plugin's own text follows shortly (it is asked for without waiting).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while bus_plugins(&pipe)[0].params[0].text != "-6.0 dB" {
+        assert!(std::time::Instant::now() < deadline, "the plugin's text never arrived");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // The crash plugin is caught by the load check; the engine carries on.
     let crash = Command::LoadPlugin { bus, path: path.clone(), plugin_id: "dev.confluence.test.crash".into() };
     let Response::Error(e) = c.call(crash).unwrap() else { panic!("the crash plugin must be refused") };
@@ -287,12 +292,12 @@ fn a_plugin_on_a_bus_keeps_its_settings_across_restarts() {
     let Response::Plugins(found) = c.call(Command::ListPlugins).unwrap() else { panic!() };
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut found = found;
-    while found.len() < 2 && std::time::Instant::now() < deadline {
+    while found.len() < 3 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
         let Response::Plugins(f) = c.call(Command::ListPlugins).unwrap() else { panic!() };
         found = f;
     }
-    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found.len(), 3, "{found:?}");
     shutdown(child, &mut c);
 
     let child = spawn_with_plugins(&pipe, &journal, &clap_dir);
@@ -324,5 +329,43 @@ fn a_plugin_on_a_bus_keeps_its_settings_across_restarts() {
     let child = spawn_with_plugins(&pipe, &journal, &clap_dir);
     let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     assert!(bus_plugins(&pipe).is_empty(), "unloading is saved too");
+    shutdown(child, &mut c);
+}
+
+/// A setting made, then the engine killed twice (the second time right after
+/// it started and rewrote its journal): the setting survives both.
+#[test]
+fn a_plugin_setting_survives_an_engine_killed_twice() {
+    use confluence_api::BusRef;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let clap_dir = dir.path().join("clap");
+    std::fs::create_dir(&clap_dir).unwrap();
+    let file = clap_dir.join("Test.clap");
+    std::fs::copy(test_plugin_dll(), &file).unwrap();
+    let pipe = format!("confluence-plugin-killed-{}", std::process::id());
+
+    let mut child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let add = Command::AddBus { name: "FX".into(), channels: 2, first_input: None, first_output: None };
+    let Response::Added { ids, .. } = c.call(add).unwrap() else { panic!() };
+    let bus = BusRef::Id(ids[0]);
+    let load =
+        Command::LoadPlugin { bus, path: file.display().to_string(), plugin_id: "dev.confluence.test.gain".into() };
+    assert!(matches!(c.call(load).unwrap(), Response::Applied { .. }));
+    for v in 1..=20 {
+        let set = Command::SetParam { bus, param: 1, value: -(v as f64) };
+        assert!(matches!(c.call(set).unwrap(), Response::Applied { .. }));
+    }
+    child.kill();
+
+    let mut child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let _c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(bus_plugins(&pipe)[0].params[0].value, -20.0);
+    child.kill();
+
+    let child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(bus_plugins(&pipe)[0].params[0].value, -20.0, "kept through the second kill too");
     shutdown(child, &mut c);
 }

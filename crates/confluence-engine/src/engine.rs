@@ -112,10 +112,14 @@ enum BusPlugin {
         /// The bus's fault count when this plugin was installed.
         faults_before: u64,
     },
-    /// Could not be loaded: the bus is silent; the reference and the last
-    /// state are kept so the plugin comes back when it can be loaded again.
-    Failed { info: PluginInfo, why: String, state: Option<Vec<u8>> },
+    /// Could not be loaded: the bus is silent; the reference, the last state
+    /// and the last value set per parameter are kept, so the plugin comes back
+    /// as it was when it can be loaded again.
+    Failed { info: PluginInfo, why: String, state: Option<Vec<u8>>, values: std::collections::BTreeMap<u32, f64> },
 }
+
+/// Room left in a journal record around a plugin state chunk.
+const STATE_HEADROOM: usize = 4096;
 
 /// Most channels an insert bus can have.
 pub const MAX_BUS_CHANNELS: u32 = 64;
@@ -239,6 +243,8 @@ pub struct Engine {
     returned_processors: Vec<Box<dyn Processor>>,
     /// Plugins on insert buses, by bus id.
     plugins: std::collections::BTreeMap<u32, BusPlugin>,
+    /// Plugin trouble the user should know about, by bus id.
+    plugin_notices: std::collections::BTreeMap<u32, String>,
     blocks: Arc<AtomicU64>,
     master_ppm: Arc<AtomicU64>,
     dsp_load: Arc<AtomicU32>,
@@ -292,6 +298,7 @@ impl Engine {
             plan_dirty: false,
             returned_processors: Vec::new(),
             plugins: std::collections::BTreeMap::new(),
+            plugin_notices: std::collections::BTreeMap::new(),
             blocks,
             master_ppm,
             dsp_load,
@@ -571,7 +578,7 @@ impl Engine {
         self.check_bus(bus)?;
         self.set_bus_processor(bus, None)?;
         self.set_bus_silent(bus, true)?;
-        self.plugins.insert(bus, BusPlugin::Failed { info, why, state: None });
+        self.plugins.insert(bus, BusPlugin::Failed { info, why, state: None, values: Default::default() });
         Ok(())
     }
 
@@ -619,6 +626,69 @@ impl Engine {
         out
     }
 
+    /// The commands that recreate every bus's plugin as it is now, for the
+    /// journal: per bus (by send column) `LoadPlugin`, its state chunk when the
+    /// plugin has one that fits a journal record, then every settable
+    /// parameter's value. The values come last: a state read from the plugin
+    /// may not have taken in the latest values yet, and a plugin may have no
+    /// state at all. A state too large to save raises a notice.
+    pub fn plugin_commands(&mut self) -> Vec<Command> {
+        let places: Vec<(u32, u32)> = {
+            let mut v: Vec<(u32, u32)> = self
+                .slots
+                .iter()
+                .filter(|s| matches!(s.stats, SlotStats::Bus(_)))
+                .map(|s| (s.state.first_output, s.state.id))
+                .collect();
+            v.sort();
+            v
+        };
+        let mut out = Vec::new();
+        for (at, bus) in places {
+            let Some(p) = self.plugins.get_mut(&bus) else { continue };
+            let (info, state, values): (PluginInfo, Option<Vec<u8>>, Vec<(u32, f64)>) = match p {
+                BusPlugin::Loaded { control, .. } => {
+                    let values = control.params().iter().filter(|q| !q.read_only).map(|q| (q.id, q.value)).collect();
+                    (control.info(), control.save_state().ok(), values)
+                }
+                BusPlugin::Failed { info, state, values, .. } => {
+                    (info.clone(), state.clone(), values.iter().map(|(k, v)| (*k, *v)).collect())
+                }
+            };
+            out.push(Command::LoadPlugin { bus: BusRef::At(at), path: info.path.clone(), plugin_id: info.id.clone() });
+            match state {
+                Some(state) if state.len() + STATE_HEADROOM <= confluence_api::MAX_FRAME_BYTES as usize => {
+                    self.plugin_notices.remove(&bus);
+                    out.push(Command::SetPluginState { bus: BusRef::At(at), state });
+                }
+                Some(state) => {
+                    self.plugin_notices.insert(
+                        bus,
+                        format!(
+                            "{}: its settings are too large to save ({} KB); only its parameter values are saved",
+                            info.name,
+                            state.len() / 1024
+                        ),
+                    );
+                }
+                None => {
+                    self.plugin_notices.remove(&bus);
+                }
+            }
+            out.extend(values.into_iter().map(|(param, value)| Command::SetParam {
+                bus: BusRef::At(at),
+                param,
+                value,
+            }));
+        }
+        out
+    }
+
+    /// Plugin trouble the user should know about.
+    pub fn plugin_notices(&self) -> Vec<String> {
+        self.plugin_notices.values().cloned().collect()
+    }
+
     /// A bus's plugin and its current state chunk (for saving the project).
     pub fn plugin_snapshot(&mut self, bus: u32) -> Option<(PluginInfo, Option<Vec<u8>>)> {
         match self.plugins.get_mut(&bus)? {
@@ -648,7 +718,10 @@ impl Engine {
                 let bus = self.resolve_bus(bus).map_err(|e| e.to_string())?;
                 match self.plugins.get_mut(&bus) {
                     Some(BusPlugin::Loaded { control, .. }) => control.set_param(*param, *value),
-                    Some(BusPlugin::Failed { info, .. }) => Err(format!("{} is not loaded", info.name)),
+                    Some(BusPlugin::Failed { values, .. }) => {
+                        values.insert(*param, *value);
+                        Ok(())
+                    }
                     None => Err(format!("insert bus {bus} has no plugin")),
                 }
             }
@@ -786,6 +859,7 @@ impl Engine {
             self.buses -= 1;
             self.plan_dirty = true;
             self.plugins.remove(&id);
+            self.plugin_notices.remove(&id);
         }
         // Routes on the slot's channels go: edges between buses may change.
         self.plan_dirty |= self.buses > 0;
@@ -1427,8 +1501,10 @@ mod tests {
         let shown = e.bus_plugins();
         assert_eq!(shown[0].status, PluginStatus::Failed("f.clap was not found".into()));
         assert_eq!(e.plugin_snapshot(b), Some((info, Some(vec![7, 7]))));
-        let set = Command::SetParam { bus: BusRef::Id(b), param: 1, value: 0.0 };
-        assert_eq!(e.handle(&set), Response::Error("Fake is not loaded".into()));
+        let set = Command::SetParam { bus: BusRef::Id(b), param: 1, value: -9.0 };
+        assert_eq!(e.handle(&set), Response::Ok, "kept for when the plugin is back");
+        let cmds = e.plugin_commands();
+        assert!(cmds.contains(&set_param_at(8, 1, -9.0)), "{cmds:?}");
     }
 
     #[test]
@@ -1442,6 +1518,83 @@ mod tests {
         e.set_plugin(b, Some((fake(), halves()))).unwrap();
         block(&mut e, &mut a, 1.0, 3);
         assert_eq!(e.bus_plugins()[0].status, PluginStatus::Running, "loading again clears it");
+    }
+
+    fn set_param_at(at: u32, param: u32, value: f64) -> Command {
+        Command::SetParam { bus: BusRef::At(at), param, value }
+    }
+
+    /// Saves a fixed state, whatever its values: like a plugin whose state was
+    /// read before the audio side applied the latest values.
+    struct StaleState(FakePlugin, Option<Vec<u8>>);
+
+    impl PluginControl for StaleState {
+        fn info(&self) -> PluginInfo {
+            self.0.info()
+        }
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn params(&self) -> Vec<ParamState> {
+            self.0.params()
+        }
+        fn set_param(&mut self, id: u32, value: f64) -> Result<(), String> {
+            self.0.set_param(id, value)
+        }
+        fn poll(&mut self) -> bool {
+            false
+        }
+        fn save_state(&mut self) -> Result<Vec<u8>, String> {
+            self.1.clone().ok_or_else(|| "this plugin cannot save its state".to_string())
+        }
+        fn load_state(&mut self, _state: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn stale(state: Option<Vec<u8>>) -> Box<dyn PluginControl> {
+        Box::new(StaleState(FakePlugin { gain: 0.0, state: Arc::new(Mutex::new(Vec::new())) }, state))
+    }
+
+    #[test]
+    fn a_plugins_values_are_saved_after_its_state() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        e.set_plugin(b, Some((stale(Some(b"old".to_vec())), halves()))).unwrap();
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: -6.0 });
+        let cmds = e.plugin_commands();
+        let load = Command::LoadPlugin { bus: BusRef::At(8), path: "f.clap".into(), plugin_id: "fake".into() };
+        let state = Command::SetPluginState { bus: BusRef::At(8), state: b"old".to_vec() };
+        assert_eq!(cmds, vec![load, state, set_param_at(8, 1, -6.0)], "values win over a stale state");
+    }
+
+    #[test]
+    fn a_plugin_without_a_state_still_has_its_values_saved() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        e.set_plugin(b, Some((stale(None), halves()))).unwrap();
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: -3.0 });
+        let cmds = e.plugin_commands();
+        assert!(cmds.contains(&set_param_at(8, 1, -3.0)), "{cmds:?}");
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SetPluginState { .. })));
+    }
+
+    #[test]
+    fn a_state_too_large_to_save_is_reported_and_its_values_are_kept() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        let huge = vec![0u8; confluence_api::MAX_FRAME_BYTES as usize];
+        e.set_plugin(b, Some((stale(Some(huge)), halves()))).unwrap();
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: -1.0 });
+        let cmds = e.plugin_commands();
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SetPluginState { .. })), "too large for the journal");
+        assert!(cmds.contains(&set_param_at(8, 1, -1.0)));
+        let notices = e.plugin_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("Fake") && notices[0].contains("too large to save"), "{notices:?}");
+        e.set_plugin(b, Some((stale(Some(vec![1])), halves()))).unwrap();
+        e.plugin_commands();
+        assert!(e.plugin_notices().is_empty(), "cleared once it fits");
     }
 
     #[test]

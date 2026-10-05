@@ -18,6 +18,16 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 const RESCAN: Duration = Duration::from_secs(30);
 /// Exit code of a scan process that failed cleanly (its reason is on stderr).
 pub const SCAN_FAILED: i32 = 2;
+/// What a load check prints when the plugin passed, followed by its id. A
+/// plugin that ends the process with code 0 never gets to print it.
+pub const CHECK_PASSED: &str = "confluence-check-passed";
+/// How long to wait for a finished scan's output: a helper process the plugin
+/// started may keep the pipes open.
+const OUTPUT_GRACE: Duration = Duration::from_secs(2);
+/// Windows `CREATE_NO_WINDOW`: a scan started by an engine without a console
+/// (as the window starts it) would otherwise open a console window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The standard CLAP folders on Windows, then each folder in `CLAP_PATH`.
 pub fn default_dirs() -> Vec<PathBuf> {
@@ -63,19 +73,24 @@ fn stamp(path: &Path) -> Option<Stamp> {
 
 /// Runs `exe` with `args` (a scan process) and returns its stdout, or why it failed.
 fn run_scan(exe: &Path, args: &[&std::ffi::OsStr], file: &Path) -> Result<String, String> {
-    let mut child = Command::new(exe)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not start the plugin check: {e}"))?;
+    let mut cmd = Command::new(exe);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("could not start the plugin check: {e}"))?;
+    // Readers report through channels, so a pipe held open by a helper
+    // process the plugin started cannot keep us waiting.
     let read = |mut r: Box<dyn Read + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut s = String::new();
             let _ = r.read_to_string(&mut s);
-            s
-        })
+            let _ = tx.send(s);
+        });
+        rx
     };
     let out = child.stdout.take().map(|o| read(Box::new(o)));
     let err = child.stderr.take().map(|e| read(Box::new(e)));
@@ -91,8 +106,10 @@ fn run_scan(exe: &Path, args: &[&std::ffi::OsStr], file: &Path) -> Result<String
             }
         }
     };
-    let join = |h: Option<std::thread::JoinHandle<String>>| h.and_then(|h| h.join().ok()).unwrap_or_default();
-    let (stdout, stderr) = (join(out), join(err));
+    let collect = |rx: Option<std::sync::mpsc::Receiver<String>>| {
+        rx.and_then(|rx| rx.recv_timeout(OUTPUT_GRACE).ok()).unwrap_or_default()
+    };
+    let (stdout, stderr) = (collect(out), collect(err));
     match status.code() {
         Some(0) => Ok(stdout),
         Some(SCAN_FAILED) => Err(stderr.trim().to_string()),
@@ -132,7 +149,14 @@ pub fn check(exe: &Path, file: &Path, id: &str, rate: f64, block: u32) -> Result
         "--block".as_ref(),
         block_s.as_ref(),
     ];
-    let r = run_scan(exe, &args, file).map(|_| ());
+    let passed = format!("{CHECK_PASSED} {id}");
+    let r = run_scan(exe, &args, file).and_then(|out| {
+        if out.lines().any(|l| l.trim() == passed) {
+            Ok(())
+        } else {
+            Err(format!("{} ended its check early; it was not loaded", file.display()))
+        }
+    });
     if let Ok(mut m) = checked().lock() {
         m.insert(key, r.clone());
     }

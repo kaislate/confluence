@@ -32,7 +32,7 @@ mod app {
     use std::time::{Duration, Instant};
 
     use confluence_api::{
-        BusRef, Command, DeviceInfo, EngineStatus, Event, ParamState, PluginInfo, Response, SlotHealth, MAX_FRAME_BYTES,
+        BusRef, Command, DeviceInfo, EngineStatus, Event, ParamState, PluginInfo, Response, SlotHealth,
     };
     use confluence_engine::clock::InternalClock;
     use confluence_engine::devices::{start_asio_master, DeviceManager};
@@ -82,10 +82,11 @@ mod app {
     /// only this process down. A clean failure exits with `SCAN_FAILED` and
     /// its reason on stderr.
     pub fn scan(args: &Args) -> std::process::ExitCode {
-        use confluence_engine::plugins::SCAN_FAILED;
+        use confluence_engine::plugins::{CHECK_PASSED, SCAN_FAILED};
         let Some(file) = args.scan.as_deref() else { return std::process::ExitCode::FAILURE };
         let result = match &args.plugin {
-            Some(id) => confluence_plugin_host::check(file, id, args.rate, args.block as u32).map(|()| String::new()),
+            Some(id) => confluence_plugin_host::check(file, id, args.rate, args.block as u32)
+                .map(|()| format!("{CHECK_PASSED} {id}")),
             None => confluence_plugin_host::describe(file)
                 .and_then(|list| serde_json::to_string(&list).map_err(|e| e.to_string())),
         };
@@ -258,6 +259,7 @@ mod app {
     fn with_plugins(mut st: confluence_api::State, engine: &mut Engine, scanner: &Scanner) -> confluence_api::State {
         (st.plugins, st.bad_plugins) = scanner.list();
         st.bus_plugins = engine.bus_plugins();
+        st.notices.extend(engine.plugin_notices());
         st
     }
 
@@ -438,22 +440,7 @@ mod app {
                 first_output: Some(s.first_output),
             })
             .collect();
-        let buses: Vec<(u32, u32)> =
-            engine.slots().into_iter().filter(|s| s.is_bus()).map(|s| (s.id, s.first_output)).collect();
-        for (id, at) in buses {
-            let Some((info, state)) = engine.plugin_snapshot(id) else { continue };
-            out.push(Command::LoadPlugin { bus: BusRef::At(at), path: info.path, plugin_id: info.id });
-            match state {
-                Some(state) if state.len() + 4096 <= MAX_FRAME_BYTES as usize => {
-                    out.push(Command::SetPluginState { bus: BusRef::At(at), state });
-                }
-                Some(state) => eprintln!(
-                    "confluence-engine: warning: {} bytes of plugin state are too many to save; its settings are not saved",
-                    state.len()
-                ),
-                None => {}
-            }
-        }
+        out.extend(engine.plugin_commands());
         if let Response::Points(points) = engine.handle(&Command::ListPoints) {
             out.extend(points.into_iter().map(|p| Command::SetPoint {
                 input: p.input,
@@ -489,6 +476,7 @@ mod app {
         let (mut engine, audio) = Engine::new(EngineConfig::new(rate, block));
         let plugin_thread = PluginThread::start()?;
         let exe = std::env::current_exe()?;
+        let replay = confluence_engine::journal::collapse_params(replay);
         for cmd in &replay {
             match cmd {
                 Command::LoadPlugin { bus, path, plugin_id } => {

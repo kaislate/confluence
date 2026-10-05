@@ -23,6 +23,9 @@ use crate::processor::ClapProcessor;
 
 /// How long a caller waits for the plugin thread.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Saving a state happens under the engine's lock: keep it short, and fall
+/// back to the last state saved when the plugin thread is busy.
+const SAVE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Loading can read files and allocate a lot.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the plugin thread looks for plugins asking to be called back.
@@ -119,6 +122,8 @@ impl PluginThread {
             params: loaded.params,
             params_tx: loaded.params_tx,
             reported_rx: loaded.reported_rx,
+            texts: Vec::new(),
+            last_state: None,
         };
         Ok((link, Box::new(loaded.processor)))
     }
@@ -155,6 +160,10 @@ pub struct PluginLink {
     params: Vec<ParamState>,
     params_tx: mailbox::Sender<(u32, f64)>,
     reported_rx: mailbox::Receiver<(u32, f64)>,
+    /// Texts asked of the plugin thread and not yet answered: (param, reply).
+    texts: Vec<(u32, mpsc::Receiver<String>)>,
+    /// The last state chunk saved, for when the plugin thread is busy.
+    last_state: Option<Vec<u8>>,
 }
 
 impl PluginLink {
@@ -190,8 +199,27 @@ impl PluginLink {
         Ok(())
     }
 
-    /// Takes in values the plugin reported itself. True if any changed.
+    /// Takes in values the plugin reported itself, and texts the plugin thread
+    /// has answered. True if anything shown changed.
     pub fn poll(&mut self) -> bool {
+        let mut shown = false;
+        let mut answered = Vec::new();
+        self.texts.retain(|(id, rx)| match rx.try_recv() {
+            Ok(text) => {
+                answered.push((*id, text));
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (id, text) in answered {
+            if let Some(p) = self.params.iter_mut().find(|p| p.id == id) {
+                if p.text != text {
+                    p.text = text;
+                    shown = true;
+                }
+            }
+        }
         let mut changed = Vec::new();
         while let Some((id, value)) = self.reported_rx.try_recv() {
             if let Some(p) = self.params.iter_mut().find(|p| p.id == id) {
@@ -206,13 +234,26 @@ impl PluginLink {
         for id in &changed {
             self.refresh_text(*id);
         }
-        !changed.is_empty()
+        shown || !changed.is_empty()
     }
 
-    /// The plugin's state chunk.
+    /// True while texts asked of the plugin are still on their way.
+    pub fn texts_pending(&self) -> bool {
+        !self.texts.is_empty()
+    }
+
+    /// The plugin's state chunk. If the plugin thread does not answer soon
+    /// (it may be loading another plugin), the last state saved is returned.
     pub fn save_state(&mut self) -> Result<Vec<u8>, String> {
         let plugin = self.plugin;
-        self.thread.call(REPLY_TIMEOUT, |reply| Msg::SaveState { plugin, reply })?
+        match self.thread.call(SAVE_TIMEOUT, |reply| Msg::SaveState { plugin, reply }) {
+            Ok(Ok(state)) => {
+                self.last_state = Some(state.clone());
+                Ok(state)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => self.last_state.clone().ok_or(e),
+        }
     }
 
     /// Loads a state chunk, then re-reads every value.
@@ -230,15 +271,16 @@ impl PluginLink {
         Ok(())
     }
 
+    /// Asks the plugin how it shows a parameter's value; until it answers
+    /// (collected by `poll`), the number is shown.
     fn refresh_text(&mut self, id: u32) {
-        let Some(value) = self.params.iter().find(|p| p.id == id).map(|p| p.value) else { return };
-        let plugin = self.plugin;
-        let text = self
-            .thread
-            .call(REPLY_TIMEOUT, |reply| Msg::Text { plugin, id, value, reply })
-            .unwrap_or_else(|_| format!("{value:.3}"));
-        if let Some(p) = self.params.iter_mut().find(|p| p.id == id) {
-            p.text = text;
+        let Some(p) = self.params.iter_mut().find(|p| p.id == id) else { return };
+        let value = p.value;
+        p.text = format!("{value:.2}");
+        let (reply, rx) = mpsc::channel();
+        if self.thread.tx.send(Msg::Text { plugin: self.plugin, id, value, reply }).is_ok() {
+            self.texts.retain(|(q, _)| *q != id);
+            self.texts.push((id, rx));
         }
     }
 }

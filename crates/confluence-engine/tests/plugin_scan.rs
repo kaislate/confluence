@@ -23,7 +23,7 @@ fn test_plugin() -> PathBuf {
 fn scanning_the_file_lists_both_test_plugins() {
     let found = plugins::describe(&engine(), &test_plugin()).unwrap();
     let names: Vec<&str> = found.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["Confluence Test Gain", "Confluence Test Crash"]);
+    assert_eq!(names, ["Confluence Test Gain", "Confluence Test Crash", "Confluence Test Exit"]);
     assert!(found.iter().all(|p| p.vendor == "Confluence" && p.path.ends_with("confluence_test_plugin.dll")));
 }
 
@@ -33,6 +33,9 @@ fn the_load_check_passes_a_good_plugin_and_catches_a_crashing_one() {
     plugins::check(&engine(), &file, "dev.confluence.test.gain", 48_000.0, 256).unwrap();
     let err = plugins::check(&engine(), &file, "dev.confluence.test.crash", 48_000.0, 256).unwrap_err();
     assert!(err.contains("crashed while loading; it was not loaded"), "{err}");
+    // Ending the process "successfully" during the check is not a pass.
+    let err = plugins::check(&engine(), &file, "dev.confluence.test.exit", 48_000.0, 256).unwrap_err();
+    assert!(err.contains("it was not loaded"), "{err}");
     let err = plugins::check(&engine(), &file, "no.such.plugin", 48_000.0, 256).unwrap_err();
     assert!(err.contains("has no plugin no.such.plugin"), "{err}");
 }
@@ -49,7 +52,7 @@ fn the_scanner_finds_clap_files_and_lists_bad_ones() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let (found, bad) = loop {
         let (found, bad) = scanner.list();
-        if found.len() == 2 && bad.len() == 1 {
+        if found.len() == 3 && bad.len() == 1 {
             break (found, bad);
         }
         assert!(Instant::now() < deadline, "scan did not finish: {found:?} {bad:?}");

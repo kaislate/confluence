@@ -19,6 +19,16 @@ fn source() -> Source {
     })
 }
 
+/// Polls until every text asked of the plugin has arrived.
+fn settle(link: &mut PluginLink) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while link.texts_pending() {
+        assert!(Instant::now() < deadline, "texts never arrived");
+        link.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn load(t: &PluginThread, channels: u32) -> (PluginLink, Box<dyn Processor>) {
     t.load(source(), GAIN_ID, RATE, BLOCK, channels).unwrap()
 }
@@ -66,6 +76,7 @@ fn a_parameter_change_reaches_the_audio_and_its_text_follows() {
     link.set_param(PARAM_GAIN, -6.020_6).unwrap();
     let out = run(p.as_mut(), 2, 1.0);
     assert!(out.iter().all(|x| (x - 0.5).abs() < 1e-3), "{out:?}");
+    settle(&mut link);
     assert_eq!(link.params()[0].text, "-6.0 dB");
     link.set_param(PARAM_GAIN, 100.0).unwrap();
     assert_eq!(link.params()[0].value, 12.0, "clamped to the range");
@@ -79,6 +90,7 @@ fn a_value_the_plugin_reports_reaches_the_link() {
     let (mut link, mut p) = load(&t, 2);
     run(p.as_mut(), 2, 0.5);
     assert!(link.poll(), "the peak changed");
+    settle(&mut link);
     let peak = link.params().iter().find(|q| q.id == PARAM_PEAK).unwrap();
     assert!((peak.value - 0.5).abs() < 1e-6, "{peak:?}");
     assert_eq!(peak.text, "0.50");
@@ -94,6 +106,7 @@ fn state_round_trips() {
     let saved = a.save_state().unwrap();
     let (mut b, _pb) = load(&t, 2);
     b.load_state(&saved).unwrap();
+    settle(&mut b);
     assert_eq!(b.params()[0].value, -12.0);
     assert_eq!(b.params()[0].text, "-12.0 dB");
 }
@@ -139,4 +152,31 @@ fn an_unknown_plugin_id_is_a_clear_error() {
     let t = PluginThread::start().unwrap();
     let err = t.load(source(), "no.such.plugin", RATE, BLOCK, 2).err().unwrap();
     assert!(err.contains("has no plugin no.such.plugin"), "{err}");
+}
+
+/// A parameter change must not wait for the plugin thread (it may be busy
+/// loading another plugin for seconds): its text arrives later, through `poll`.
+#[test]
+fn a_parameter_change_does_not_wait_for_a_busy_plugin_thread() {
+    let t = PluginThread::start().unwrap();
+    let (mut link, _p) = load(&t, 2);
+    let slow = Source::InProcess(|| {
+        std::thread::sleep(Duration::from_secs(2));
+        clack_host::entry::PluginEntry::load_from_clack::<confluence_test_plugin::Entry>(c"slow.dll")
+            .map_err(|e| e.to_string())
+    });
+    let busy = t.clone();
+    let loading = std::thread::spawn(move || busy.load(slow, GAIN_ID, RATE, BLOCK, 2).map(|_| ()));
+    std::thread::sleep(Duration::from_millis(200)); // the plugin thread is now loading
+    let started = Instant::now();
+    link.set_param(PARAM_GAIN, -6.0).unwrap();
+    assert!(started.elapsed() < Duration::from_millis(500), "set_param waited {:?}", started.elapsed());
+    assert_eq!(link.params()[0].value, -6.0, "the value is known at once");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while link.params()[0].text != "-6.0 dB" {
+        assert!(Instant::now() < deadline, "the plugin's text never arrived: {:?}", link.params()[0].text);
+        link.poll();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    loading.join().unwrap().unwrap();
 }

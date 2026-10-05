@@ -4,7 +4,7 @@
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_host::events::event_types::ParamValueEvent;
 use clack_host::prelude::*;
-use confluence_test_plugin::{Entry, CRASH_ID, GAIN_ID, PARAM_GAIN};
+use confluence_test_plugin::{Entry, CRASH_ID, EXIT_ID, GAIN_ID, PARAM_GAIN};
 
 struct Shared;
 impl SharedHandler<'_> for Shared {
@@ -37,6 +37,7 @@ fn both_plugins_are_listed() {
         vec![
             (GAIN_ID.to_string(), "Confluence Test Gain".to_string()),
             (CRASH_ID.to_string(), "Confluence Test Crash".to_string()),
+            (EXIT_ID.to_string(), "Confluence Test Exit".to_string()),
         ]
     );
 }

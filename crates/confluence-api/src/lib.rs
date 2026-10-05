@@ -90,7 +90,7 @@ pub enum Command {
 }
 
 /// Which insert bus a command means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BusRef {
     /// By slot id (what clients use; ids change between engine runs).
     Id(u32),

@@ -6,6 +6,8 @@
 //!   parameter values.
 //! - **Confluence Test Crash** (`dev.confluence.test.crash`): aborts the process
 //!   when created, for the engine's load-check tests. Never create it in-process.
+//! - **Confluence Test Exit** (`dev.confluence.test.exit`): ends the process with
+//!   exit code 0 when created (a check must not mistake that for success).
 
 use std::ffi::CStr;
 use std::fmt::Write as _;
@@ -29,6 +31,8 @@ use clack_plugin::stream::{InputStream, OutputStream};
 
 pub const GAIN_ID: &str = "dev.confluence.test.gain";
 pub const CRASH_ID: &str = "dev.confluence.test.crash";
+/// Ends the process "successfully" (exit code 0) when created.
+pub const EXIT_ID: &str = "dev.confluence.test.exit";
 /// Gain in dB, −60…+12.
 pub const PARAM_GAIN: u32 = 1;
 /// 0 or 1: at 1, processing fails.
@@ -278,17 +282,19 @@ impl Plugin for TestCrash {
 pub struct Factory {
     gain: PluginDescriptor,
     crash: PluginDescriptor,
+    exit: PluginDescriptor,
 }
 
 impl PluginFactoryImpl for Factory {
     fn plugin_count(&self) -> u32 {
-        2
+        3
     }
 
     fn plugin_descriptor(&self, index: u32) -> Option<&PluginDescriptor> {
         match index {
             0 => Some(&self.gain),
             1 => Some(&self.crash),
+            2 => Some(&self.exit),
             _ => None,
         }
     }
@@ -308,13 +314,20 @@ impl PluginFactoryImpl for Factory {
                 |_host| std::process::abort(),
                 |_host, _shared| Ok(()),
             ))
+        } else if plugin_id.to_bytes() == EXIT_ID.as_bytes() {
+            Some(PluginInstance::new::<TestCrash>(
+                host_info,
+                &self.exit,
+                |_host| std::process::exit(0),
+                |_host, _shared| Ok(()),
+            ))
         } else {
             None
         }
     }
 }
 
-/// The file's entry: one factory with both plugins.
+/// The file's entry: one factory with all three plugins.
 pub struct Entry {
     factory: PluginFactoryWrapper<Factory>,
 }
@@ -329,6 +342,10 @@ impl clack_plugin::entry::Entry for Entry {
                     .with_version("1.0.0")
                     .with_features([AUDIO_EFFECT, STEREO]),
                 crash: PluginDescriptor::new(CRASH_ID, "Confluence Test Crash")
+                    .with_vendor("Confluence")
+                    .with_version("1.0.0")
+                    .with_features([AUDIO_EFFECT, UTILITY]),
+                exit: PluginDescriptor::new(EXIT_ID, "Confluence Test Exit")
                     .with_vendor("Confluence")
                     .with_version("1.0.0")
                     .with_features([AUDIO_EFFECT, UTILITY]),
