@@ -375,6 +375,9 @@ mod tests {
             scenes: Vec::new(),
             current_scene: None,
             morphing: false,
+            midi_inputs: Vec::new(),
+            midi_bindings: Vec::new(),
+            midi_learning: None,
         };
         assert_eq!(routes_of(&state, &a), 2, "0→2 (its input) and 1→1 (both)");
         assert_eq!(routes_of(&state, &b), 2, "0→2 (its output) and 3→3");
@@ -422,6 +425,9 @@ mod display_tests {
                 scenes: Vec::new(),
                 current_scene: None,
                 morphing: false,
+                midi_inputs: Vec::new(),
+                midi_bindings: Vec::new(),
+                midi_learning: None,
             }),
             conn: ConnState::Live,
             status: None,

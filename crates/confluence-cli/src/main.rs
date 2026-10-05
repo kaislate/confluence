@@ -70,6 +70,16 @@ enum Cmd {
     RecallScene { name: String },
     /// Delete scene NAME.
     DeleteScene { name: String },
+    /// Show MIDI inputs and bindings.
+    Midi,
+    /// The next CC that arrives binds to the gain of route IN → OUT.
+    LearnMidi { input: u32, output: u32 },
+    /// Handle a MIDI message as if DEVICE sent it (bytes in decimal or 0x hex).
+    InjectMidi {
+        device: String,
+        #[arg(value_parser = parse_byte, num_args = 1..=3)]
+        bytes: Vec<u8>,
+    },
     /// Set parameter PARAM of the plugin on insert bus BUS.
     SetParam {
         bus: u32,
@@ -135,12 +145,26 @@ impl Cmd {
             }
             Cmd::RecallScene { ref name } => Command::RecallScene { name: name.clone() },
             Cmd::DeleteScene { ref name } => Command::DeleteScene { name: name.clone() },
+            Cmd::Midi => Command::Subscribe,
+            Cmd::LearnMidi { input, output } => Command::LearnMidi { input, output },
+            Cmd::InjectMidi { ref device, ref bytes } => {
+                Command::InjectMidi { device: device.clone(), bytes: bytes.clone() }
+            }
             Cmd::HideEditor { bus } => Command::HideEditor { bus: BusRef::Id(bus) },
             Cmd::SetParam { bus, param, value } => Command::SetParam { bus: BusRef::Id(bus), param, value },
             Cmd::Status => Command::Status,
             Cmd::Watch => Command::Subscribe,
         }
     }
+}
+
+/// A byte given as decimal or `0x` hex.
+fn parse_byte(s: &str) -> Result<u8, String> {
+    let r = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u8::from_str_radix(hex, 16),
+        None => s.parse(),
+    };
+    r.map_err(|e| format!("{s}: {e}"))
 }
 
 fn render(resp: &Response) -> String {
@@ -303,6 +327,12 @@ fn render_change(c: &Change) -> String {
         }
         Change::BusPluginSet(p) => format!("bus #{}: {} {:?}", p.bus, p.info.name, p.status),
         Change::BusPluginRemoved { bus } => format!("bus #{bus}: plugin removed"),
+        Change::MidiChanged(inputs, bindings, learning) => format!(
+            "MIDI: {} inputs, {} bindings{}",
+            inputs.len(),
+            bindings.len(),
+            learning.map(|(i, o)| format!(", learning {i} -> {o}")).unwrap_or_default()
+        ),
         Change::ScenesChanged(s, current, morphing) => format!(
             "{} scenes, current: {}{}",
             s.len(),
@@ -445,6 +475,11 @@ v7  slot #3 removed"
         );
         assert_eq!(parse(&["recall-scene", "Verse"]), Command::RecallScene { name: "Verse".into() });
         assert_eq!(parse(&["delete-scene", "Verse"]), Command::DeleteScene { name: "Verse".into() });
+        assert_eq!(parse(&["learn-midi", "1", "2"]), Command::LearnMidi { input: 1, output: 2 });
+        assert_eq!(
+            parse(&["inject-midi", "nanoKONTROL2", "0xB0", "7", "100"]),
+            Command::InjectMidi { device: "nanoKONTROL2".into(), bytes: vec![0xB0, 7, 100] }
+        );
         assert_eq!(parse(&["hide-editor", "4"]), Command::HideEditor { bus: BusRef::Id(4) });
         assert_eq!(
             parse(&["set-param", "4", "1", "-6.5"]),

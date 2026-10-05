@@ -6,10 +6,11 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 
 mod state;
+pub mod taper;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 5;
+pub const API_VERSION: u16 = 6;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -119,6 +120,39 @@ pub enum Command {
     },
     /// Replies `Scenes`.
     ListScenes,
+    /// The next CC that arrives binds that control to this route's gain.
+    LearnMidi {
+        input: u32,
+        output: u32,
+    },
+    CancelMidiLearn,
+    /// Binds a control to a route's gain (replacing that control's binding).
+    SetMidiBinding {
+        binding: MidiBinding,
+    },
+    RemoveMidiBinding {
+        device: String,
+        channel: u8,
+        cc: u8,
+    },
+    /// Handles `bytes` as a MIDI message received from `device` (diagnostics, tests).
+    InjectMidi {
+        device: String,
+        bytes: Vec<u8>,
+    },
+}
+
+/// A hardware control (a CC on a channel of a MIDI input) bound to a route's gain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiBinding {
+    /// The MIDI input's name.
+    pub device: String,
+    /// 1 to 16.
+    pub channel: u8,
+    pub cc: u8,
+    /// The route, by its channels.
+    pub input: u32,
+    pub output: u32,
 }
 
 /// Most a morph can last.
@@ -176,6 +210,8 @@ impl Command {
                 | Command::DeleteScene { .. }
                 | Command::SetSceneMorph { .. }
                 | Command::RecallScene { .. }
+                | Command::SetMidiBinding { .. }
+                | Command::RemoveMidiBinding { .. }
         )
     }
 }
@@ -432,6 +468,11 @@ pub struct State {
     pub current_scene: Option<String>,
     /// A recall is gliding to its scene.
     pub morphing: bool,
+    /// MIDI inputs open now.
+    pub midi_inputs: Vec<String>,
+    pub midi_bindings: Vec<MidiBinding>,
+    /// The route waiting for a control to be moved (MIDI Learn).
+    pub midi_learning: Option<(u32, u32)>,
 }
 
 /// One difference between two published states.
@@ -460,6 +501,8 @@ pub enum Change {
     },
     /// The scenes, the current one, and whether a morph runs.
     ScenesChanged(Vec<SceneInfo>, Option<String>, bool),
+    /// MIDI inputs, bindings, and the route being learned.
+    MidiChanged(Vec<String>, Vec<MidiBinding>, Option<(u32, u32)>),
     /// Only a parameter's value (and its text) changed.
     ParamChanged {
         bus: u32,
@@ -584,6 +627,14 @@ mod tests {
             Command::DeleteScene { name: "Verse".into() },
             Command::SetSceneMorph { name: "Verse".into(), morph_ms: 2000 },
             Command::RecallScene { name: "Verse".into() },
+            Command::ListScenes,
+            Command::LearnMidi { input: 1, output: 2 },
+            Command::CancelMidiLearn,
+            Command::SetMidiBinding {
+                binding: MidiBinding { device: "nanoKONTROL2".into(), channel: 1, cc: 7, input: 1, output: 2 },
+            },
+            Command::RemoveMidiBinding { device: "nanoKONTROL2".into(), channel: 1, cc: 7 },
+            Command::InjectMidi { device: "nanoKONTROL2".into(), bytes: vec![0xB0, 7, 100] },
         ];
         for (n, c) in cmds.iter().enumerate() {
             assert_eq!(first(c), 11 + n as u8, "{c:?}");
@@ -593,7 +644,10 @@ mod tests {
         assert!(cmds[2].is_mutation() && cmds[3].is_mutation() && cmds[4].is_mutation() && cmds[5].is_mutation());
         assert!(!cmds[1].is_mutation());
         assert!(!cmds[6].is_mutation() && !cmds[7].is_mutation(), "editors are not saved");
-        assert!(cmds[8..].iter().all(Command::is_mutation), "scene commands are saved");
+        assert!(cmds[8..13].iter().all(Command::is_mutation), "scene commands are saved");
+        assert!(!cmds[13].is_mutation(), "listing is not");
+        let saved: Vec<bool> = cmds[14..].iter().map(Command::is_mutation).collect();
+        assert_eq!(saved, [false, false, true, true, false], "learn/cancel/inject are not saved; bindings are");
     }
 
     #[test]

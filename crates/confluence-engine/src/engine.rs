@@ -1099,6 +1099,11 @@ impl Engine {
                 Response::Error("subscriptions and status are served by the engine process".into())
             }
             Command::Shutdown => Response::Ok,
+            Command::LearnMidi { .. }
+            | Command::CancelMidiLearn
+            | Command::SetMidiBinding { .. }
+            | Command::RemoveMidiBinding { .. }
+            | Command::InjectMidi { .. } => Response::Error("MIDI is not available yet".into()),
             Command::SaveScene { .. }
             | Command::PutScene { .. }
             | Command::DeleteScene { .. }
