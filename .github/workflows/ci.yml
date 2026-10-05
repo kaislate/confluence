@@ -15,7 +15,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Builds the VASIO cdylib too: one test loads the built DLL like a DAW does.
       - run: cargo build --workspace
-      - run: cargo test --workspace
+      # --no-fail-fast: one failing crate must not hide the results of the others.
+      - run: cargo test --workspace --no-fail-fast
       - run: cargo test -p confluence-core --test bridge_sim --release
       - name: loom
         shell: bash

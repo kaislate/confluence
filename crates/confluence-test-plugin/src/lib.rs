@@ -1,11 +1,14 @@
 //! Two CLAP plugins for Confluence's tests, in one file:
 //!
-//! - **Confluence Test Gain** (`dev.confluence.test.gain`): stereo gain with a
+//! - **Confluence Test Gain** (`dev.confluence.test.gain`): stereo gain (with an
+//!   editor of its own on Windows, see `gui`) and a
 //!   `Gain` parameter (dB), a `Fail` switch that makes processing fail, and a
 //!   read-only `Peak` parameter the plugin reports itself. Its state is the
 //!   parameter values.
 //! - **Confluence Test Crash** (`dev.confluence.test.crash`): aborts the process
 //!   when created, for the engine's load-check tests. Never create it in-process.
+//! - **Confluence Test Plain** (`dev.confluence.test.plain`): the gain plugin
+//!   without an editor of its own.
 //! - **Confluence Test Exit** (`dev.confluence.test.exit`): ends the process with
 //!   exit code 0 when created (a check must not mistake that for success).
 
@@ -29,8 +32,16 @@ use clack_plugin::events::spaces::CoreEventSpace;
 use clack_plugin::prelude::*;
 use clack_plugin::stream::{InputStream, OutputStream};
 
+#[cfg(windows)]
+pub mod gui;
+
 pub const GAIN_ID: &str = "dev.confluence.test.gain";
 pub const CRASH_ID: &str = "dev.confluence.test.crash";
+/// The gain plugin without an editor.
+pub const PLAIN_ID: &str = "dev.confluence.test.plain";
+/// The gain plugin (no editor) reporting every change the host makes back to
+/// it, as some plugin frameworks do.
+pub const ECHO_ID: &str = "dev.confluence.test.echo";
 /// Ends the process "successfully" (exit code 0) when created.
 pub const EXIT_ID: &str = "dev.confluence.test.exit";
 /// Gain in dB, −60…+12.
@@ -39,6 +50,11 @@ pub const PARAM_GAIN: u32 = 1;
 pub const PARAM_FAIL: u32 = 2;
 /// Read-only: the last block's peak (0…1), reported by the plugin.
 pub const PARAM_PEAK: u32 = 3;
+
+/// Test hook: milliseconds this file takes to load.
+pub const SLOW_LOAD_ENV: &str = "CONFLUENCE_TEST_PLUGIN_SLOW_LOAD_MS";
+/// Test hook: a file written when a slow load finishes.
+pub const SLOW_LOAD_MARK_ENV: &str = "CONFLUENCE_TEST_PLUGIN_SLOW_LOAD_MARK";
 
 /// Gain processors deactivated so far (in this process), for host tests.
 pub static DEACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -62,6 +78,32 @@ pub struct GainShared {
     gain_db: AtomicF64,
     fail: AtomicF64,
     peak: AtomicF64,
+    /// Gain was changed in the editor: report it on the next block.
+    edited: std::sync::atomic::AtomicBool,
+    /// This instance offers an editor.
+    with_gui: bool,
+    /// This instance reports the host's changes back.
+    echo: bool,
+}
+
+impl GainShared {
+    fn new(with_gui: bool, echo: bool) -> Self {
+        GainShared {
+            gain_db: AtomicF64::zero(),
+            fail: AtomicF64::zero(),
+            peak: AtomicF64::zero(),
+            edited: std::sync::atomic::AtomicBool::new(false),
+            with_gui,
+            echo,
+        }
+    }
+
+    /// A change made in the plugin's own editor.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn edit_gain(&self, db: f64) {
+        self.set(PARAM_GAIN, db);
+        self.edited.store(true, Ordering::Release);
+    }
 }
 
 impl PluginShared<'_> for GainShared {}
@@ -95,6 +137,8 @@ impl GainShared {
 
 pub struct GainMain<'a> {
     shared: &'a GainShared,
+    #[cfg(windows)]
+    editor: gui::Editor,
 }
 
 impl<'a> PluginMainThread<'a, GainShared> for GainMain<'a> {}
@@ -110,12 +154,18 @@ impl Plugin for TestGain {
     type Shared<'a> = GainShared;
     type MainThread<'a> = GainMain<'a>;
 
-    fn declare_extensions(builder: &mut PluginExtensions<Self>, _shared: Option<&GainShared>) {
+    fn declare_extensions(builder: &mut PluginExtensions<Self>, shared: Option<&GainShared>) {
         builder
             .register::<PluginAudioPorts>()
             .register::<PluginParams>()
             .register::<PluginState>()
             .register::<PluginLatency>();
+        #[cfg(windows)]
+        if shared.is_some_and(|s| s.with_gui) {
+            builder.register::<clack_extensions::gui::PluginGui>();
+        }
+        #[cfg(not(windows))]
+        let _ = shared;
     }
 }
 
@@ -132,6 +182,14 @@ impl<'a> PluginAudioProcessor<'a, GainShared, GainMain<'a>> for GainProcessor<'a
     fn process(&mut self, _process: Process, mut audio: Audio, events: Events) -> Result<ProcessStatus, PluginError> {
         for e in events.input {
             self.shared.handle(e);
+            if self.shared.echo {
+                if let Some(CoreEventSpace::ParamValue(v)) = e.as_core_event() {
+                    if let Some(id) = v.param_id() {
+                        let ev = ParamValueEvent::new(0, id, Pckn::match_all(), v.value());
+                        let _ = events.output.try_push(ev);
+                    }
+                }
+            }
         }
         if self.shared.fail.get() >= 0.5 {
             return Err(PluginError::Message("test failure"));
@@ -153,6 +211,10 @@ impl<'a> PluginAudioProcessor<'a, GainShared, GainMain<'a>> for GainProcessor<'a
                 *x *= g;
                 peak = peak.max(x.abs());
             }
+        }
+        if self.shared.edited.swap(false, Ordering::AcqRel) {
+            let ev = ParamValueEvent::new(0, ClapId::new(PARAM_GAIN), Pckn::match_all(), self.shared.gain_db.get());
+            let _ = events.output.try_push(ev);
         }
         let peak = f64::from(peak.min(1.0));
         if (peak - self.shared.peak.get()).abs() > 0.01 {
@@ -283,11 +345,13 @@ pub struct Factory {
     gain: PluginDescriptor,
     crash: PluginDescriptor,
     exit: PluginDescriptor,
+    plain: PluginDescriptor,
+    echo: PluginDescriptor,
 }
 
 impl PluginFactoryImpl for Factory {
     fn plugin_count(&self) -> u32 {
-        3
+        5
     }
 
     fn plugin_descriptor(&self, index: u32) -> Option<&PluginDescriptor> {
@@ -295,18 +359,33 @@ impl PluginFactoryImpl for Factory {
             0 => Some(&self.gain),
             1 => Some(&self.crash),
             2 => Some(&self.exit),
+            3 => Some(&self.plain),
+            4 => Some(&self.echo),
             _ => None,
         }
     }
 
     fn create_plugin<'a>(&'a self, host_info: HostInfo<'a>, plugin_id: &CStr) -> Option<PluginInstance<'a>> {
-        if plugin_id.to_bytes() == GAIN_ID.as_bytes() {
-            Some(PluginInstance::new::<TestGain>(
+        let gain = |descriptor, with_gui, echo| {
+            PluginInstance::new::<TestGain>(
                 host_info,
-                &self.gain,
-                |_host| Ok(GainShared { gain_db: AtomicF64::zero(), fail: AtomicF64::zero(), peak: AtomicF64::zero() }),
-                |_host, shared| Ok(GainMain { shared }),
-            ))
+                descriptor,
+                move |_host| Ok(GainShared::new(with_gui, echo)),
+                |_host, shared| {
+                    Ok(GainMain {
+                        shared,
+                        #[cfg(windows)]
+                        editor: gui::Editor::default(),
+                    })
+                },
+            )
+        };
+        if plugin_id.to_bytes() == GAIN_ID.as_bytes() {
+            Some(gain(&self.gain, true, false))
+        } else if plugin_id.to_bytes() == PLAIN_ID.as_bytes() {
+            Some(gain(&self.plain, false, false))
+        } else if plugin_id.to_bytes() == ECHO_ID.as_bytes() {
+            Some(gain(&self.echo, false, true))
         } else if plugin_id.to_bytes() == CRASH_ID.as_bytes() {
             Some(PluginInstance::new::<TestCrash>(
                 host_info,
@@ -327,7 +406,7 @@ impl PluginFactoryImpl for Factory {
     }
 }
 
-/// The file's entry: one factory with all three plugins.
+/// The file's entry: one factory with all five plugins.
 pub struct Entry {
     factory: PluginFactoryWrapper<Factory>,
 }
@@ -335,6 +414,14 @@ pub struct Entry {
 impl clack_plugin::entry::Entry for Entry {
     fn new(_bundle_path: Option<&CStr>) -> Result<Self, EntryLoadError> {
         use clack_plugin::plugin::features::{AUDIO_EFFECT, STEREO, UTILITY};
+        // Test hook: a slow load, which then leaves a mark (a load that was
+        // stopped part-way never does).
+        if let Ok(ms) = std::env::var(SLOW_LOAD_ENV) {
+            std::thread::sleep(std::time::Duration::from_millis(ms.parse().unwrap_or(0)));
+            if let Ok(mark) = std::env::var(SLOW_LOAD_MARK_ENV) {
+                let _ = std::fs::write(mark, b"finished");
+            }
+        }
         Ok(Entry {
             factory: PluginFactoryWrapper::new(Factory {
                 gain: PluginDescriptor::new(GAIN_ID, "Confluence Test Gain")
@@ -345,6 +432,14 @@ impl clack_plugin::entry::Entry for Entry {
                     .with_vendor("Confluence")
                     .with_version("1.0.0")
                     .with_features([AUDIO_EFFECT, UTILITY]),
+                plain: PluginDescriptor::new(PLAIN_ID, "Confluence Test Plain")
+                    .with_vendor("Confluence")
+                    .with_version("1.0.0")
+                    .with_features([AUDIO_EFFECT, STEREO]),
+                echo: PluginDescriptor::new(ECHO_ID, "Confluence Test Echo")
+                    .with_vendor("Confluence")
+                    .with_version("1.0.0")
+                    .with_features([AUDIO_EFFECT, STEREO]),
                 exit: PluginDescriptor::new(EXIT_ID, "Confluence Test Exit")
                     .with_vendor("Confluence")
                     .with_version("1.0.0")

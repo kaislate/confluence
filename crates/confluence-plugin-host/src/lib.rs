@@ -8,9 +8,11 @@
 //! - [`describe`] and [`check`] are what the engine runs in a separate process
 //!   before it loads a plugin file itself.
 
+mod editor;
 mod host;
 mod processor;
 mod thread;
+mod wake;
 
 use std::path::Path;
 

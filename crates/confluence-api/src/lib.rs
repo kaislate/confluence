@@ -9,7 +9,7 @@ mod state;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 3;
+pub const API_VERSION: u16 = 4;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -86,6 +86,15 @@ pub enum Command {
     SetPluginState {
         bus: BusRef,
         state: Vec<u8>,
+    },
+    /// Opens the editor of a bus's plugin (the engine owns the window), or
+    /// brings it to the front.
+    ShowEditor {
+        bus: BusRef,
+    },
+    /// Closes the editor of a bus's plugin.
+    HideEditor {
+        bus: BusRef,
     },
 }
 
@@ -275,6 +284,10 @@ pub struct LoadedPlugin {
     pub status: PluginStatus,
     /// Samples of delay the plugin reports (not compensated yet).
     pub latency: u32,
+    /// The plugin has an editor of its own.
+    pub has_editor: bool,
+    /// Its editor is open.
+    pub editor_open: bool,
     pub params: Vec<ParamState>,
 }
 
@@ -487,6 +500,8 @@ mod tests {
             Command::UnloadPlugin { bus },
             Command::SetParam { bus, param: 1, value: -6.0 },
             Command::SetPluginState { bus: BusRef::At(8), state: vec![1, 2, 3] },
+            Command::ShowEditor { bus },
+            Command::HideEditor { bus },
         ];
         for (n, c) in cmds.iter().enumerate() {
             assert_eq!(first(c), 11 + n as u8, "{c:?}");
@@ -495,6 +510,7 @@ mod tests {
         }
         assert!(cmds[2].is_mutation() && cmds[3].is_mutation() && cmds[4].is_mutation() && cmds[5].is_mutation());
         assert!(!cmds[1].is_mutation());
+        assert!(!cmds[6].is_mutation() && !cmds[7].is_mutation(), "editors are not saved");
     }
 
     #[test]

@@ -27,6 +27,7 @@ windows = { version = "0.62", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
+    "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_System_IO",
 ] }
@@ -36,6 +37,9 @@ confluence-vasio = { path = "../confluence-vasio" }
 confluence-provider-vasio = { path = "../confluence-provider-vasio" }
 tempfile = "3"
 assert_no_alloc.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [lints]
 workspace = true

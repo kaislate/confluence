@@ -108,6 +108,11 @@ impl Journal {
     }
 
     /// Appends a mutating command and flushes it to the OS.
+    /// The journal file's size in bytes.
+    pub fn size(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
     pub fn append(&mut self, cmd: &Command) -> io::Result<()> {
         write_frame(&mut self.file, &record(self.next_id, cmd)).map_err(io::Error::other)?;
         self.next_id = self.next_id.wrapping_add(1);
@@ -162,6 +167,20 @@ mod tests {
             collapse_params(cmds),
             vec![load(8), p(8, 2, 0.5), p(4, 1, -7.0), p(8, 1, -3.0), load(8), p(8, 1, -5.0)]
         );
+    }
+
+    #[test]
+    fn a_journal_reports_its_size_and_compaction_shrinks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut j, _) = Journal::open(&dir.path().join("j.bin")).unwrap();
+        let empty = j.size();
+        for i in 0..100 {
+            j.append(&set(i)).unwrap();
+        }
+        let full = j.size();
+        assert!(full > empty + 100, "{empty} → {full}");
+        j.compact(&[set(1)]).unwrap();
+        assert!(j.size() < full);
     }
 
     #[test]

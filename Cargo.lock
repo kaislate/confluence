@@ -1014,6 +1014,7 @@ dependencies = [
  "confluence-api",
  "confluence-core",
  "confluence-test-plugin",
+ "windows",
 ]
 
 [[package]]
@@ -1079,6 +1080,7 @@ dependencies = [
  "clack-extensions",
  "clack-host",
  "clack-plugin",
+ "windows",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,8 +18,10 @@ use confluence_api::{ParamState, PluginInfo};
 use confluence_core::mailbox;
 use confluence_core::processor::Processor;
 
-use crate::host::{host_info, Host, Main, Shared};
+use crate::editor::{self, Editor, WinEvent};
+use crate::host::{host_info, GuiRequests, Host, Main, Shared};
 use crate::processor::ClapProcessor;
+use crate::wake::Wake;
 
 /// How long a caller waits for the plugin thread.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +34,10 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
 /// Parameter changes in flight to one plugin's audio side.
 const PARAM_RING: usize = 1024;
+/// After the host sets a parameter, the plugin's reports of it are taken as
+/// echoes of the host's own changes (some plugins report every change back,
+/// and a late report may carry an older value) for this long.
+const ECHO_WINDOW: Duration = Duration::from_millis(500);
 /// Values one plugin reports in flight to the engine.
 const REPORT_RING: usize = 1024;
 
@@ -45,13 +51,26 @@ pub enum Source {
     InProcess(fn() -> Result<PluginEntry, String>),
 }
 
+thread_local! {
+    /// Every plugin file loaded, kept loaded until the engine exits. Many
+    /// plugins do not survive being unloaded and loaded again (e.g. a window
+    /// class left registered to code that is gone), so a file is loaded once.
+    static ENTRIES: std::cell::RefCell<HashMap<PathBuf, PluginEntry>> = std::cell::RefCell::new(HashMap::new());
+}
+
 impl Source {
     fn entry(&self) -> Result<PluginEntry, String> {
         match self {
             Source::File(p) => {
+                if let Some(e) = ENTRIES.with(|m| m.borrow().get(p).cloned()) {
+                    return Ok(e);
+                }
                 // SAFETY: loading a CLAP file runs its code; the engine only loads
                 // files that passed the load check in a separate process.
-                unsafe { PluginEntry::load(p) }.map_err(|e| format!("{} could not be loaded: {e}", p.display()))
+                let e =
+                    unsafe { PluginEntry::load(p) }.map_err(|e| format!("{} could not be loaded: {e}", p.display()))?;
+                ENTRIES.with(|m| m.borrow_mut().insert(p.clone(), e.clone()));
+                Ok(e)
             }
             Source::InProcess(f) => f(),
         }
@@ -70,6 +89,8 @@ struct Loaded {
     plugin: u64,
     info: PluginInfo,
     latency: u32,
+    has_editor: bool,
+    editor_open: Arc<AtomicBool>,
     params: Vec<ParamState>,
     processor: ClapProcessor,
     params_tx: mailbox::Sender<(u32, f64)>,
@@ -83,6 +104,8 @@ enum Msg {
     SaveState { plugin: u64, reply: mpsc::Sender<Result<Vec<u8>, String>> },
     LoadState { plugin: u64, state: Vec<u8>, reply: mpsc::Sender<Result<(), String>> },
     Reclaim { plugin: u64, processor: Box<ClapProcessor> },
+    ShowEditor { plugin: u64, title: String, reply: mpsc::Sender<Result<(), String>> },
+    HideEditor { plugin: u64, reply: mpsc::Sender<()> },
     Forget { plugin: u64 },
 }
 
@@ -91,14 +114,24 @@ enum Msg {
 #[derive(Clone)]
 pub struct PluginThread {
     tx: mpsc::Sender<Msg>,
+    wake: Arc<Wake>,
 }
 
 impl PluginThread {
     /// Starts the plugin thread.
     pub fn start() -> std::io::Result<PluginThread> {
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new().name("confluence-plugins".into()).spawn(move || run(rx))?;
-        Ok(PluginThread { tx })
+        let wake = Arc::new(Wake::new()?);
+        let w = wake.clone();
+        std::thread::Builder::new().name("confluence-plugins".into()).spawn(move || run(rx, w))?;
+        Ok(PluginThread { tx, wake })
+    }
+
+    /// Queues a request and wakes the thread.
+    fn send(&self, msg: Msg) -> Result<(), mpsc::SendError<Msg>> {
+        let r = self.tx.send(msg);
+        self.wake.set();
+        r
     }
 
     /// Loads plugin `id` from `src`, activated at `rate` with blocks of up to
@@ -124,6 +157,10 @@ impl PluginThread {
             reported_rx: loaded.reported_rx,
             texts: Vec::new(),
             last_state: None,
+            has_editor: loaded.has_editor,
+            editor_open: loaded.editor_open,
+            edited: Vec::new(),
+            host_sets: Vec::new(),
         };
         Ok((link, Box::new(loaded.processor)))
     }
@@ -135,7 +172,7 @@ impl PluginThread {
         if let Ok(p) = any.downcast::<ClapProcessor>() {
             let plugin = p.plugin;
             if let Err(mpsc::SendError(Msg::Reclaim { processor, .. })) =
-                self.tx.send(Msg::Reclaim { plugin, processor: p })
+                self.send(Msg::Reclaim { plugin, processor: p })
             {
                 // The plugin thread is gone; nothing can deactivate it now.
                 std::mem::forget(processor);
@@ -145,7 +182,7 @@ impl PluginThread {
 
     fn call<T>(&self, timeout: Duration, make: impl FnOnce(mpsc::Sender<T>) -> Msg) -> Result<T, String> {
         let (reply, rx) = mpsc::channel();
-        self.tx.send(make(reply)).map_err(|_| "the plugin thread has stopped".to_string())?;
+        self.send(make(reply)).map_err(|_| "the plugin thread has stopped".to_string())?;
         rx.recv_timeout(timeout).map_err(|_| "the plugin did not respond".to_string())
     }
 }
@@ -164,6 +201,13 @@ pub struct PluginLink {
     texts: Vec<(u32, mpsc::Receiver<String>)>,
     /// The last state chunk saved, for when the plugin thread is busy.
     last_state: Option<Vec<u8>>,
+    has_editor: bool,
+    /// Kept up to date by the plugin thread.
+    editor_open: Arc<AtomicBool>,
+    /// Writable values the plugin changed itself (in its editor), not yet taken.
+    edited: Vec<(u32, f64)>,
+    /// When the host last set each parameter (reports right after are echoes).
+    host_sets: Vec<(u32, std::time::Instant)>,
 }
 
 impl PluginLink {
@@ -195,6 +239,8 @@ impl PluginLink {
         }
         self.params_tx.try_send((id, v)).map_err(|_| format!("{name} is not taking changes this fast"))?;
         p.value = v;
+        self.host_sets.retain(|(q, _)| *q != id);
+        self.host_sets.push((id, std::time::Instant::now()));
         self.refresh_text(id);
         Ok(())
     }
@@ -221,12 +267,20 @@ impl PluginLink {
             }
         }
         let mut changed = Vec::new();
+        self.host_sets.retain(|(_, at)| at.elapsed() < ECHO_WINDOW);
         while let Some((id, value)) = self.reported_rx.try_recv() {
+            if self.host_sets.iter().any(|(q, _)| *q == id) {
+                continue; // an echo of the host's own change
+            }
             if let Some(p) = self.params.iter_mut().find(|p| p.id == id) {
                 if p.value != value {
                     p.value = value;
                     if !changed.contains(&id) {
                         changed.push(id);
+                    }
+                    if !p.read_only {
+                        self.edited.retain(|(q, _)| *q != id);
+                        self.edited.push((id, value));
                     }
                 }
             }
@@ -235,6 +289,38 @@ impl PluginLink {
             self.refresh_text(*id);
         }
         shown || !changed.is_empty()
+    }
+
+    /// Whether the plugin has an editor of its own.
+    pub fn has_editor(&self) -> bool {
+        self.has_editor
+    }
+
+    /// Whether its editor is open now.
+    pub fn editor_open(&self) -> bool {
+        self.editor_open.load(Ordering::Acquire)
+    }
+
+    /// Opens the plugin's editor in a window titled `title`, or brings it to
+    /// the front if it is open.
+    pub fn show_editor(&mut self, title: &str) -> Result<(), String> {
+        if !self.has_editor {
+            return Err(format!("{} has no editor", self.info.name));
+        }
+        let (plugin, title) = (self.plugin, title.to_string());
+        self.thread.call(REPLY_TIMEOUT, |reply| Msg::ShowEditor { plugin, title, reply })?
+    }
+
+    /// Closes the plugin's editor, if open.
+    pub fn hide_editor(&mut self) {
+        let plugin = self.plugin;
+        let _ = self.thread.call(REPLY_TIMEOUT, |reply| Msg::HideEditor { plugin, reply });
+    }
+
+    /// Values the plugin changed itself (in its editor) since the last call,
+    /// writable parameters only, newest value per parameter.
+    pub fn take_edited(&mut self) -> Vec<(u32, f64)> {
+        std::mem::take(&mut self.edited)
     }
 
     /// True while texts asked of the plugin are still on their way.
@@ -278,7 +364,7 @@ impl PluginLink {
         let value = p.value;
         p.text = format!("{value:.2}");
         let (reply, rx) = mpsc::channel();
-        if self.thread.tx.send(Msg::Text { plugin: self.plugin, id, value, reply }).is_ok() {
+        if self.thread.send(Msg::Text { plugin: self.plugin, id, value, reply }).is_ok() {
             self.texts.retain(|(q, _)| *q != id);
             self.texts.push((id, rx));
         }
@@ -287,7 +373,7 @@ impl PluginLink {
 
 impl Drop for PluginLink {
     fn drop(&mut self) {
-        let _ = self.thread.tx.send(Msg::Forget { plugin: self.plugin });
+        let _ = self.thread.send(Msg::Forget { plugin: self.plugin });
     }
 }
 
@@ -295,36 +381,161 @@ impl Drop for PluginLink {
 struct Slot {
     instance: PluginInstance<Host>,
     callback: Arc<AtomicBool>,
+    name: String,
+    gui: Arc<GuiRequests>,
+    editor: Option<Editor>,
+    editor_open: Arc<AtomicBool>,
     /// A link (engine side) still refers to it.
     linked: bool,
     /// Its processor is out on the audio side.
     processing: bool,
 }
 
-fn run(rx: mpsc::Receiver<Msg>) {
+fn run(rx: mpsc::Receiver<Msg>, wake: Arc<Wake>) {
+    #[cfg(windows)]
+    windows_setup();
     let mut plugins: HashMap<u64, Slot> = HashMap::new();
     let mut next = 1u64;
     loop {
-        match rx.recv_timeout(POLL) {
-            Ok(msg) => handle(msg, &mut plugins, &mut next),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                // The engine is exiting. A processor may still be running on
-                // the audio thread: destroying its instance now could crash
-                // it, so those instances are left for the process exit.
-                for (_, slot) in plugins.drain() {
-                    if slot.processing {
-                        std::mem::forget(slot.instance);
+        wait(&rx, &wake);
+        #[cfg(windows)]
+        pump_messages();
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => handle(msg, &mut plugins, &mut next),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The engine is exiting. Editors close first. A processor
+                    // may still be running on the audio thread: destroying its
+                    // instance now could crash it, so those instances are left
+                    // for the process exit.
+                    for (_, mut slot) in plugins.drain() {
+                        close_editor(&mut slot);
+                        if slot.processing {
+                            std::mem::forget(slot.instance);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        for ev in editor::take_events() {
+            match ev {
+                WinEvent::Close(id) => {
+                    if let Some(slot) = plugins.get_mut(&id) {
+                        close_editor(slot);
                     }
                 }
-                return;
+                WinEvent::Resize(id, w, h) => {
+                    if let Some(slot) = plugins.get_mut(&id) {
+                        if let Some(ed) = &slot.editor {
+                            editor::user_resized(&mut slot.instance, ed, w, h);
+                        }
+                    }
+                }
             }
+        }
+        for slot in plugins.values_mut() {
+            gui_requests(slot);
         }
         for slot in plugins.values_mut() {
             if slot.callback.swap(false, Ordering::AcqRel) {
                 slot.instance.call_on_main_thread_callback();
             }
         }
+    }
+}
+
+/// Waits for a request, a window message, or the callback poll interval.
+#[cfg(windows)]
+fn wait(_rx: &mpsc::Receiver<Msg>, wake: &Wake) {
+    use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT};
+    // SAFETY: one valid event handle; a timeout, not an infinite wait. With
+    // MWMO_INPUTAVAILABLE, messages left in the queue by a bounded pump wake
+    // it at once.
+    let _ = unsafe {
+        MsgWaitForMultipleObjectsEx(Some(&[wake.handle()]), POLL.as_millis() as u32, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+    };
+}
+
+#[cfg(not(windows))]
+fn wait(_rx: &mpsc::Receiver<Msg>, _wake: &Wake) {
+    std::thread::sleep(Duration::from_millis(1));
+}
+
+/// At most this many window messages per pass of the loop...
+#[cfg(windows)]
+const PUMP_MESSAGES: usize = 256;
+/// ...or this long: an editor that never lets its queue empty (one that
+/// reposts messages to itself) must not keep requests and callbacks waiting.
+#[cfg(windows)]
+const PUMP_TIME: Duration = Duration::from_millis(10);
+
+/// Runs the window messages waiting for this thread (plugin editors), within
+/// a bound; the rest wait for the next pass.
+#[cfg(windows)]
+fn pump_messages() {
+    use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
+    let started = std::time::Instant::now();
+    let mut msg = MSG::default();
+    for _ in 0..PUMP_MESSAGES {
+        // SAFETY: standard message loop on this thread's own queue.
+        unsafe {
+            if !PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                return;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if started.elapsed() >= PUMP_TIME {
+            return;
+        }
+    }
+}
+
+/// Editor windows follow each monitor's scale.
+#[cfg(windows)]
+fn windows_setup() {
+    use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+    // SAFETY: affects only this thread.
+    unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// Closes a slot's editor, if open: the plugin's GUI, then our window.
+fn close_editor(slot: &mut Slot) {
+    if let Some(ed) = slot.editor.take() {
+        editor::close(&mut slot.instance, ed);
+    }
+    slot.editor_open.store(false, Ordering::Release);
+}
+
+/// Acts on what a plugin's editor asked for.
+fn gui_requests(slot: &mut Slot) {
+    let resize = slot.gui.resize.lock().ok().and_then(|mut r| r.take());
+    let closed = slot.gui.closed.lock().ok().and_then(|mut c| c.take());
+    let show = slot.gui.show.swap(false, Ordering::AcqRel);
+    let hide = slot.gui.hide.swap(false, Ordering::AcqRel);
+    if let Some(ed) = &slot.editor {
+        if let Some((w, h)) = resize {
+            editor::plugin_resized(ed, w, h);
+        }
+        if show || hide {
+            editor::plugin_visibility(ed, show);
+        }
+    }
+    if closed.is_some() {
+        // A floating editor closed by the user: release it (destroy is safe
+        // even if the plugin already did).
+        close_editor(slot);
+    }
+}
+
+/// Removes a plugin's slot: its editor closes first.
+fn remove(plugins: &mut HashMap<u64, Slot>, plugin: u64) {
+    if let Some(mut slot) = plugins.remove(&plugin) {
+        close_editor(&mut slot);
     }
 }
 
@@ -365,15 +576,39 @@ fn handle(msg: Msg, plugins: &mut HashMap<u64, Slot>, next: &mut u64) {
                 }
                 slot.processing = false;
                 if !slot.linked {
-                    plugins.remove(&plugin);
+                    remove(plugins, plugin);
                 }
             }
+        }
+        Msg::ShowEditor { plugin, title, reply } => {
+            let r = match plugins.get_mut(&plugin) {
+                Some(slot) => match &slot.editor {
+                    Some(ed) => {
+                        editor::front(&mut slot.instance, ed);
+                        Ok(())
+                    }
+                    None => editor::open(&mut slot.instance, plugin, &title, &slot.name).map(|ed| {
+                        slot.editor = Some(ed);
+                        slot.editor_open.store(true, Ordering::Release);
+                    }),
+                },
+                None => Err("the plugin is gone".into()),
+            };
+            let _ = reply.send(r);
+        }
+        Msg::HideEditor { plugin, reply } => {
+            if let Some(slot) = plugins.get_mut(&plugin) {
+                close_editor(slot);
+            }
+            let _ = reply.send(());
         }
         Msg::Forget { plugin } => {
             if let Some(slot) = plugins.get_mut(&plugin) {
                 slot.linked = false;
+                // Nothing can ask for the editor any more.
+                close_editor(slot);
                 if !slot.processing {
-                    plugins.remove(&plugin);
+                    remove(plugins, plugin);
                 }
             }
         }
@@ -404,10 +639,16 @@ fn load(
     };
     let cid = CString::new(id).map_err(|e| e.to_string())?;
     let callback = Arc::new(AtomicBool::new(false));
-    let flag = callback.clone();
-    let mut instance =
-        PluginInstance::<Host>::new(move |_| Shared { callback: flag }, |_| Main, &entry, &cid, &host_info()?)
-            .map_err(|e| format!("{} could not start: {e}", info.name))?;
+    let gui = Arc::new(GuiRequests::default());
+    let (flag, requests) = (callback.clone(), gui.clone());
+    let mut instance = PluginInstance::<Host>::new(
+        move |_| Shared { callback: flag, gui: requests },
+        |_| Main,
+        &entry,
+        &cid,
+        &host_info()?,
+    )
+    .map_err(|e| format!("{} could not start: {e}", info.name))?;
 
     let (ins, outs) = ports(&mut instance);
     if ins.is_empty() {
@@ -427,8 +668,22 @@ fn load(
     let (params_tx, params_rx) = mailbox::channel(PARAM_RING);
     let (reported_tx, reported_rx) = mailbox::channel(REPORT_RING);
     let processor = ClapProcessor::new(plugin, stopped.into(), &ins, &outs, block as usize, params_rx, reported_tx);
-    plugins.insert(plugin, Slot { instance, callback, linked: true, processing: true });
-    Ok(Loaded { plugin, info, latency, params, processor, params_tx, reported_rx })
+    let has_editor = editor::has_editor(&mut instance);
+    let editor_open = Arc::new(AtomicBool::new(false));
+    plugins.insert(
+        plugin,
+        Slot {
+            instance,
+            callback,
+            name: info.name.clone(),
+            gui,
+            editor: None,
+            editor_open: editor_open.clone(),
+            linked: true,
+            processing: true,
+        },
+    );
+    Ok(Loaded { plugin, info, latency, has_editor, editor_open, params, processor, params_tx, reported_rx })
 }
 
 /// Channel counts of the plugin's input and output ports.

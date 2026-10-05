@@ -66,6 +66,8 @@ fn only_values_differ(a: &LoadedPlugin, b: &LoadedPlugin) -> bool {
     a.info == b.info
         && a.status == b.status
         && a.latency == b.latency
+        && a.has_editor == b.has_editor
+        && a.editor_open == b.editor_open
         && a.params.len() == b.params.len()
         && a.params.iter().zip(&b.params).all(|(x, y)| {
             let (mut x, mut y) = (x.clone(), y.clone());
@@ -180,6 +182,8 @@ mod tests {
             },
             status: crate::PluginStatus::Running,
             latency: 0,
+            has_editor: true,
+            editor_open: false,
             params: vec![crate::ParamState {
                 id: 1,
                 name: "Gain".into(),
@@ -207,6 +211,9 @@ mod tests {
         applied.apply(&changes);
         assert_eq!(applied.bus_plugins, b.bus_plugins);
 
+        let mut opened = b.clone();
+        opened.bus_plugins[0].editor_open = true;
+        assert_eq!(diff(&b, &opened), vec![Change::BusPluginSet(opened.bus_plugins[0].clone())], "editor opened");
         let mut c = b.clone();
         c.bus_plugins[0].status = crate::PluginStatus::Faulted;
         assert_eq!(diff(&b, &c), vec![Change::BusPluginSet(c.bus_plugins[0].clone())]);

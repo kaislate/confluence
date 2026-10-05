@@ -467,3 +467,45 @@ fn a_plugin_is_loaded_from_the_picker_and_its_gain_set() {
     pump_until(&mut h, "the plugin's text", LONG, |h| h.query_by_label("-6.0 dB").is_some());
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_plugins_editor_is_opened_and_closed_from_the_window() {
+    let d = EngineDir::new("editor");
+    d.add_test_plugin();
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let add = Command::AddBus { name: "FX".into(), channels: 2, first_input: None, first_output: None };
+    let Response::Added { ids, .. } = c.call(add).unwrap() else { panic!() };
+    let path = d.clap_dir().join("ConfluenceTest.clap").display().to_string();
+    let load = Command::LoadPlugin {
+        bus: confluence_api::BusRef::Id(ids[0]),
+        path,
+        plugin_id: "dev.confluence.test.gain".into(),
+    };
+    assert!(matches!(c.call(load).unwrap(), Response::Applied { .. }));
+    let open = |want: bool| {
+        let (state, _sub) = confluence_client::Subscription::connect(&d.pipe, Duration::from_secs(5)).unwrap();
+        state.bus_plugins.first().is_some_and(|p| p.editor_open == want)
+    };
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "the bus header", LONG, |h| h.query_by_label("FX outputs").is_some());
+    h.get_by_label("FX outputs").click();
+    pump_until(&mut h, "the Show editor button", LONG, |h| h.query_by_label("Show editor").is_some());
+    settle(&mut h); // the plugin section is laid out on its first frame; click once it has settled
+    h.get_by_label("Show editor").click();
+    let deadline = std::time::Instant::now() + LONG;
+    while !open(true) {
+        if std::time::Instant::now() > deadline {
+            // Say why: what the engine answers when asked directly.
+            let direct = c.call(Command::ShowEditor { bus: confluence_api::BusRef::Id(ids[0]) });
+            panic!("the editor did not open from the window; asked directly the engine says {direct:?}");
+        }
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pump_until(&mut h, "the Close editor button", LONG, |h| h.query_by_label("Close editor").is_some());
+    settle(&mut h);
+    h.get_by_label("Close editor").click();
+    pump_until(&mut h, "the editor closed", LONG, |_| open(false));
+    c.call(Command::Shutdown).unwrap();
+}

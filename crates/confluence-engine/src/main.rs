@@ -144,6 +144,21 @@ mod app {
         fn load_state(&mut self, state: &[u8]) -> Result<(), String> {
             self.0.load_state(state)
         }
+        fn has_editor(&self) -> bool {
+            self.0.has_editor()
+        }
+        fn editor_open(&self) -> bool {
+            self.0.editor_open()
+        }
+        fn show_editor(&mut self, title: &str) -> Result<(), String> {
+            self.0.show_editor(title)
+        }
+        fn hide_editor(&mut self) {
+            self.0.hide_editor()
+        }
+        fn take_edited(&mut self) -> Vec<(u32, f64)> {
+            self.0.take_edited()
+        }
     }
 
     /// Checks plugin `id` of `path` in a separate process, then loads it here.
@@ -265,6 +280,8 @@ mod app {
 
     /// How often state is diffed and telemetry sent, in control-loop ticks of 10 ms.
     const PUBLISH_TICKS: u64 = 10;
+    /// The journal is rewritten as the current state once it grows past this.
+    const JOURNAL_COMPACT_BYTES: u64 = 4 << 20;
     /// How often the device list is refreshed.
     const DEVICE_SCAN: Duration = Duration::from_secs(2);
 
@@ -579,6 +596,20 @@ mod app {
             if ticks.is_multiple_of(PUBLISH_TICKS) {
                 // Catches changes no command made: devices lost or back, a DAW attaching.
                 publish(&mut s);
+                // Values changed in plugin editors are saved like any other change.
+                let edited = s.engine.take_edited_values(Instant::now());
+                for c in &edited {
+                    if let Err(e) = s.journal.append(c) {
+                        eprintln!("confluence-engine: warning: a plugin edit was not saved: {e}");
+                    }
+                }
+                // A long session of edits: rewrite the journal as the current state.
+                if s.journal.size() > JOURNAL_COMPACT_BYTES {
+                    let State { engine, journal, .. } = &mut *s;
+                    if let Err(e) = journal.compact(&state_commands(engine)) {
+                        eprintln!("confluence-engine: warning: the journal could not be compacted: {e}");
+                    }
+                }
                 let h = health(&mut s);
                 let st = status(&s, &h);
                 s.publisher.telemetry(st, h);
