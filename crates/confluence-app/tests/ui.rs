@@ -491,6 +491,7 @@ fn a_plugins_editor_is_opened_and_closed_from_the_window() {
     pump_until(&mut h, "the bus header", LONG, |h| h.query_by_label("FX outputs").is_some());
     h.get_by_label("FX outputs").click();
     pump_until(&mut h, "the Show editor button", LONG, |h| h.query_by_label("Show editor").is_some());
+    settle(&mut h); // the plugin section is laid out on its first frame; click once it has settled
     h.get_by_label("Show editor").click();
     let deadline = std::time::Instant::now() + LONG;
     while !open(true) {
@@ -503,6 +504,7 @@ fn a_plugins_editor_is_opened_and_closed_from_the_window() {
         std::thread::sleep(Duration::from_millis(20));
     }
     pump_until(&mut h, "the Close editor button", LONG, |h| h.query_by_label("Close editor").is_some());
+    settle(&mut h);
     h.get_by_label("Close editor").click();
     pump_until(&mut h, "the editor closed", LONG, |_| open(false));
     c.call(Command::Shutdown).unwrap();
