@@ -12,9 +12,14 @@ use confluence_core::buffer::PlanarBuffer;
 use confluence_core::clock::{RateEstimator, DEFAULT_RATE_BANDWIDTH_HZ};
 use confluence_core::mailbox::{Receiver, Sender};
 use confluence_core::matrix::MatrixRouter;
+use confluence_core::plan::{PlanRunner, Step};
+use confluence_core::processor::{BusIo, Processor};
 
 /// Maximum soft input plus soft output slots the audio side can hold.
 pub const MAX_SLOTS: usize = 64;
+
+/// Maximum insert buses the audio side can hold.
+pub const MAX_BUSES: usize = 64;
 
 pub(crate) struct InputEntry {
     pub id: u32,
@@ -46,10 +51,41 @@ pub(crate) struct StrictEntry {
     pub side: Box<dyn StrictSide>,
 }
 
+/// The audio-thread end of an insert bus: its channels and what it runs.
+pub(crate) struct BusEntry {
+    pub id: u32,
+    pub first_send: usize,
+    pub first_return: usize,
+    pub channels: usize,
+    /// `None`: a summing bus (returns = sends).
+    pub processor: Option<Box<dyn Processor>>,
+    /// Blocks whose processor panicked (their returns were silenced).
+    pub faults: Arc<AtomicU64>,
+}
+
+impl BusEntry {
+    fn run(&mut self, sends: &PlanarBuffer, returns: &mut PlanarBuffer) {
+        let (fs, fr, ch) = (self.first_send, self.first_return, self.channels);
+        let Some(p) = self.processor.as_mut() else {
+            BusIo::new(sends, fs, returns, fr, ch).passthrough();
+            return;
+        };
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            p.process(BusIo::new(sends, fs, &mut *returns, fr, ch))
+        }))
+        .is_ok();
+        if !ok {
+            BusIo::new(sends, fs, returns, fr, ch).silence();
+            self.faults.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 pub(crate) enum AudioMsg {
     AddInput(Box<InputEntry>),
     AddOutput(Box<OutputEntry>),
     AddStrict(Box<StrictEntry>),
+    AddBus(Box<BusEntry>),
     Remove(u32),
 }
 
@@ -58,6 +94,7 @@ pub(crate) enum Returned {
     Input(Box<InputEntry>),
     Output(Box<OutputEntry>),
     Strict(Box<StrictEntry>),
+    Bus(Box<BusEntry>),
 }
 
 pub struct AudioEngine {
@@ -72,6 +109,10 @@ pub struct AudioEngine {
     pub(crate) soft_outputs: Vec<Box<OutputEntry>>,
     #[allow(clippy::vec_box)]
     pub(crate) strict: Vec<Box<StrictEntry>>,
+    #[allow(clippy::vec_box)]
+    pub(crate) buses: Vec<Box<BusEntry>>,
+    /// The order of matrix mixing and bus processing.
+    pub(crate) plan: PlanRunner,
     pub(crate) inbox: Receiver<AudioMsg>,
     pub(crate) returns: Sender<Returned>,
     pub(crate) blocks: Arc<AtomicU64>,
@@ -149,7 +190,22 @@ impl AudioEngine {
         for e in self.soft_inputs.iter_mut() {
             e.side.read(&mut self.inputs, e.first_channel, now, master_ppm);
         }
-        self.router.process(&self.inputs, &mut self.outputs);
+        self.router.begin_block();
+        self.plan.begin_block();
+        {
+            let Self { router, plan, buses, inputs, outputs, .. } = self;
+            for step in plan.steps() {
+                match step {
+                    Step::Mix(cols) => router.mix(inputs, outputs, cols.start as usize..cols.end as usize),
+                    Step::Bus(id) => {
+                        // A bus not (or no longer) here is skipped: its returns stay silent.
+                        if let Some(b) = buses.iter_mut().find(|b| b.id == *id) {
+                            b.run(outputs, inputs);
+                        }
+                    }
+                }
+            }
+        }
         for e in self.soft_outputs.iter_mut() {
             e.side.write(&self.outputs, e.first_channel, now, master_ppm);
         }
@@ -190,7 +246,21 @@ impl AudioEngine {
                         self.give_back(Returned::Strict(e));
                     }
                 }
+                AudioMsg::AddBus(e) => {
+                    if self.buses.len() < self.buses.capacity() {
+                        self.buses.push(e);
+                    } else {
+                        self.give_back(Returned::Bus(e));
+                    }
+                }
                 AudioMsg::Remove(id) => {
+                    if let Some(i) = self.buses.iter().position(|e| e.id == id) {
+                        let e = self.buses.swap_remove(i);
+                        for ch in e.first_return..e.first_return + e.channels {
+                            self.inputs.channel_mut(ch).fill(0.0);
+                        }
+                        self.give_back(Returned::Bus(e));
+                    }
                     if let Some(i) = self.soft_inputs.iter().position(|e| e.id == id) {
                         let e = self.soft_inputs.swap_remove(i);
                         // Nothing writes these channels any more: silence them so
