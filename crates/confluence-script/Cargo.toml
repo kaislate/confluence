@@ -1,0 +1,14 @@
+[package]
+name = "confluence-script"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Luau scripts for Confluence: sandboxed, reacting to MIDI and controlling routes"
+
+[dependencies]
+confluence-api = { path = "../confluence-api" }
+mlua = { version = "0.12", features = ["luau", "send"] }
+
+[lints]
+workspace = true
