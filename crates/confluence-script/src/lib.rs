@@ -92,10 +92,13 @@ impl Script {
         lua.sandbox(true)?;
         let log = self.log.clone();
         let say = lua.create_function(move |lua, args: mlua::MultiValue| {
+            // Like print: anything goes, shown as tostring shows it.
+            let tostring: Function = lua.globals().get("tostring")?;
             let parts: Vec<String> = args
                 .into_iter()
-                .map(|v| {
-                    lua.coerce_string(v).ok().flatten().map(|s| s.to_string_lossy()).unwrap_or_else(|| "nil".into())
+                .map(|v| match &v {
+                    Value::String(s) => s.to_string_lossy(),
+                    _ => tostring.call::<String>(v).unwrap_or_else(|_| "?".into()),
                 })
                 .collect();
             push_log(&log, parts.join("\t"));
@@ -366,14 +369,16 @@ mod tests {
         let mut h = ScriptHost::new();
         let src = "function on_midi(m)
             local ok, err = pcall(confluence.set_route, 5, 5, 0)
-            if not ok then confluence.log('refused: ' .. tostring(err)) end
+            if not ok then confluence.log('refused:', err, {}, nil) end
         end";
         h.set("careful", src, true).unwrap();
         let mut routes = Map::default();
         routes.1.push((5, 5));
         h.on_midi(&cc(1, 1), &mut routes);
         assert_eq!(status(&h, "careful"), ScriptStatus::Running);
-        assert!(h.infos()[0].log[0].contains("back into itself"), "{:?}", h.infos()[0].log);
+        let line = &h.infos()[0].log[0];
+        assert!(line.contains("back into itself") && line.ends_with("\tnil"), "{line}");
+        assert!(line.contains("\ttable: "), "{line}");
     }
 
     #[test]

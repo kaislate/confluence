@@ -1005,6 +1005,7 @@ dependencies = [
  "confluence-provider-vasio",
  "confluence-provider-wasapi",
  "confluence-rt",
+ "confluence-script",
  "confluence-vasio",
  "serde",
  "serde_json",
