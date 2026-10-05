@@ -492,7 +492,16 @@ fn a_plugins_editor_is_opened_and_closed_from_the_window() {
     h.get_by_label("FX outputs").click();
     pump_until(&mut h, "the Show editor button", LONG, |h| h.query_by_label("Show editor").is_some());
     h.get_by_label("Show editor").click();
-    pump_until(&mut h, "the editor open in the engine", LONG, |_| open(true));
+    let deadline = std::time::Instant::now() + LONG;
+    while !open(true) {
+        if std::time::Instant::now() > deadline {
+            // Say why: what the engine answers when asked directly.
+            let direct = c.call(Command::ShowEditor { bus: confluence_api::BusRef::Id(ids[0]) });
+            panic!("the editor did not open from the window; asked directly the engine says {direct:?}");
+        }
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
     pump_until(&mut h, "the Close editor button", LONG, |h| h.query_by_label("Close editor").is_some());
     h.get_by_label("Close editor").click();
     pump_until(&mut h, "the editor closed", LONG, |_| open(false));
