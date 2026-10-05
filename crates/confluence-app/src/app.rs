@@ -181,6 +181,7 @@ pub struct ConfluenceApp {
     param_pending: HashMap<(u32, u32), f64>,
     /// A bus whose plugin is being loaded.
     plugin_loading: Option<u32>,
+    scene_bar: crate::scenes::SceneBar,
 }
 
 /// The engine owns plugin editor windows; Windows lets a background process
@@ -246,6 +247,7 @@ impl ConfluenceApp {
             picker: None,
             param_pending: HashMap::new(),
             plugin_loading: None,
+            scene_bar: crate::scenes::SceneBar::default(),
         }
     }
 
@@ -389,6 +391,7 @@ impl ConfluenceApp {
         let graphs = self.inspector_open && matches!(self.selection, Selection::Slot(_));
         self.graphs_live.store(graphs, Ordering::Relaxed);
         self.top_bar(ui, &view, now);
+        self.scene_bar(ui, &view);
         self.side_panels(ui, &view, now);
         self.matrix(ui, &view);
         self.keyboard(ui, &view);
@@ -400,6 +403,17 @@ impl ConfluenceApp {
         }
         if self.notes.has_info() || self.xruns.1.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    fn scene_bar(&mut self, ui: &mut egui::Ui, view: &StoreView) {
+        let Some(state) = &view.state else { return };
+        let editable = self.live();
+        let edits = egui::Panel::bottom("scene-bar")
+            .show(ui, |ui| crate::scenes::show(ui, state, &mut self.scene_bar, editable))
+            .inner;
+        for e in edits {
+            self.send(e);
         }
     }
 

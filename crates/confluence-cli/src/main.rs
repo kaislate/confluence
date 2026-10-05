@@ -57,6 +57,19 @@ enum Cmd {
     ShowEditor { bus: u32 },
     /// Close the editor of the plugin on insert bus BUS.
     HideEditor { bus: u32 },
+    /// List the scenes.
+    Scenes,
+    /// Save the current routes and plugin settings as scene NAME.
+    SaveScene {
+        name: String,
+        /// Seconds recalling it takes to glide there (0 to 10).
+        #[arg(long, default_value_t = 0.0)]
+        morph: f64,
+    },
+    /// Glide to scene NAME.
+    RecallScene { name: String },
+    /// Delete scene NAME.
+    DeleteScene { name: String },
     /// Set parameter PARAM of the plugin on insert bus BUS.
     SetParam {
         bus: u32,
@@ -116,6 +129,12 @@ impl Cmd {
             }
             Cmd::UnloadPlugin { bus } => Command::UnloadPlugin { bus: BusRef::Id(bus) },
             Cmd::ShowEditor { bus } => Command::ShowEditor { bus: BusRef::Id(bus) },
+            Cmd::Scenes => Command::ListScenes,
+            Cmd::SaveScene { ref name, morph } => {
+                Command::SaveScene { name: name.clone(), morph_ms: (morph.clamp(0.0, 10.0) * 1000.0).round() as u32 }
+            }
+            Cmd::RecallScene { ref name } => Command::RecallScene { name: name.clone() },
+            Cmd::DeleteScene { ref name } => Command::DeleteScene { name: name.clone() },
             Cmd::HideEditor { bus } => Command::HideEditor { bus: BusRef::Id(bus) },
             Cmd::SetParam { bus, param, value } => Command::SetParam { bus: BusRef::Id(bus), param, value },
             Cmd::Status => Command::Status,
@@ -127,6 +146,20 @@ impl Cmd {
 fn render(resp: &Response) -> String {
     match resp {
         Response::Ok => "ok".into(),
+        Response::Scenes(s) if s.is_empty() => "no scenes".into(),
+        Response::Scenes(s) => s
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}  morph {:.1} s  {} routes  {} parameters",
+                    s.name,
+                    s.morph_ms as f64 / 1000.0,
+                    s.routes,
+                    s.params
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         Response::Plugins(p) if p.is_empty() => "no CLAP plugins found".into(),
         Response::Plugins(p) => p
             .iter()
@@ -270,6 +303,12 @@ fn render_change(c: &Change) -> String {
         }
         Change::BusPluginSet(p) => format!("bus #{}: {} {:?}", p.bus, p.info.name, p.status),
         Change::BusPluginRemoved { bus } => format!("bus #{bus}: plugin removed"),
+        Change::ScenesChanged(s, current, morphing) => format!(
+            "{} scenes, current: {}{}",
+            s.len(),
+            current.as_deref().unwrap_or("none"),
+            if *morphing { " (morphing)" } else { "" }
+        ),
         Change::ParamChanged { bus, id, text, .. } => format!("bus #{bus}: parameter {id} = {text}"),
     }
 }
@@ -398,6 +437,14 @@ v7  slot #3 removed"
         );
         assert_eq!(parse(&["unload-plugin", "4"]), Command::UnloadPlugin { bus: BusRef::Id(4) });
         assert_eq!(parse(&["show-editor", "4"]), Command::ShowEditor { bus: BusRef::Id(4) });
+        assert_eq!(parse(&["scenes"]), Command::ListScenes);
+        assert_eq!(parse(&["save-scene", "Verse"]), Command::SaveScene { name: "Verse".into(), morph_ms: 0 });
+        assert_eq!(
+            parse(&["save-scene", "Chorus", "--morph", "1.5"]),
+            Command::SaveScene { name: "Chorus".into(), morph_ms: 1500 }
+        );
+        assert_eq!(parse(&["recall-scene", "Verse"]), Command::RecallScene { name: "Verse".into() });
+        assert_eq!(parse(&["delete-scene", "Verse"]), Command::DeleteScene { name: "Verse".into() });
         assert_eq!(parse(&["hide-editor", "4"]), Command::HideEditor { bus: BusRef::Id(4) });
         assert_eq!(
             parse(&["set-param", "4", "1", "-6.5"]),

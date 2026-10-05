@@ -509,3 +509,31 @@ fn a_plugins_editor_is_opened_and_closed_from_the_window() {
     pump_until(&mut h, "the editor closed", LONG, |_| open(false));
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_scene_saved_from_the_bar_brings_a_route_back() {
+    let d = EngineDir::new("scenes");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_vasio(&mut c, 1);
+    let set = |gain_db| Command::SetPoint { input: i, output: o, gain_db, mute: false, invert: false };
+    assert!(matches!(c.call(set(-6.0)).unwrap(), Response::Applied { .. }));
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "the scene bar", LONG, |h| h.query_by_label("+ Scene").is_some());
+    h.get_by_label("+ Scene").click();
+    pump_until(&mut h, "the scene form", LONG, |h| h.query_by_label("Save scene").is_some());
+    h.get_by(|n| n.placeholder() == Some("Scene name")).click();
+    settle(&mut h);
+    h.get_by(|n| n.placeholder() == Some("Scene name")).type_text("Verse");
+    settle(&mut h);
+    h.get_by_label("Save scene").click();
+    pump_until(&mut h, "the scene button", LONG, |h| h.query_by_label("Scene Verse").is_some());
+    assert!(matches!(c.call(set(-30.0)).unwrap(), Response::Applied { .. }));
+    settle(&mut h);
+    h.get_by_label("Scene Verse").click();
+    pump_until(&mut h, "the route back at −6 dB", LONG, |_| {
+        let (state, _sub) = confluence_client::Subscription::connect(&d.pipe, Duration::from_secs(5)).unwrap();
+        state.points.iter().any(|p| (p.input, p.output) == (i, o) && p.gain_db == -6.0)
+    });
+    c.call(Command::Shutdown).unwrap();
+}

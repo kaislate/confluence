@@ -161,6 +161,7 @@ impl PluginThread {
             editor_open: loaded.editor_open,
             edited: Vec::new(),
             host_sets: Vec::new(),
+            texts_stale: Vec::new(),
         };
         Ok((link, Box::new(loaded.processor)))
     }
@@ -206,8 +207,10 @@ pub struct PluginLink {
     editor_open: Arc<AtomicBool>,
     /// Writable values the plugin changed itself (in its editor), not yet taken.
     edited: Vec<(u32, f64)>,
-    /// When the host last set each parameter (reports right after are echoes).
-    host_sets: Vec<(u32, std::time::Instant)>,
+    /// Values the host sent recently: a report of one of them is an echo.
+    host_sets: Vec<(u32, f64, std::time::Instant)>,
+    /// Parameters whose text changed again while a text was being asked for.
+    texts_stale: Vec<u32>,
 }
 
 impl PluginLink {
@@ -239,8 +242,8 @@ impl PluginLink {
         }
         self.params_tx.try_send((id, v)).map_err(|_| format!("{name} is not taking changes this fast"))?;
         p.value = v;
-        self.host_sets.retain(|(q, _)| *q != id);
-        self.host_sets.push((id, std::time::Instant::now()));
+        self.host_sets.retain(|(_, _, at)| at.elapsed() < ECHO_WINDOW);
+        self.host_sets.push((id, v, std::time::Instant::now()));
         self.refresh_text(id);
         Ok(())
     }
@@ -265,12 +268,21 @@ impl PluginLink {
                     shown = true;
                 }
             }
+            // The value moved again while its text was asked for: ask again.
+            if let Some(i) = self.texts_stale.iter().position(|q| *q == id) {
+                self.texts_stale.swap_remove(i);
+                self.refresh_text(id);
+            }
         }
         let mut changed = Vec::new();
-        self.host_sets.retain(|(_, at)| at.elapsed() < ECHO_WINDOW);
+        self.host_sets.retain(|(_, _, at)| at.elapsed() < ECHO_WINDOW);
         while let Some((id, value)) = self.reported_rx.try_recv() {
-            if self.host_sets.iter().any(|(q, _)| *q == id) {
-                continue; // an echo of the host's own change
+            let echo = self
+                .host_sets
+                .iter()
+                .any(|(q, sent, _)| *q == id && (value - sent).abs() <= 1e-6 * sent.abs().max(1.0));
+            if echo {
+                continue; // a value the host sent: its own change coming back
             }
             if let Some(p) = self.params.iter_mut().find(|p| p.id == id) {
                 if p.value != value {
@@ -363,9 +375,16 @@ impl PluginLink {
         let Some(p) = self.params.iter_mut().find(|p| p.id == id) else { return };
         let value = p.value;
         p.text = format!("{value:.2}");
+        // One question at a time per parameter (a morph moves values every
+        // tick): the answer's arrival asks again if the value moved meanwhile.
+        if self.texts.iter().any(|(q, _)| *q == id) {
+            if !self.texts_stale.contains(&id) {
+                self.texts_stale.push(id);
+            }
+            return;
+        }
         let (reply, rx) = mpsc::channel();
         if self.thread.send(Msg::Text { plugin: self.plugin, id, value, reply }).is_ok() {
-            self.texts.retain(|(q, _)| *q != id);
             self.texts.push((id, rx));
         }
     }

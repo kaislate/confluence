@@ -20,6 +20,8 @@ use confluence_core::plan::{compile, order, plan, BusSpan, PlanController};
 use confluence_core::processor::Processor;
 
 use crate::alloc::ChannelAllocator;
+
+mod scenes;
 use crate::audio::{
     AudioEngine, AudioMsg, BusEntry, InputEntry, LoadMeter, OutputEntry, Returned, StrictEntry, StrictSide, MAX_BUSES,
     MAX_SLOTS,
@@ -84,6 +86,12 @@ pub enum EngineError {
     NotABus(u32),
     #[error("no insert bus at channel {0}")]
     NoBusAt(u32),
+    #[error("a scene needs a name")]
+    SceneName,
+    #[error("morph time is 0 to 10 s")]
+    MorphTime,
+    #[error("no scene named {0}")]
+    NoScene(String),
 }
 
 /// The engine's handle on the plugin of an insert bus (its audio side runs as
@@ -265,6 +273,8 @@ pub struct Engine {
     plugins: std::collections::BTreeMap<u32, BusPlugin>,
     /// Plugin trouble the user should know about, by bus id.
     plugin_notices: std::collections::BTreeMap<u32, String>,
+    /// Scenes and the running morph.
+    scenes: scenes::Scenes,
     /// Editor changes not saved yet, by (send column, param).
     edits_held: std::collections::BTreeMap<(u32, u32), f64>,
     /// When each (send column, param) was last saved.
@@ -324,6 +334,7 @@ impl Engine {
             plugins: std::collections::BTreeMap::new(),
             plugin_notices: std::collections::BTreeMap::new(),
             edits_held: std::collections::BTreeMap::new(),
+            scenes: scenes::Scenes::default(),
             edits_saved: std::collections::HashMap::new(),
             blocks,
             master_ppm,
@@ -586,6 +597,7 @@ impl Engine {
         };
         self.set_bus_processor(bus, processor)?;
         self.set_bus_silent(bus, false)?;
+        self.scenes.bus_changed(bus);
         match control {
             Some(control) => {
                 let faults_before = self.bus_faults(bus);
@@ -604,6 +616,7 @@ impl Engine {
         self.check_bus(bus)?;
         self.set_bus_processor(bus, None)?;
         self.set_bus_silent(bus, true)?;
+        self.scenes.bus_changed(bus);
         self.plugins.insert(bus, BusPlugin::Failed { info, why, state: None, values: Default::default() });
         Ok(())
     }
@@ -678,7 +691,12 @@ impl Engine {
             let Some(p) = self.plugins.get_mut(&bus) else { continue };
             let (info, state, values): (PluginInfo, Option<Vec<u8>>, Vec<(u32, f64)>) = match p {
                 BusPlugin::Loaded { control, .. } => {
-                    let values = control.params().iter().filter(|q| !q.read_only).map(|q| (q.id, q.value)).collect();
+                    let values = control
+                        .params()
+                        .iter()
+                        .filter(|q| !q.read_only)
+                        .map(|q| (q.id, self.scenes.param_target(bus, q.id).unwrap_or(q.value)))
+                        .collect();
                     (control.info(), control.save_state().ok(), values)
                 }
                 BusPlugin::Failed { info, state, values, .. } => {
@@ -714,6 +732,30 @@ impl Engine {
         out
     }
 
+    /// Takes in values plugins changed themselves (in their editors): held
+    /// for saving, and a change to a parameter a morph is moving stops that
+    /// glide (the user's value is sent to the plugin again, in case a glide
+    /// step overtook it).
+    fn collect_plugin_edits(&mut self) {
+        let places: Vec<(u32, u32)> = self
+            .slots
+            .iter()
+            .filter(|s| matches!(s.stats, SlotStats::Bus(_)))
+            .map(|s| (s.state.id, s.state.first_output))
+            .collect();
+        for (bus, at) in places {
+            let Some(BusPlugin::Loaded { control, .. }) = self.plugins.get_mut(&bus) else { continue };
+            control.poll();
+            for (param, value) in control.take_edited() {
+                self.edits_held.insert((at, param), value);
+                if self.scenes.is_gliding(bus, param) {
+                    let _ = control.set_param(param, value);
+                }
+                self.scenes.param_changed(bus, param);
+            }
+        }
+    }
+
     /// Values plugins changed themselves (in their editors), as journal
     /// records (buses by send column). A parameter is saved at most once per
     /// [`EDIT_SAVE_INTERVAL`]: a plugin moving its own parameter all the time
@@ -725,15 +767,9 @@ impl Engine {
             .filter(|s| matches!(s.stats, SlotStats::Bus(_)))
             .map(|s| (s.state.id, s.state.first_output))
             .collect();
+        let _ = places;
         let mut out = Vec::new();
-        for (bus, at) in places {
-            if let Some(BusPlugin::Loaded { control, .. }) = self.plugins.get_mut(&bus) {
-                control.poll();
-                for (param, value) in control.take_edited() {
-                    self.edits_held.insert((at, param), value);
-                }
-            }
-        }
+        self.collect_plugin_edits();
         let due: Vec<(u32, u32)> = self
             .edits_held
             .keys()
@@ -784,7 +820,18 @@ impl Engine {
             Command::SetParam { bus, param, value } => {
                 let bus = self.resolve_bus(bus).map_err(|e| e.to_string())?;
                 match self.plugins.get_mut(&bus) {
-                    Some(BusPlugin::Loaded { control, .. }) => control.set_param(*param, *value),
+                    Some(BusPlugin::Loaded { control, .. }) => {
+                        let r = control.set_param(*param, *value);
+                        if r.is_ok() {
+                            self.scenes.param_changed(bus, *param);
+                            if let Some(at) =
+                                self.slots.iter().find(|s| s.state.id == bus).map(|s| s.state.first_output)
+                            {
+                                self.edits_held.remove(&(at, *param));
+                            }
+                        }
+                        r
+                    }
                     Some(BusPlugin::Failed { values, .. }) => {
                         values.insert(*param, *value);
                         Ok(())
@@ -794,6 +841,8 @@ impl Engine {
             }
             Command::SetPluginState { bus, state } => {
                 let bus = self.resolve_bus(bus).map_err(|e| e.to_string())?;
+                self.scenes.bus_changed(bus);
+                self.scenes.mix_changed();
                 match self.plugins.get_mut(&bus) {
                     Some(BusPlugin::Loaded { control, .. }) => control.load_state(state),
                     Some(BusPlugin::Failed { state: kept, .. }) => {
@@ -973,6 +1022,7 @@ impl Engine {
             self.plan_dirty = false;
         }
         self.plan.tick();
+        self.advance_morph(std::time::Instant::now());
         self.matrix.tick();
         while let Some(r) = self.returns.try_recv() {
             match r {
@@ -1004,13 +1054,17 @@ impl Engine {
             }
             Command::SetPoint { input, output, gain_db, mute, invert } => {
                 match self.set_point(input, output, PointParams { gain_db, mute, invert }) {
-                    Ok(()) => Response::Ok,
+                    Ok(()) => {
+                        self.scenes.route_changed(input, output);
+                        Response::Ok
+                    }
                     Err(e) => Response::Error(e.to_string()),
                 }
             }
             Command::RemovePoint { input, output } => match self.matrix.remove_point(input, output) {
                 Ok(()) => {
                     self.plan_dirty |= self.buses > 0;
+                    self.scenes.route_changed(input, output);
                     Response::Ok
                 }
                 Err(_) => Response::Error(EngineError::OutOfRange.to_string()),
@@ -1045,6 +1099,12 @@ impl Engine {
                 Response::Error("subscriptions and status are served by the engine process".into())
             }
             Command::Shutdown => Response::Ok,
+            Command::SaveScene { .. }
+            | Command::PutScene { .. }
+            | Command::DeleteScene { .. }
+            | Command::SetSceneMorph { .. }
+            | Command::RecallScene { .. }
+            | Command::ListScenes => self.scene_command(cmd),
             Command::ListPlugins
             | Command::LoadPlugin { .. }
             | Command::UnloadPlugin { .. }
@@ -1822,6 +1882,360 @@ mod tests {
         assert_eq!(e.handle(&show), Response::Error("Fake has no editor".into()));
         e.set_failed_plugin(b, fake().info(), "gone".into()).unwrap();
         assert_eq!(e.handle(&show), Response::Error("Fake is not loaded".into()));
+    }
+
+    fn set(e: &mut Engine, input: u32, output: u32, gain_db: f32, mute: bool) {
+        let r = e.handle(&Command::SetPoint { input, output, gain_db, mute, invert: false });
+        assert_eq!(r, Response::Ok);
+    }
+
+    /// (gain dB, muted) of a route.
+    fn level(e: &mut Engine, input: u32, output: u32) -> (f32, bool) {
+        let Response::Points(p) = e.handle(&Command::ListPoints) else { panic!() };
+        let p = p.iter().find(|p| (p.input, p.output) == (input, output)).expect("the route");
+        (p.gain_db, p.mute)
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.5
+    }
+
+    fn save(e: &mut Engine, name: &str, morph_ms: u32) {
+        assert_eq!(e.handle(&Command::SaveScene { name: name.into(), morph_ms }), Response::Ok);
+    }
+
+    #[test]
+    fn a_scene_is_saved_and_recalled() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, -6.0, false);
+        save(&mut e, "A", 0);
+        set(&mut e, 0, 1, -20.0, false);
+        assert_eq!(e.handle(&Command::RecallScene { name: "A".into() }), Response::Ok);
+        assert_eq!(level(&mut e, 0, 1), (-6.0, false));
+        assert_eq!(e.current_scene(), Some("A"));
+        let infos = e.scene_infos();
+        assert_eq!(infos, vec![confluence_api::SceneInfo { name: "A".into(), morph_ms: 0, routes: 1, params: 0 }]);
+        assert_eq!(e.handle(&Command::ListScenes), Response::Scenes(infos));
+    }
+
+    #[test]
+    fn a_morph_glides_in_db() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, -40.0, false);
+        save(&mut e, "Quiet", 1000);
+        set(&mut e, 0, 1, 0.0, false);
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("Quiet", t0, false).unwrap();
+        assert!(e.morphing());
+        e.advance_morph(t0 + Duration::from_millis(500));
+        assert!(near(level(&mut e, 0, 1).0, -20.0), "{:?}", level(&mut e, 0, 1));
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        assert_eq!(level(&mut e, 0, 1), (-40.0, false));
+        assert!(!e.morphing());
+    }
+
+    #[test]
+    fn muting_and_unmuting_glide_through_silence() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, 0.0, false);
+        save(&mut e, "On", 1000);
+        set(&mut e, 0, 1, 0.0, true);
+        save(&mut e, "Off", 1000);
+        set(&mut e, 0, 1, 0.0, false);
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("Off", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(500));
+        let (g, m) = level(&mut e, 0, 1);
+        assert!(near(g, -50.0) && !m, "gliding down, not yet muted: {g} {m}");
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        assert_eq!(level(&mut e, 0, 1), (0.0, true), "muted at the end, its gain kept");
+        let t1 = t0 + Duration::from_millis(2000);
+        e.recall_scene_at("On", t1, false).unwrap();
+        let (g, m) = level(&mut e, 0, 1);
+        assert!(g <= -99.0 && !m, "unmuted at silence first: {g} {m}");
+        e.advance_morph(t1 + Duration::from_millis(500));
+        assert!(near(level(&mut e, 0, 1).0, -50.0));
+        e.advance_morph(t1 + Duration::from_millis(1000));
+        assert_eq!(level(&mut e, 0, 1), (0.0, false));
+    }
+
+    #[test]
+    fn recall_skips_routes_gone_and_leaves_others_alone() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, -6.0, false);
+        set(&mut e, 0, 2, -6.0, false);
+        save(&mut e, "S", 0);
+        set(&mut e, 0, 1, -30.0, false);
+        e.handle(&Command::RemovePoint { input: 0, output: 2 });
+        set(&mut e, 0, 3, -5.0, false);
+        assert_eq!(e.handle(&Command::RecallScene { name: "S".into() }), Response::Ok);
+        assert_eq!(level(&mut e, 0, 1), (-6.0, false));
+        assert_eq!(level(&mut e, 0, 3), (-5.0, false), "not in the scene: untouched");
+        let Response::Points(p) = e.handle(&Command::ListPoints) else { panic!() };
+        assert!(!p.iter().any(|p| (p.input, p.output) == (0, 2)), "nothing is created");
+    }
+
+    #[test]
+    fn a_route_changed_during_a_morph_stays_where_it_was_put() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, -40.0, false);
+        set(&mut e, 0, 2, -40.0, false);
+        save(&mut e, "Q", 1000);
+        set(&mut e, 0, 1, 0.0, false);
+        set(&mut e, 0, 2, 0.0, false);
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("Q", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(300));
+        set(&mut e, 0, 1, -10.0, false);
+        assert_eq!(e.current_scene(), None, "the mix no longer matches the scene");
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        assert_eq!(level(&mut e, 0, 1), (-10.0, false), "the user's value");
+        assert_eq!(level(&mut e, 0, 2), (-40.0, false), "the others carry on");
+    }
+
+    #[test]
+    fn a_new_recall_takes_over_from_where_the_mix_is() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, -40.0, false);
+        save(&mut e, "Q", 1000);
+        set(&mut e, 0, 1, 0.0, false);
+        save(&mut e, "L", 1000);
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("Q", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(500)); // at −20
+        e.recall_scene_at("L", t0 + Duration::from_millis(500), false).unwrap();
+        assert!(near(level(&mut e, 0, 1).0, -20.0), "no jump");
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        assert!(near(level(&mut e, 0, 1).0, -10.0), "halfway from −20 to 0");
+        assert_eq!(e.current_scene(), Some("L"));
+    }
+
+    #[test]
+    fn plugin_parameters_glide_too() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("FX", 1, 8)).unwrap();
+        e.set_plugin(b, Some((fake(), halves()))).unwrap();
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: -12.0 });
+        save(&mut e, "P", 1000);
+        assert_eq!(e.scene_infos()[0].params, 1);
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: 0.0 });
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("P", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(500));
+        assert!((e.bus_plugins()[0].params[0].value + 6.0).abs() < 0.1);
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        assert_eq!(e.bus_plugins()[0].params[0].value, -12.0);
+    }
+
+    #[test]
+    fn saving_mid_morph_saves_where_the_mix_is_going() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, -40.0, false);
+        let b = e.add_bus(&bus_at("FX", 1, 8)).unwrap();
+        e.set_plugin(b, Some((fake(), halves()))).unwrap();
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: -12.0 });
+        save(&mut e, "Q", 1000);
+        set(&mut e, 0, 1, 0.0, false);
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: 0.0 });
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("Q", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(500));
+        let settled = e.settled_points();
+        assert_eq!(settled.iter().find(|p| (p.input, p.output) == (0, 1)).unwrap().gain_db, -40.0);
+        assert!(e.plugin_commands().contains(&set_param_at(8, 1, -12.0)), "the parameter's target");
+        let puts: Vec<Command> = e.scene_commands();
+        assert!(matches!(&puts[..], [Command::PutScene { scene }] if scene.name == "Q"));
+    }
+
+    #[test]
+    fn a_morph_never_brings_back_a_route_that_was_removed() {
+        let (mut e, _a) = small();
+        let (slot, _dev) = e.add_soft_input(&spec("in", 2)).unwrap(); // inputs 0..2
+        set(&mut e, 0, 5, -40.0, false);
+        save(&mut e, "Q", 1000);
+        set(&mut e, 0, 5, 0.0, false);
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("Q", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(300));
+        e.remove_slot(slot).unwrap(); // takes its routes with it
+        e.advance_morph(t0 + Duration::from_millis(600));
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        let Response::Points(p) = e.handle(&Command::ListPoints) else { panic!() };
+        assert!(p.is_empty(), "the removed route stays removed: {p:?}");
+    }
+
+    /// A plugin whose `set_param` calls are counted, failing on demand.
+    struct Counting {
+        inner: FakePlugin,
+        sets: Arc<Mutex<Vec<f64>>>,
+        refuse: Arc<std::sync::atomic::AtomicBool>,
+        feed: Arc<Mutex<Vec<(u32, f64)>>>,
+    }
+
+    impl PluginControl for Counting {
+        fn info(&self) -> PluginInfo {
+            self.inner.info()
+        }
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn params(&self) -> Vec<ParamState> {
+            self.inner.params()
+        }
+        fn set_param(&mut self, id: u32, value: f64) -> Result<(), String> {
+            if self.refuse.load(Ordering::Relaxed) {
+                return Err("Fake is not taking changes this fast".into());
+            }
+            self.sets.lock().unwrap().push(value);
+            self.inner.set_param(id, value)
+        }
+        fn poll(&mut self) -> bool {
+            false
+        }
+        fn save_state(&mut self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn load_state(&mut self, _state: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn take_edited(&mut self) -> Vec<(u32, f64)> {
+            let edits = std::mem::take(&mut *self.feed.lock().unwrap());
+            for (id, v) in &edits {
+                let _ = self.inner.set_param(*id, *v); // what the editor did to the plugin
+            }
+            edits
+        }
+    }
+
+    struct PluginProbe {
+        sets: Arc<Mutex<Vec<f64>>>,
+        refuse: Arc<std::sync::atomic::AtomicBool>,
+        feed: Arc<Mutex<Vec<(u32, f64)>>>,
+    }
+
+    fn counting() -> (Box<dyn PluginControl>, PluginProbe) {
+        let sets = Arc::new(Mutex::new(Vec::new()));
+        let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let feed = Arc::new(Mutex::new(Vec::new()));
+        let c = Counting {
+            inner: FakePlugin { gain: 0.0, state: Arc::new(Mutex::new(Vec::new())) },
+            sets: sets.clone(),
+            refuse: refuse.clone(),
+            feed: feed.clone(),
+        };
+        (Box::new(c), PluginProbe { sets, refuse, feed })
+    }
+
+    /// A bus with a counting plugin, Gain saved at −12 in scene "P" (1 s).
+    fn scene_on_plugin() -> (Engine, AudioEngine, u32, PluginProbe) {
+        let (mut e, a) = small();
+        let b = e.add_bus(&bus_at("FX", 1, 8)).unwrap();
+        let (control, probe) = counting();
+        e.set_plugin(b, Some((control, halves()))).unwrap();
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: -12.0 });
+        save(&mut e, "P", 1000);
+        e.handle(&Command::SetParam { bus: BusRef::Id(b), param: 1, value: 0.0 });
+        probe.sets.lock().unwrap().clear();
+        (e, a, b, probe)
+    }
+
+    #[test]
+    fn a_change_made_in_the_plugins_editor_wins_over_a_morph() {
+        let (mut e, _a, _b, probe) = scene_on_plugin();
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("P", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(200));
+        probe.feed.lock().unwrap().push((1, -3.0)); // the user turns the knob in the editor
+        e.advance_morph(t0 + Duration::from_millis(400));
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        assert_eq!(e.bus_plugins()[0].params[0].value, -3.0, "the editor's value stays");
+        assert_eq!(e.current_scene(), None);
+        assert!(e.take_edited_values(t0 + Duration::from_millis(1000)).contains(&set_param_at(8, 1, -3.0)));
+    }
+
+    #[test]
+    fn a_held_editor_edit_is_not_saved_over_a_later_recall() {
+        let (mut e, _a, _b, probe) = scene_on_plugin();
+        let t0 = std::time::Instant::now();
+        probe.feed.lock().unwrap().push((1, -1.0));
+        assert_eq!(e.take_edited_values(t0), vec![set_param_at(8, 1, -1.0)]);
+        probe.feed.lock().unwrap().push((1, -2.0));
+        assert!(e.take_edited_values(t0 + Duration::from_millis(100)).is_empty(), "held");
+        e.recall_scene_at("P", t0 + Duration::from_millis(200), true).unwrap();
+        let later = e.take_edited_values(t0 + Duration::from_millis(3000));
+        assert!(!later.contains(&set_param_at(8, 1, -2.0)), "the recall superseded it: {later:?}");
+    }
+
+    #[test]
+    fn a_morph_sends_only_what_changes_and_finishes_what_it_could_not_send() {
+        let (mut e, _a, _b, probe) = scene_on_plugin();
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("P", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(500));
+        e.advance_morph(t0 + Duration::from_millis(500));
+        let sent = probe.sets.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "the same value is not sent twice: {sent:?}");
+        probe.refuse.store(true, Ordering::Relaxed);
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        assert!(e.morphing(), "the final value did not go through: still morphing");
+        probe.refuse.store(false, Ordering::Relaxed);
+        e.advance_morph(t0 + Duration::from_millis(1010));
+        assert!(!e.morphing());
+        assert_eq!(e.bus_plugins()[0].params[0].value, -12.0);
+        // A scene value equal to the current one is not glided at all.
+        probe.sets.lock().unwrap().clear();
+        e.recall_scene_at("P", t0 + Duration::from_millis(2000), false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(2500));
+        assert!(probe.sets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_new_plugin_on_the_bus_is_not_moved_by_the_old_morph() {
+        let (mut e, _a, b, _probe) = scene_on_plugin();
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("P", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(300));
+        e.set_plugin(b, Some((fake(), halves()))).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(1000));
+        assert_eq!(e.bus_plugins()[0].params[0].value, 0.0, "the new plugin keeps its value");
+    }
+
+    #[test]
+    fn a_second_recall_finishes_what_the_first_was_moving_and_it_does_not_cover() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, 0.0, false);
+        save(&mut e, "B", 1000); // has only 0→1
+        set(&mut e, 0, 2, 0.0, false);
+        set(&mut e, 0, 1, -40.0, false);
+        set(&mut e, 0, 2, 0.0, true);
+        save(&mut e, "A", 1000); // 0→2 muted
+        set(&mut e, 0, 1, 0.0, false);
+        set(&mut e, 0, 2, 0.0, false);
+        let t0 = std::time::Instant::now();
+        e.recall_scene_at("A", t0, false).unwrap();
+        e.advance_morph(t0 + Duration::from_millis(500)); // 0→2 at −50, unmuted
+        e.recall_scene_at("B", t0 + Duration::from_millis(500), false).unwrap();
+        assert_eq!(level(&mut e, 0, 2), (0.0, true), "finished where A was taking it, not left at −50");
+    }
+
+    #[test]
+    fn scene_mistakes_are_refused() {
+        let (mut e, _a) = small();
+        let err = |e: &mut Engine, c: Command| match e.handle(&c) {
+            Response::Error(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(err(&mut e, Command::SaveScene { name: "  ".into(), morph_ms: 0 }), "a scene needs a name");
+        assert_eq!(err(&mut e, Command::SaveScene { name: "X".into(), morph_ms: 10_001 }), "morph time is 0 to 10 s");
+        assert_eq!(err(&mut e, Command::RecallScene { name: "Nope".into() }), "no scene named Nope");
+        assert_eq!(err(&mut e, Command::DeleteScene { name: "Nope".into() }), "no scene named Nope");
+        save(&mut e, "X", 0);
+        assert_eq!(e.handle(&Command::SetSceneMorph { name: "X".into(), morph_ms: 2500 }), Response::Ok);
+        assert_eq!(e.scene_infos()[0].morph_ms, 2500);
+        save(&mut e, "X", 100);
+        assert_eq!(e.scene_infos().len(), 1, "saving under a name replaces that scene");
+        assert_eq!(e.handle(&Command::DeleteScene { name: "X".into() }), Response::Ok);
+        assert!(e.scene_infos().is_empty());
     }
 
     #[test]
