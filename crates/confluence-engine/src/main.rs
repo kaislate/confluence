@@ -195,6 +195,11 @@ mod app {
             Command::LoadPlugin { bus, path, plugin_id } => {
                 Command::LoadPlugin { bus: at(bus), path: path.clone(), plugin_id: plugin_id.clone() }
             }
+            // The journal keeps what was captured, not the request to capture.
+            Command::SaveScene { name, morph_ms } => match engine.scene(name.trim()) {
+                Some(scene) => Command::PutScene { scene: scene.clone() },
+                None => Command::SaveScene { name: name.clone(), morph_ms: *morph_ms },
+            },
             other => other.clone(),
         }
     }
@@ -275,6 +280,9 @@ mod app {
         (st.plugins, st.bad_plugins) = scanner.list();
         st.bus_plugins = engine.bus_plugins();
         st.notices.extend(engine.plugin_notices());
+        st.scenes = engine.scene_infos();
+        st.current_scene = engine.current_scene().map(String::from);
+        st.morphing = engine.morphing();
         st
     }
 
@@ -458,15 +466,15 @@ mod app {
             })
             .collect();
         out.extend(engine.plugin_commands());
-        if let Response::Points(points) = engine.handle(&Command::ListPoints) {
-            out.extend(points.into_iter().map(|p| Command::SetPoint {
-                input: p.input,
-                output: p.output,
-                gain_db: p.gain_db,
-                mute: p.mute,
-                invert: p.invert,
-            }));
-        }
+        out.extend(engine.scene_commands());
+        // Mid-morph, the routes are saved where the morph is taking them.
+        out.extend(engine.settled_points().into_iter().map(|p| Command::SetPoint {
+            input: p.input,
+            output: p.output,
+            gain_db: p.gain_db,
+            mute: p.mute,
+            invert: p.invert,
+        }));
         out
     }
 
@@ -498,6 +506,10 @@ mod app {
             match cmd {
                 Command::LoadPlugin { bus, path, plugin_id } => {
                     replay_load(&mut engine, &exe, &plugin_thread, bus, path, plugin_id)
+                }
+                // At start-up a recall lands at once: no morph before audio runs.
+                Command::RecallScene { name } => {
+                    let _ = engine.recall_scene_at(name, Instant::now(), true);
                 }
                 _ => {
                     engine.handle(cmd);

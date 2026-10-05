@@ -469,3 +469,49 @@ fn scan_processes_end_with_the_engine() {
     std::thread::sleep(Duration::from_millis(5000));
     assert!(!mark.exists(), "the scan process outlived its engine");
 }
+
+fn scenes_now(pipe: &str) -> confluence_api::State {
+    confluence_client::Subscription::connect(pipe, Duration::from_secs(10)).unwrap().0
+}
+
+/// Scenes are saved with the project; a recall survives a restart, even one in
+/// the middle of its morph (the mix comes back where it was going).
+#[test]
+fn scenes_and_recalls_survive_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let pipe = format!("confluence-scenes-{}", std::process::id());
+    let set = |gain_db| Command::SetPoint { input: 1, output: 2, gain_db, mute: false, invert: false };
+
+    let mut child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert!(matches!(c.call(set(-40.0)).unwrap(), Response::Applied { .. }));
+    let save = Command::SaveScene { name: "Quiet".into(), morph_ms: 10_000 };
+    assert!(matches!(c.call(save).unwrap(), Response::Applied { .. }));
+    assert!(matches!(c.call(set(0.0)).unwrap(), Response::Applied { .. }));
+    let st = scenes_now(&pipe);
+    assert_eq!(st.scenes.len(), 1);
+    assert_eq!(st.current_scene, None);
+    assert!(matches!(c.call(Command::RecallScene { name: "Quiet".into() }).unwrap(), Response::Applied { .. }));
+    let st = scenes_now(&pipe);
+    assert_eq!(st.current_scene.as_deref(), Some("Quiet"));
+    assert!(st.morphing, "a 10 s morph is under way");
+    child.kill(); // in the middle of it
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let st = scenes_now(&pipe);
+    assert_eq!(st.scenes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Quiet"]);
+    assert_eq!(st.points[0].gain_db, -40.0, "where the morph was going");
+    shutdown(child, &mut c);
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(scenes_now(&pipe).points[0].gain_db, -40.0, "and after a clean restart");
+    assert!(matches!(c.call(Command::DeleteScene { name: "Quiet".into() }).unwrap(), Response::Applied { .. }));
+    shutdown(child, &mut c);
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert!(scenes_now(&pipe).scenes.is_empty(), "deleting is saved too");
+    shutdown(child, &mut c);
+}
