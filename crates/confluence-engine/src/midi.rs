@@ -18,7 +18,23 @@ pub struct MidiEvent {
 
 /// An open MIDI input: messages go to the channel given when it was opened;
 /// dropping it closes it.
-pub trait MidiInput: Send {}
+pub trait MidiInput: Send {
+    /// False once the device behind this handle is gone (unplugged, even if it
+    /// is back under the same name: a new handle is needed).
+    fn alive(&self) -> bool {
+        true
+    }
+}
+
+/// A device name without the " (2)", " (3)"… given to identical devices.
+fn base(name: &str) -> &str {
+    match name.rsplit_once(" (") {
+        Some((b, n)) if n.strip_suffix(')').is_some_and(|d| !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit())) => {
+            b
+        }
+        _ => name,
+    }
+}
 
 /// An open MIDI output; dropping it closes it.
 pub trait MidiOutput: Send {
@@ -51,38 +67,62 @@ pub struct MidiHub {
     tx: mpsc::Sender<MidiEvent>,
     rx: mpsc::Receiver<MidiEvent>,
     last_scan: Option<Instant>,
+    /// The outputs seen at the last scan (not listed again for every message).
+    output_names: Vec<String>,
 }
 
 impl MidiHub {
     pub fn new(provider: Box<dyn MidiProvider>) -> MidiHub {
         let (tx, rx) = mpsc::channel();
-        MidiHub { provider, inputs: BTreeMap::new(), outputs: BTreeMap::new(), tx, rx, last_scan: None }
+        MidiHub {
+            provider,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            tx,
+            rx,
+            last_scan: None,
+            output_names: Vec::new(),
+        }
     }
 
-    /// Opens inputs that appeared and closes ones that vanished. True if the
-    /// set of open inputs changed.
-    pub fn scan(&mut self) -> bool {
+    /// Opens inputs that appeared and closes ones that vanished or went dead.
+    /// Identical devices are told apart only by order, so when their number
+    /// changes all of them are reopened under the names they have now.
+    /// Returns the inputs opened (new or reopened).
+    pub fn scan(&mut self) -> Vec<String> {
         let present = self.provider.inputs();
-        let before: Vec<String> = self.inputs.keys().cloned().collect();
-        self.inputs.retain(|name, _| present.contains(name));
-        self.outputs.retain(|name, _| present.iter().any(|i| output_for(i, std::slice::from_ref(name)).is_some()));
+        self.output_names = self.provider.outputs();
+        let count = |names: &mut dyn Iterator<Item = &String>, b: &str| names.filter(|n| base(n) == b).count();
+        let shifted: Vec<String> = present
+            .iter()
+            .chain(self.inputs.keys())
+            .map(|n| base(n).to_string())
+            .filter(|b| count(&mut present.iter(), b) != count(&mut self.inputs.keys(), b))
+            .collect();
+        self.inputs
+            .retain(|name, input| present.contains(name) && input.alive() && !shifted.iter().any(|b| b == base(name)));
+        let outputs = self.output_names.clone();
+        self.outputs.retain(|name, _| outputs.contains(name));
+        let mut opened = Vec::new();
         for name in present {
             if !self.inputs.contains_key(&name) {
                 match self.provider.open_input(&name, self.tx.clone()) {
                     Ok(input) => {
-                        self.inputs.insert(name, input);
+                        self.inputs.insert(name.clone(), input);
+                        opened.push(name);
                     }
                     Err(e) => eprintln!("confluence-engine: warning: MIDI input {name} could not be opened: {e}"),
                 }
             }
         }
-        self.inputs.keys().cloned().collect::<Vec<_>>() != before
+        opened.sort();
+        opened
     }
 
-    /// Rescans at most every [`RESCAN`]; true if the open inputs changed.
-    pub fn tick(&mut self, now: Instant) -> bool {
+    /// Rescans at most every [`RESCAN`]; returns the inputs opened.
+    pub fn tick(&mut self, now: Instant) -> Vec<String> {
         if self.last_scan.is_some_and(|t| now.saturating_duration_since(t) < RESCAN) {
-            return false;
+            return Vec::new();
         }
         self.last_scan = Some(now);
         self.scan()
@@ -99,22 +139,24 @@ impl MidiHub {
     }
 
     /// Sends `bytes` to the output of the device that has input `device`,
-    /// opening it if needed. A failed output is closed and tried again later.
-    pub fn send(&mut self, device: &str, bytes: &[u8]) {
-        let Some(name) = output_for(device, &self.provider.outputs()) else { return };
+    /// opening it if needed. False if it could not be sent (no such output, or
+    /// it failed: then it is closed, and opened again next time).
+    pub fn send(&mut self, device: &str, bytes: &[u8]) -> bool {
+        let Some(name) = output_for(device, &self.output_names) else { return false };
         if !self.outputs.contains_key(&name) {
             match self.provider.open_output(&name) {
                 Ok(out) => {
                     self.outputs.insert(name.clone(), out);
                 }
-                Err(_) => return,
+                Err(_) => return false,
             }
         }
-        if let Some(out) = self.outputs.get_mut(&name) {
-            if out.send(bytes).is_err() {
-                self.outputs.remove(&name);
-            }
+        let Some(out) = self.outputs.get_mut(&name) else { return false };
+        if out.send(bytes).is_ok() {
+            return true;
         }
+        self.outputs.remove(&name);
+        false
     }
 }
 
@@ -126,8 +168,8 @@ mod winmm {
     use std::sync::mpsc;
 
     use windows::Win32::Media::Audio::{
-        midiInClose, midiInGetDevCapsW, midiInGetNumDevs, midiInOpen, midiInReset, midiInStart, midiInStop,
-        midiOutClose, midiOutGetDevCapsW, midiOutGetNumDevs, midiOutOpen, midiOutReset, midiOutShortMsg,
+        midiInClose, midiInGetDevCapsW, midiInGetID, midiInGetNumDevs, midiInOpen, midiInReset, midiInStart,
+        midiInStop, midiOutClose, midiOutGetDevCapsW, midiOutGetNumDevs, midiOutOpen, midiOutReset, midiOutShortMsg,
         CALLBACK_FUNCTION, CALLBACK_NULL, HMIDIIN, HMIDIOUT, MIDIINCAPSW, MIDIOUTCAPSW,
     };
     use windows::Win32::Media::MM_MIM_DATA;
@@ -227,7 +269,13 @@ mod winmm {
     // SAFETY: the handle may be closed from any thread; the sink is only freed after closing.
     unsafe impl Send for Input {}
 
-    impl MidiInput for Input {}
+    impl MidiInput for Input {
+        fn alive(&self) -> bool {
+            let mut id = 0u32;
+            // SAFETY: our handle; fails once its device is gone.
+            unsafe { midiInGetID(self.handle, &mut id) == 0 }
+        }
+    }
 
     impl Drop for Input {
         fn drop(&mut self) {
@@ -347,6 +395,10 @@ pub(crate) mod fake {
         pub inputs: Vec<String>,
         pub outputs: Vec<String>,
         pub open: Vec<(String, mpsc::Sender<MidiEvent>)>,
+        /// Every open_input call, in order.
+        pub opens: Vec<String>,
+        /// Inputs whose open handles have gone dead (unplugged meanwhile).
+        pub dead: Vec<String>,
         pub opened_outputs: Vec<String>,
         pub sent: Vec<(String, Vec<u8>)>,
     }
@@ -366,8 +418,14 @@ pub(crate) mod fake {
         }
     }
 
-    struct In(Arc<Mutex<World>>, String);
-    impl MidiInput for In {}
+    struct In(Arc<Mutex<World>>, String, usize);
+    impl MidiInput for In {
+        fn alive(&self) -> bool {
+            let w = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            // Dead once marked, until reopened (a newer open of the same name).
+            !(w.dead.contains(&self.1) && w.opens.iter().filter(|n| **n == self.1).count() == self.2)
+        }
+    }
     impl Drop for In {
         fn drop(&mut self) {
             let mut w = self.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -392,8 +450,11 @@ pub(crate) mod fake {
             self.0.lock().unwrap_or_else(|p| p.into_inner()).outputs.clone()
         }
         fn open_input(&self, name: &str, events: mpsc::Sender<MidiEvent>) -> Result<Box<dyn MidiInput>, String> {
-            self.0.lock().unwrap_or_else(|p| p.into_inner()).open.push((name.into(), events));
-            Ok(Box::new(In(self.0.clone(), name.into())))
+            let mut w = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            w.open.push((name.into(), events));
+            w.opens.push(name.into());
+            let nth = w.opens.iter().filter(|n| *n == name).count();
+            Ok(Box::new(In(self.0.clone(), name.into(), nth)))
         }
         fn open_output(&self, name: &str) -> Result<Box<dyn MidiOutput>, String> {
             self.0.lock().unwrap_or_else(|p| p.into_inner()).opened_outputs.push(name.into());
@@ -417,17 +478,21 @@ mod tests {
         (MidiHub::new(Box::new(fake.clone())), fake)
     }
 
+    fn opened(fake: &Fake, name: &str) -> usize {
+        fake.0.lock().unwrap().opens.iter().filter(|n| *n == name).count()
+    }
+
     #[test]
     fn every_input_is_opened_and_its_messages_arrive_in_order() {
         let (mut hub, fake) = hub_with(&["Pad", "Keys"], &[]);
-        assert!(hub.scan());
+        assert_eq!(hub.scan(), ["Keys", "Pad"]);
         assert_eq!(hub.input_names(), ["Keys", "Pad"]);
         fake.play("Pad", &[0xB0, 7, 1]);
         fake.play("Keys", &[0xB0, 7, 2]);
         fake.play("Pad", &[0xB0, 7, 3]);
         let got: Vec<u8> = hub.events().iter().map(|e| e.bytes[2]).collect();
         assert_eq!(got, [1, 2, 3]);
-        assert!(!hub.scan(), "nothing changed");
+        assert!(hub.scan().is_empty(), "nothing changed");
     }
 
     #[test]
@@ -435,11 +500,11 @@ mod tests {
         let (mut hub, fake) = hub_with(&["Pad"], &[]);
         hub.scan();
         fake.0.lock().unwrap().inputs.clear();
-        assert!(hub.scan());
+        assert!(hub.scan().is_empty());
         assert!(hub.input_names().is_empty());
         assert!(fake.0.lock().unwrap().open.is_empty(), "closed");
         fake.0.lock().unwrap().inputs.push("Pad".into());
-        assert!(hub.scan());
+        assert_eq!(hub.scan(), ["Pad"]);
         fake.play("Pad", &[0xB0, 1, 64]);
         assert_eq!(hub.events().len(), 1, "works again");
     }
@@ -448,20 +513,43 @@ mod tests {
     fn rescans_happen_at_most_every_two_seconds() {
         let (mut hub, fake) = hub_with(&[], &[]);
         let t0 = Instant::now();
-        assert!(!hub.tick(t0));
+        assert!(hub.tick(t0).is_empty());
         fake.0.lock().unwrap().inputs.push("Pad".into());
-        assert!(!hub.tick(t0 + Duration::from_millis(500)), "too soon");
-        assert!(hub.tick(t0 + RESCAN));
+        assert!(hub.tick(t0 + Duration::from_millis(500)).is_empty(), "too soon");
+        assert_eq!(hub.tick(t0 + RESCAN), ["Pad"]);
+    }
+
+    /// Two identical controllers: when the first is unplugged, the second takes
+    /// its name; it must be reopened, not left behind a dead handle.
+    #[test]
+    fn identical_devices_are_reopened_when_their_names_shift() {
+        let (mut hub, fake) = hub_with(&["Pad", "Pad (2)"], &[]);
+        hub.scan();
+        fake.0.lock().unwrap().inputs = vec!["Pad".into()];
+        assert_eq!(hub.scan(), ["Pad"], "reopened under the name it has now");
+        assert_eq!(opened(&fake, "Pad"), 2);
+        assert_eq!(hub.input_names(), ["Pad"]);
+    }
+
+    /// A device that went away and came back between two rescans: its old
+    /// handle is dead, so it is reopened.
+    #[test]
+    fn a_dead_input_is_reopened() {
+        let (mut hub, fake) = hub_with(&["Pad"], &[]);
+        hub.scan();
+        fake.0.lock().unwrap().dead.push("Pad".into());
+        assert_eq!(hub.scan(), ["Pad"]);
+        assert_eq!(opened(&fake, "Pad"), 2);
     }
 
     #[test]
     fn feedback_goes_to_the_same_devices_output_opened_once() {
         let (mut hub, fake) = hub_with(&["Pad", "MIDIIN2 (Keys)"], &["Pad", "MIDIOUT2 (Keys)"]);
         hub.scan();
-        hub.send("Pad", &[0xB0, 7, 100]);
-        hub.send("Pad", &[0xB0, 7, 101]);
-        hub.send("MIDIIN2 (Keys)", &[0xB1, 1, 5]);
-        hub.send("Nowhere", &[0xB0, 1, 1]);
+        assert!(hub.send("Pad", &[0xB0, 7, 100]));
+        assert!(hub.send("Pad", &[0xB0, 7, 101]));
+        assert!(hub.send("MIDIIN2 (Keys)", &[0xB1, 1, 5]));
+        assert!(!hub.send("Nowhere", &[0xB0, 1, 1]), "no output: not sent");
         let w = fake.0.lock().unwrap();
         assert_eq!(w.opened_outputs, ["Pad", "MIDIOUT2 (Keys)"]);
         assert_eq!(w.sent.len(), 3);

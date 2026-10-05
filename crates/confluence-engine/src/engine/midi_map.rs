@@ -21,6 +21,9 @@ pub(super) struct Midi {
     /// sends what differs, and never echoes a control's own move.
     last: HashMap<Control, u8>,
     inputs: Vec<String>,
+    /// Whoever owns the devices has said which are open: feedback then goes
+    /// only to those (and waits for the others to come back).
+    inputs_known: bool,
 }
 
 fn key(b: &MidiBinding) -> Control {
@@ -66,9 +69,23 @@ impl Engine {
         &self.midi.bindings
     }
 
-    /// The MIDI inputs open now (set by whoever owns the devices).
+    /// The MIDI inputs open now (set by whoever owns the devices). A device
+    /// that has (re)appeared is brought in line by the next feedback.
     pub fn set_midi_inputs(&mut self, inputs: Vec<String>) {
+        let back: Vec<String> = inputs.iter().filter(|n| !self.midi.inputs.contains(n)).cloned().collect();
         self.midi.inputs = inputs;
+        self.midi.inputs_known = true;
+        self.midi_reopened(&back);
+    }
+
+    /// Devices whose inputs were (re)opened: their controls get feedback again.
+    pub fn midi_reopened(&mut self, devices: &[String]) {
+        self.midi.last.retain(|(d, _, _), _| !devices.contains(d));
+    }
+
+    /// A feedback message that could not be sent: it is sent again next time.
+    pub fn midi_unsent(&mut self, device: &str, bytes: [u8; 3]) {
+        self.midi.last.remove(&(device.to_string(), (bytes[0] & 0x0F) + 1, bytes[1]));
     }
 
     pub fn midi_inputs(&self) -> &[String] {
@@ -96,11 +113,13 @@ impl Engine {
         if routes.is_empty() {
             return Vec::new();
         }
-        self.midi.last.insert(control, value);
         let mut out = Vec::new();
         for (input, output) in routes {
             let Some(cur) = self.matrix.point(input, output) else { continue };
             let p = PointParams { gain_db: cc_to_db(value), mute: cur.mute, invert: cur.invert };
+            // What feedback would show now (a muted route shows the bottom):
+            // recorded so the control is not answered with anything else.
+            self.midi.last.insert(control.clone(), db_to_cc(p.gain_db, p.mute));
             if self.matrix.set_point(input, output, p).is_ok() {
                 self.scenes.route_changed(input, output);
                 out.push(Command::SetPoint { input, output, gain_db: p.gain_db, mute: p.mute, invert: p.invert });
@@ -114,6 +133,9 @@ impl Engine {
     pub fn midi_feedback(&mut self) -> Vec<(String, [u8; 3])> {
         let mut out = Vec::new();
         for b in &self.midi.bindings {
+            if self.midi.inputs_known && !self.midi.inputs.contains(&b.device) {
+                continue; // unplugged: brought in line when it returns
+            }
             let Some(cur) = self.matrix.point(b.input, b.output) else { continue };
             let v = db_to_cc(cur.gain_db, cur.mute);
             let k = key(b);

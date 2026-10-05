@@ -289,16 +289,21 @@ mod app {
             let _ = s.engine.midi_feedback();
             return;
         };
-        if hub.tick(Instant::now()) {
+        let opened = hub.tick(Instant::now());
+        if hub.input_names() != s.engine.midi_inputs() {
             s.engine.set_midi_inputs(hub.input_names());
         }
+        // A device reopened under its old name (replugged) is brought in line too.
+        s.engine.midi_reopened(&opened);
         for ev in hub.events() {
             if let Err(e) = midi_in(s, &ev) {
                 eprintln!("confluence-engine: warning: a MIDI change was not saved: {e}");
             }
         }
         for (device, bytes) in s.engine.midi_feedback() {
-            hub.send(&device, &bytes);
+            if !hub.send(&device, &bytes) {
+                s.engine.midi_unsent(&device, bytes);
+            }
         }
         s.midi = Some(hub);
     }

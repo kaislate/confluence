@@ -2328,6 +2328,41 @@ mod tests {
     }
 
     #[test]
+    fn a_fader_on_a_muted_route_is_not_pulled_down() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, 0.0, true);
+        e.set_midi_binding(binding("Pad", 1, 7, 0, 1));
+        let _ = e.midi_feedback(); // brought in line: 0 (muted)
+        e.midi_event(&cc("Pad", 1, 7, 64));
+        assert!(e.midi_feedback().is_empty(), "the motor must not fight the hand");
+        set(&mut e, 0, 1, confluence_api::taper::cc_to_db(64), false);
+        assert_eq!(e.midi_feedback(), vec![("Pad".to_string(), [0xB0, 7, 64])], "unmuted: the real position");
+    }
+
+    #[test]
+    fn feedback_waits_for_an_absent_device_and_resyncs_when_it_returns() {
+        let (mut e, _a) = small();
+        set(&mut e, 0, 1, 0.0, false);
+        e.set_midi_binding(binding("Pad", 1, 7, 0, 1));
+        e.set_midi_inputs(vec!["Keys".into()]); // Pad is unplugged
+        assert!(e.midi_feedback().is_empty(), "nowhere to send");
+        set(&mut e, 0, 1, -20.0, false);
+        assert!(e.midi_feedback().is_empty());
+        e.set_midi_inputs(vec!["Keys".into(), "Pad".into()]); // back
+        let v = confluence_api::taper::db_to_cc(-20.0, false);
+        assert_eq!(e.midi_feedback(), vec![("Pad".to_string(), [0xB0, 7, v])], "brought in line on return");
+        // A replug that keeps the name (reopened by the hub) resyncs too.
+        assert!(e.midi_feedback().is_empty());
+        e.midi_reopened(&["Pad".to_string()]);
+        assert_eq!(e.midi_feedback().len(), 1);
+        // A send that failed is tried again.
+        set(&mut e, 0, 1, -10.0, false);
+        let fb = e.midi_feedback();
+        e.midi_unsent(&fb[0].0, fb[0].1);
+        assert_eq!(e.midi_feedback(), fb, "sent again");
+    }
+
+    #[test]
     fn a_control_moved_during_a_morph_wins() {
         let (mut e, _a) = small();
         set(&mut e, 0, 1, -40.0, false);
