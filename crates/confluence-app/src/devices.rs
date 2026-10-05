@@ -12,7 +12,6 @@ use crate::commands::Edit;
 const KINDS: [DeviceKind; 5] =
     [DeviceKind::Asio, DeviceKind::WasapiRender, DeviceKind::WasapiCapture, DeviceKind::Vasio, DeviceKind::Vaio];
 
-#[derive(Default)]
 pub struct DevicesState {
     /// Per VASIO instance, the channel spec typed so far (`8x2`).
     pub vasio_spec: HashMap<String, String>,
@@ -20,6 +19,25 @@ pub struct DevicesState {
     pub app_name: String,
     /// Adds in flight, keyed by kind and the listed name.
     pub adding: HashSet<(DeviceKind, String)>,
+    /// The insert bus name field.
+    pub bus_name: String,
+    /// The insert bus channel count.
+    pub bus_channels: u32,
+    /// An insert bus is being added.
+    pub adding_bus: bool,
+}
+
+impl Default for DevicesState {
+    fn default() -> Self {
+        DevicesState {
+            vasio_spec: HashMap::new(),
+            app_name: String::new(),
+            adding: HashSet::new(),
+            bus_name: String::new(),
+            bus_channels: 2,
+            adding_bus: false,
+        }
+    }
 }
 
 pub fn kind_title(kind: DeviceKind) -> &'static str {
@@ -119,6 +137,19 @@ pub fn show(
                     edits.push(Edit::AddDevice { kind: DeviceKind::AppCapture, name });
                 }
             });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Insert bus").strong());
+            ui.horizontal(|ui| {
+                ui.add(TextEdit::singleline(&mut st.bus_name).hint_text("Bus name").desired_width(100.0));
+                ui.add(egui::DragValue::new(&mut st.bus_channels).range(1..=64).suffix(" ch"));
+                let name = st.bus_name.trim().to_string();
+                if st.adding_bus {
+                    ui.add(Spinner::new());
+                } else if add_button(ui, "Add insert bus".into(), !name.is_empty()) {
+                    st.adding_bus = true;
+                    edits.push(Edit::AddBus { name, channels: st.bus_channels });
+                }
+            });
         });
     });
     edits
@@ -184,6 +215,27 @@ mod tests {
         h.step();
         assert_eq!(h.state().1, vec![Edit::AddDevice { kind: DeviceKind::AppCapture, name: "Discord".into() }]);
         assert!(h.query_by_label("Add app capture").is_none(), "a spinner while it is being added");
+    }
+
+    #[test]
+    fn an_insert_bus_needs_a_name_and_shows_progress() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        use egui_kittest::Harness;
+        let mut h = Harness::new_ui_state(
+            |ui, (st, edits): &mut (DevicesState, Vec<Edit>)| {
+                edits.extend(show(ui, &[], &[], st, true));
+            },
+            (DevicesState::default(), Vec::new()),
+        );
+        h.run();
+        assert!(h.get_by_label("Add insert bus").accesskit_node().is_disabled(), "no name: nothing to add");
+        h.state_mut().0.bus_name = " Verb ".into();
+        h.run();
+        h.get_by_label("Add insert bus").click();
+        h.step(); // the spinner keeps animating: one frame, not run-until-idle
+        h.step();
+        assert_eq!(h.state().1, vec![Edit::AddBus { name: "Verb".into(), channels: 2 }], "two channels by default");
+        assert!(h.query_by_label("Add insert bus").is_none(), "a spinner while it is being added");
     }
 
     #[test]

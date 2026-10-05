@@ -26,6 +26,7 @@ pub enum Edit {
     RemovePoint { input: u32, output: u32 },
     AddDevice { kind: DeviceKind, name: String },
     RemoveSlot { id: u32 },
+    AddBus { name: String, channels: u32 },
 }
 
 impl Edit {
@@ -37,6 +38,9 @@ impl Edit {
             Edit::RemovePoint { input, output } => Command::RemovePoint { input: *input, output: *output },
             Edit::AddDevice { kind, name } => Command::AddDevice { kind: *kind, name: name.clone() },
             Edit::RemoveSlot { id } => Command::RemoveSlot { id: *id },
+            Edit::AddBus { name, channels } => {
+                Command::AddBus { name: name.clone(), channels: *channels, first_input: None, first_output: None }
+            }
         }
     }
 
@@ -57,7 +61,7 @@ impl Edit {
 /// What became of an edit.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
-    /// Applied; `version` is the engine state version after it, `ids` the new slots of an `AddDevice`.
+    /// Applied; `version` is the engine state version after it, `ids` the new slots of an `AddDevice` or `AddBus`.
     Done {
         edit: Edit,
         version: Option<u64>,
@@ -301,6 +305,17 @@ fn send(caller: &mut Option<Caller>, pipe: &str, edit: Edit, timeout: Duration) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_bus_is_a_plain_edit() {
+        let e = Edit::AddBus { name: "Verb".into(), channels: 2 };
+        assert_eq!(
+            e.command(),
+            Command::AddBus { name: "Verb".into(), channels: 2, first_input: None, first_output: None }
+        );
+        assert_eq!(e.point(), None);
+        assert!(!e.is_slow(), "a bus opens no device: the normal timeout applies");
+    }
 
     fn gain(input: u32, output: u32, gain_db: f32) -> Edit {
         Edit::SetPoint { input, output, gain_db, mute: false, invert: false }

@@ -21,6 +21,8 @@ pub struct Band {
     pub slot: u32,
     pub name: String,
     pub online: bool,
+    /// An insert bus: its rows are returns and its columns sends.
+    pub bus: bool,
     /// The slot's first global channel in this direction.
     pub first_channel: u32,
     pub channels: u32,
@@ -56,6 +58,7 @@ impl Axis {
                 slot: s.id,
                 name: s.name.clone(),
                 online: s.online,
+                bus: s.is_bus(),
                 first_channel,
                 channels,
                 start: axis.len,
@@ -136,11 +139,12 @@ impl GridLayout {
         Some((self.rows.index_of(input)?, self.cols.index_of(output)?))
     }
 
-    /// `Mic in 1 → Speakers out 2`.
+    /// `Mic in 1 → Speakers out 2`; a bus says `Verb return 1`, `Verb send 1`.
     pub fn label(&self, row: usize, col: usize) -> Option<String> {
         let (ib, ik) = self.rows.at(row)?;
         let (ob, ok) = self.cols.at(col)?;
-        Some(format!("{} in {} → {} out {}", ib.name, ik + 1, ob.name, ok + 1))
+        let (iw, ow) = (if ib.bus { "return" } else { "in" }, if ob.bus { "send" } else { "out" });
+        Some(format!("{} {iw} {} → {} {ow} {}", ib.name, ik + 1, ob.name, ok + 1))
     }
 }
 
@@ -335,6 +339,15 @@ mod tests {
         PointState { input, output, gain_db, mute: false, invert: false }
     }
 
+    #[test]
+    fn bus_cells_say_send_and_return() {
+        let mic = slot(1, "Mic", 0, 1, 0, 1);
+        let verb = SlotState { device: confluence_api::BUS_DEVICE.into(), ..slot(2, "Verb", 1, 1, 1, 1) };
+        let slots = [mic, verb];
+        assert_eq!(point_label(&slots, 0, 1), "Mic in 1 → Verb send 1");
+        assert_eq!(point_label(&slots, 1, 0), "Verb return 1 → Mic out 1");
+        assert_eq!(point_label(&slots, 1, 1), "Verb return 1 → Verb send 1");
+    }
     #[test]
     fn bands_follow_slot_ids_and_skip_empty_directions() {
         let l = GridLayout::new(&slots(), CELL_DEFAULT);

@@ -263,6 +263,14 @@ impl ConfluenceApp {
     }
 
     fn on_done(&mut self, edit: &Edit, ids: &[u32], now: Instant) {
+        if let Edit::AddBus { name, .. } = edit {
+            self.devices.adding_bus = false;
+            self.devices.bus_name.clear();
+            self.notes.info(format!("Added insert bus {name}"), now);
+            if let Some(id) = ids.first() {
+                self.selection = Selection::Slot(*id);
+            }
+        }
         if let Edit::AddDevice { kind, name } = edit {
             let base = crate::devices::base_name(*kind, name);
             self.devices.adding.remove(&(*kind, base.clone()));
@@ -274,6 +282,9 @@ impl ConfluenceApp {
     }
 
     fn on_failed(&mut self, edit: &Edit, _now: Instant) {
+        if let Edit::AddBus { .. } = edit {
+            self.devices.adding_bus = false;
+        }
         if let Edit::AddDevice { kind, name } = edit {
             self.devices.adding.remove(&(*kind, crate::devices::base_name(*kind, name)));
         }
