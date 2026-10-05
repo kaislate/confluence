@@ -989,6 +989,7 @@ dependencies = [
  "confluence-api",
  "confluence-client",
  "confluence-core",
+ "confluence-plugin-host",
  "confluence-provider-asio",
  "confluence-provider-vaio",
  "confluence-provider-vasio",

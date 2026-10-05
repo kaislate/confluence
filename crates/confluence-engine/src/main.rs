@@ -4,7 +4,11 @@
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
     use clap::Parser;
-    match app::run(app::Args::parse()) {
+    let args = app::Args::parse();
+    if args.scan.is_some() {
+        return app::scan(&args);
+    }
+    match app::run(args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("confluence-engine: {e}");
@@ -58,6 +62,39 @@ mod app {
         /// Engine block size in frames (internal clock; an ASIO master uses its preferred size).
         #[arg(long, default_value_t = 256)]
         block: usize,
+        /// Folders searched for CLAP plugins, `;`-separated (default: the
+        /// standard CLAP folders and `CLAP_PATH`).
+        #[arg(long)]
+        clap_path: Option<String>,
+        /// Scan mode: print the plugins in this CLAP file as JSON and exit.
+        #[arg(long)]
+        pub scan: Option<PathBuf>,
+        /// With `--scan`: instead, load, start and run this plugin once (the load check).
+        #[arg(long, requires = "scan")]
+        plugin: Option<String>,
+    }
+
+    /// `--scan`: runs in a throwaway process, so a plugin that crashes takes
+    /// only this process down. A clean failure exits with `SCAN_FAILED` and
+    /// its reason on stderr.
+    pub fn scan(args: &Args) -> std::process::ExitCode {
+        use confluence_engine::plugins::SCAN_FAILED;
+        let Some(file) = args.scan.as_deref() else { return std::process::ExitCode::FAILURE };
+        let result = match &args.plugin {
+            Some(id) => confluence_plugin_host::check(file, id, args.rate, args.block as u32).map(|()| String::new()),
+            None => confluence_plugin_host::describe(file)
+                .and_then(|list| serde_json::to_string(&list).map_err(|e| e.to_string())),
+        };
+        match result {
+            Ok(out) => {
+                println!("{out}");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::ExitCode::from(SCAN_FAILED as u8)
+            }
+        }
     }
 
     struct State {

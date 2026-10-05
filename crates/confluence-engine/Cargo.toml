@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 confluence-client = { path = "../confluence-client" }
+confluence-plugin-host = { path = "../confluence-plugin-host" }
 confluence-provider-asio = { path = "../confluence-provider-asio" }
 confluence-provider-wasapi = { path = "../confluence-provider-wasapi" }
 confluence-provider-vasio = { path = "../confluence-provider-vasio" }
