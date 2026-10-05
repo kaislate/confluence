@@ -30,6 +30,8 @@ pub enum Edit {
     LoadPlugin { bus: u32, path: String, plugin_id: String },
     UnloadPlugin { bus: u32 },
     SetParam { bus: u32, param: u32, value: f64 },
+    ShowEditor { bus: u32 },
+    HideEditor { bus: u32 },
 }
 
 /// What a merged, rate-limited edit is about.
@@ -52,6 +54,8 @@ impl Edit {
                 Command::LoadPlugin { bus: BusRef::Id(*bus), path: path.clone(), plugin_id: plugin_id.clone() }
             }
             Edit::UnloadPlugin { bus } => Command::UnloadPlugin { bus: BusRef::Id(*bus) },
+            Edit::ShowEditor { bus } => Command::ShowEditor { bus: BusRef::Id(*bus) },
+            Edit::HideEditor { bus } => Command::HideEditor { bus: BusRef::Id(*bus) },
             Edit::SetParam { bus, param, value } => {
                 Command::SetParam { bus: BusRef::Id(*bus), param: *param, value: *value }
             }
@@ -366,6 +370,10 @@ mod tests {
                 plugin_id: "dev.x".into()
             }
         );
+        let show = Edit::ShowEditor { bus: 2 };
+        assert!(!show.is_slow());
+        assert_eq!(show.command(), Command::ShowEditor { bus: confluence_api::BusRef::Id(2) });
+        assert_eq!(Edit::HideEditor { bus: 2 }.command(), Command::HideEditor { bus: confluence_api::BusRef::Id(2) });
         let unload = Edit::UnloadPlugin { bus: 2 };
         assert!(!unload.is_slow());
         assert_eq!(unload.command(), Command::UnloadPlugin { bus: confluence_api::BusRef::Id(2) });

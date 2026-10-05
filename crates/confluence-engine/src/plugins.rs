@@ -81,8 +81,6 @@ fn run_scan(exe: &Path, args: &[&std::ffi::OsStr], file: &Path) -> Result<String
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = cmd.spawn().map_err(|e| format!("could not start the plugin check: {e}"))?;
-    #[cfg(windows)]
-    reap_with_engine(&child);
     // Readers report through channels, so a pipe held open by a helper
     // process the plugin started cannot keep us waiting.
     let read = |mut r: Box<dyn Read + Send>| {
@@ -119,38 +117,31 @@ fn run_scan(exe: &Path, args: &[&std::ffi::OsStr], file: &Path) -> Result<String
     }
 }
 
-/// Puts a scan process in a job that is closed, killing it, when the engine
-/// exits for any reason: a scan must not outlive the engine that started it.
+/// Puts the engine in a job that is closed, killing everything in it, when
+/// the engine exits for any reason. Processes the engine starts (plugin scans)
+/// are created inside the job, so none can outlive it, not even one caught
+/// half-created (still suspended) when the engine was killed. Call once, early.
 #[cfg(windows)]
-fn reap_with_engine(child: &std::process::Child) {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
+pub fn end_children_with_engine() -> Result<(), String> {
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-    /// The job's handle, as an integer (handles are not `Sync`). Never closed:
-    /// it closes when the engine process ends, which kills what is in it.
-    static JOB: OnceLock<Option<isize>> = OnceLock::new();
-    let job = JOB.get_or_init(|| {
-        // SAFETY: an unnamed job object, configured before use.
-        unsafe {
-            let job = CreateJobObjectW(None, None).ok()?;
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const std::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-            .ok()?;
-            Some(job.0 as isize)
-        }
-    });
-    if let Some(job) = job {
-        // SAFETY: both handles are valid; failure leaves the child unmanaged.
-        let _ = unsafe { AssignProcessToJobObject(HANDLE(*job as *mut _), HANDLE(child.as_raw_handle())) };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: an unnamed job, configured before the engine joins it. Its handle
+    // is never closed: it closes when the engine process ends.
+    unsafe {
+        let job = CreateJobObjectW(None, None).map_err(|e| e.to_string())?;
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .map_err(|e| e.to_string())?;
+        AssignProcessToJobObject(job, GetCurrentProcess()).map_err(|e| e.to_string())
     }
 }
 

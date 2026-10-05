@@ -270,6 +270,22 @@ fn bus_panel(
             if p.latency > 0 {
                 ui.label(RichText::new(format!("Latency {} samples (not compensated)", p.latency)).weak());
             }
+            if p.has_editor {
+                ui.horizontal(|ui| {
+                    if p.editor_open {
+                        if ui.button("Bring editor to front").clicked() {
+                            actions.push(Action::Edit(Edit::ShowEditor { bus }));
+                        }
+                        if ui.button("Close editor").clicked() {
+                            actions.push(Action::Edit(Edit::HideEditor { bus }));
+                        }
+                    } else if ui.button("Show editor").clicked() {
+                        actions.push(Action::Edit(Edit::ShowEditor { bus }));
+                    }
+                });
+            } else if p.status == PluginStatus::Running {
+                ui.label(RichText::new("This plugin has no editor of its own").weak());
+            }
             ui.horizontal(|ui| {
                 if ui.button("Replace…").clicked() {
                     actions.push(Action::PickPlugin(bus));
@@ -507,6 +523,41 @@ mod display_tests {
             })
             .collect();
         assert_eq!(sent, [&Edit::SetParam { bus: 2, param: 1, value: -6.0 }]);
+    }
+
+    fn edits(actions: &[Action]) -> Vec<&Edit> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Edit(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_plugin_with_an_editor_can_show_and_close_it() {
+        let mut p = gain_plugin(confluence_api::PluginStatus::Running);
+        p.has_editor = true;
+        let closed = bus_view(Some(p.clone()));
+        let actions = bus_panel_actions(&closed, |h| h.get_by_label("Show editor").click());
+        assert_eq!(edits(&actions), [&Edit::ShowEditor { bus: 2 }]);
+        p.editor_open = true;
+        let open = bus_view(Some(p));
+        let actions = bus_panel_actions(&open, |h| {
+            assert!(h.query_by_label("Bring editor to front").is_some());
+            h.get_by_label("Close editor").click();
+        });
+        assert_eq!(edits(&actions), [&Edit::HideEditor { bus: 2 }]);
+    }
+
+    #[test]
+    fn a_plugin_without_an_editor_says_so() {
+        let view = bus_view(Some(gain_plugin(confluence_api::PluginStatus::Running)));
+        bus_panel_actions(&view, |h| {
+            assert!(h.query_by_label("Show editor").is_none());
+            assert!(h.query_by_label("This plugin has no editor of its own").is_some());
+        });
     }
 
     #[test]

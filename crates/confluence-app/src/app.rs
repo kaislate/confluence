@@ -183,6 +183,17 @@ pub struct ConfluenceApp {
     plugin_loading: Option<u32>,
 }
 
+/// The engine owns plugin editor windows; Windows lets a background process
+/// bring a window to the front only with the foreground process's leave.
+fn allow_engine_to_the_front() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
+        // SAFETY: no pointers; failure only means the editor may open behind.
+        let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+    }
+}
+
 impl ConfluenceApp {
     pub fn new(config: AppConfig) -> Self {
         let repaint: Arc<Mutex<Option<egui::Context>>> = Arc::default();
@@ -258,6 +269,7 @@ impl ConfluenceApp {
                 self.param_pending.insert((bus, param), value);
             }
             Edit::LoadPlugin { bus, .. } => self.plugin_loading = Some(bus),
+            Edit::ShowEditor { .. } => allow_engine_to_the_front(),
             _ => {}
         }
         self.pending.sent(&edit);

@@ -469,6 +469,10 @@ mod app {
     }
 
     pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
+        // Plugin scans this engine starts end with it, whatever ends it.
+        if let Err(e) = plugins::end_children_with_engine() {
+            eprintln!("confluence-engine: warning: plugin scans may outlive the engine: {e}");
+        }
         if let Err(e) = disable_power_throttling() {
             eprintln!("confluence-engine: warning: could not disable power throttling: {e}");
         }
