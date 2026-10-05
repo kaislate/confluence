@@ -566,3 +566,34 @@ fn a_route_learns_a_midi_control_from_the_window() {
     });
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_script_is_written_in_the_window_and_runs_in_the_engine() {
+    let d = EngineDir::new("scripts");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "the Scripts button", LONG, |h| h.query_by_label("Scripts…").is_some());
+    settle(&mut h);
+    h.get_by_label("Scripts…").click();
+    pump_until(&mut h, "the scripts window", LONG, |h| h.query_by_label("New script").is_some());
+    h.get_by_label("New script").click();
+    pump_until(&mut h, "the editor", LONG, |h| h.query_by_label("Save script").is_some());
+    h.get_by_label("Save script").click();
+    let scripts = |d: &EngineDir| {
+        let (state, _sub) = confluence_client::Subscription::connect(&d.pipe, Duration::from_secs(5)).unwrap();
+        state.scripts
+    };
+    pump_until(&mut h, "the script in the engine", LONG, |_| !scripts(&d).is_empty());
+    let saved = &scripts(&d)[0];
+    assert_eq!((saved.name.as_str(), &saved.status), ("Script 1", &confluence_api::ScriptStatus::Running));
+    // The example toggles route 0 → 1 on note 36.
+    let route = Command::SetPoint { input: 0, output: 1, gain_db: -6.0, mute: false, invert: false };
+    assert!(matches!(c.call(route).unwrap(), Response::Applied { .. }));
+    let pad = Command::InjectMidi { device: "Test Pad".into(), bytes: vec![0x90, 36, 100] };
+    assert!(matches!(c.call(pad).unwrap(), Response::Applied { .. }));
+    let (state, _sub) = confluence_client::Subscription::connect(&d.pipe, Duration::from_secs(5)).unwrap();
+    assert!(state.points.iter().any(|p| (p.input, p.output, p.mute) == (0, 1, true)), "{:?}", state.points);
+    pump_until(&mut h, "running in the list", LONG, |h| h.query_by_label("running").is_some());
+    c.call(Command::Shutdown).unwrap();
+}
