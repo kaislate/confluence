@@ -530,6 +530,7 @@ impl Engine {
                 Response::Error("subscriptions and status are served by the engine process".into())
             }
             Command::Shutdown => Response::Ok,
+            Command::AddBus { .. } => Response::Error("insert buses are not available yet".into()),
         }
     }
 

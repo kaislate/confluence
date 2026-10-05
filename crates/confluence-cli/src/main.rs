@@ -45,6 +45,8 @@ enum Cmd {
     AddDevice { kind: Kind, name: String },
     /// Close a slot and remove the routes on its channels.
     RemoveSlot { id: u32 },
+    /// Create an insert bus (send columns + return rows) of CHANNELS channels.
+    AddBus { name: String, channels: u32 },
     /// Show the engine's master clock, rate, block, DSP load and xruns.
     Status,
     /// Follow every change to routes, slots and devices live, with a status line each second.
@@ -88,6 +90,9 @@ impl Cmd {
             Cmd::Devices => Command::ListDevices,
             Cmd::AddDevice { kind, ref name } => Command::AddDevice { kind: kind.into(), name: name.clone() },
             Cmd::RemoveSlot { id } => Command::RemoveSlot { id },
+            Cmd::AddBus { ref name, channels } => {
+                Command::AddBus { name: name.clone(), channels, first_input: None, first_output: None }
+            }
             Cmd::Status => Command::Status,
             Cmd::Watch => Command::Subscribe,
         }
@@ -340,6 +345,15 @@ v7  slot #3 removed"
     fn add_device_vaio_parses() {
         let cli = Cli::try_parse_from(["confluence-cli", "add-device", "vaio", "1"]).unwrap();
         assert_eq!(cli.command.to_command(), Command::AddDevice { kind: DeviceKind::Vaio, name: "1".into() });
+    }
+
+    #[test]
+    fn add_bus_parses() {
+        let cli = Cli::try_parse_from(["confluence-cli", "add-bus", "Reverb", "2"]).unwrap();
+        assert_eq!(
+            cli.command.to_command(),
+            Command::AddBus { name: "Reverb".into(), channels: 2, first_input: None, first_output: None }
+        );
     }
 
     #[test]
