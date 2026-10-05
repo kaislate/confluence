@@ -5,6 +5,7 @@
 //! replaced snapshot on a second mailbox so it is freed on the control side.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,13 @@ impl MatrixRouter {
     /// Mixes `inputs` into `outputs` for `outputs.frames()` frames.
     /// Output channels beyond the routing size are zeroed.
     pub fn process(&mut self, inputs: &PlanarBuffer, outputs: &mut PlanarBuffer) {
+        self.begin_block();
+        let n = outputs.channels();
+        self.mix(inputs, outputs, 0..n);
+    }
+
+    /// Adopts the newest routing snapshot. Call once per block, before [`mix`](Self::mix).
+    pub fn begin_block(&mut self) {
         while let Some(next) = self.inbox.try_recv() {
             for &cell in &next.retired {
                 self.ramps[cell as usize] = Ramp::default();
@@ -73,11 +81,15 @@ impl MatrixRouter {
                 std::mem::forget(old);
             }
         }
+    }
 
+    /// Zeroes and mixes the output channels in `columns` (clamped to `outputs`);
+    /// other channels are left as they are.
+    pub fn mix(&mut self, inputs: &PlanarBuffer, outputs: &mut PlanarBuffer, columns: Range<usize>) {
         let frames = outputs.frames();
         let Self { snapshot, params, ramps, ramp_samples, .. } = self;
         let num_outputs = snapshot.num_outputs();
-        for o in 0..outputs.channels() {
+        for o in columns.start..columns.end.min(outputs.channels()) {
             let out = outputs.channel_mut(o);
             out.fill(0.0);
             if o >= num_outputs || frames == 0 {
@@ -305,6 +317,28 @@ mod tests {
         for _ in 0..n {
             router.process(i, o);
         }
+    }
+
+    #[test]
+    fn mixing_a_column_range_leaves_other_columns_alone() {
+        let (mut ctl, mut router) = matrix(2, 4, RAMP, 48_000.0);
+        ctl.set_point(0, 1, PointParams::default()).unwrap();
+        ctl.set_point(0, 3, PointParams::default()).unwrap();
+        ctl.tick();
+        let (mut i, mut o) = buffers(2, 4, 8);
+        i.channel_mut(0).fill(1.0);
+        run_blocks(&mut router, &i, &mut o, 100); // past the fade-in
+        for ch in 0..4 {
+            o.channel_mut(ch).fill(7.0);
+        }
+        router.begin_block();
+        router.mix(&i, &mut o, 0..2);
+        assert_eq!(o.channel(0), &[0.0; 8], "in range, unrouted: zeroed");
+        assert_eq!(o.channel(1), &[1.0; 8], "in range, routed");
+        assert_eq!(o.channel(2), &[7.0; 8], "out of range: untouched");
+        assert_eq!(o.channel(3), &[7.0; 8], "out of range: untouched even though routed");
+        router.mix(&i, &mut o, 2..99); // clamped to the buffer
+        assert_eq!(o.channel(3), &[1.0; 8]);
     }
 
     #[test]
