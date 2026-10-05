@@ -23,7 +23,10 @@ fn test_plugin() -> PathBuf {
 fn scanning_the_file_lists_both_test_plugins() {
     let found = plugins::describe(&engine(), &test_plugin()).unwrap();
     let names: Vec<&str> = found.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["Confluence Test Gain", "Confluence Test Crash", "Confluence Test Exit"]);
+    assert_eq!(
+        names,
+        ["Confluence Test Gain", "Confluence Test Crash", "Confluence Test Exit", "Confluence Test Plain"]
+    );
     assert!(found.iter().all(|p| p.vendor == "Confluence" && p.path.ends_with("confluence_test_plugin.dll")));
 }
 
@@ -52,7 +55,7 @@ fn the_scanner_finds_clap_files_and_lists_bad_ones() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let (found, bad) = loop {
         let (found, bad) = scanner.list();
-        if found.len() == 3 && bad.len() == 1 {
+        if found.len() == 4 && bad.len() == 1 {
             break (found, bad);
         }
         assert!(Instant::now() < deadline, "scan did not finish: {found:?} {bad:?}");

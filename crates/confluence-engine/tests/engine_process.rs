@@ -292,12 +292,12 @@ fn a_plugin_on_a_bus_keeps_its_settings_across_restarts() {
     let Response::Plugins(found) = c.call(Command::ListPlugins).unwrap() else { panic!() };
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut found = found;
-    while found.len() < 3 && std::time::Instant::now() < deadline {
+    while found.len() < 4 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
         let Response::Plugins(f) = c.call(Command::ListPlugins).unwrap() else { panic!() };
         found = f;
     }
-    assert_eq!(found.len(), 3, "{found:?}");
+    assert_eq!(found.len(), 4, "{found:?}");
     shutdown(child, &mut c);
 
     let child = spawn_with_plugins(&pipe, &journal, &clap_dir);

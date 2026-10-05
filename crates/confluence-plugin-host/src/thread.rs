@@ -18,7 +18,8 @@ use confluence_api::{ParamState, PluginInfo};
 use confluence_core::mailbox;
 use confluence_core::processor::Processor;
 
-use crate::host::{host_info, Host, Main, Shared};
+use crate::editor::{self, Editor, WinEvent};
+use crate::host::{host_info, GuiRequests, Host, Main, Shared};
 use crate::processor::ClapProcessor;
 use crate::wake::Wake;
 
@@ -71,6 +72,8 @@ struct Loaded {
     plugin: u64,
     info: PluginInfo,
     latency: u32,
+    has_editor: bool,
+    editor_open: Arc<AtomicBool>,
     params: Vec<ParamState>,
     processor: ClapProcessor,
     params_tx: mailbox::Sender<(u32, f64)>,
@@ -84,6 +87,8 @@ enum Msg {
     SaveState { plugin: u64, reply: mpsc::Sender<Result<Vec<u8>, String>> },
     LoadState { plugin: u64, state: Vec<u8>, reply: mpsc::Sender<Result<(), String>> },
     Reclaim { plugin: u64, processor: Box<ClapProcessor> },
+    ShowEditor { plugin: u64, title: String, reply: mpsc::Sender<Result<(), String>> },
+    HideEditor { plugin: u64, reply: mpsc::Sender<()> },
     Forget { plugin: u64 },
 }
 
@@ -135,6 +140,9 @@ impl PluginThread {
             reported_rx: loaded.reported_rx,
             texts: Vec::new(),
             last_state: None,
+            has_editor: loaded.has_editor,
+            editor_open: loaded.editor_open,
+            edited: Vec::new(),
         };
         Ok((link, Box::new(loaded.processor)))
     }
@@ -175,6 +183,11 @@ pub struct PluginLink {
     texts: Vec<(u32, mpsc::Receiver<String>)>,
     /// The last state chunk saved, for when the plugin thread is busy.
     last_state: Option<Vec<u8>>,
+    has_editor: bool,
+    /// Kept up to date by the plugin thread.
+    editor_open: Arc<AtomicBool>,
+    /// Writable values the plugin changed itself (in its editor), not yet taken.
+    edited: Vec<(u32, f64)>,
 }
 
 impl PluginLink {
@@ -239,6 +252,10 @@ impl PluginLink {
                     if !changed.contains(&id) {
                         changed.push(id);
                     }
+                    if !p.read_only {
+                        self.edited.retain(|(q, _)| *q != id);
+                        self.edited.push((id, value));
+                    }
                 }
             }
         }
@@ -246,6 +263,38 @@ impl PluginLink {
             self.refresh_text(*id);
         }
         shown || !changed.is_empty()
+    }
+
+    /// Whether the plugin has an editor of its own.
+    pub fn has_editor(&self) -> bool {
+        self.has_editor
+    }
+
+    /// Whether its editor is open now.
+    pub fn editor_open(&self) -> bool {
+        self.editor_open.load(Ordering::Acquire)
+    }
+
+    /// Opens the plugin's editor in a window titled `title`, or brings it to
+    /// the front if it is open.
+    pub fn show_editor(&mut self, title: &str) -> Result<(), String> {
+        if !self.has_editor {
+            return Err(format!("{} has no editor", self.info.name));
+        }
+        let (plugin, title) = (self.plugin, title.to_string());
+        self.thread.call(REPLY_TIMEOUT, |reply| Msg::ShowEditor { plugin, title, reply })?
+    }
+
+    /// Closes the plugin's editor, if open.
+    pub fn hide_editor(&mut self) {
+        let plugin = self.plugin;
+        let _ = self.thread.call(REPLY_TIMEOUT, |reply| Msg::HideEditor { plugin, reply });
+    }
+
+    /// Values the plugin changed itself (in its editor) since the last call,
+    /// writable parameters only, newest value per parameter.
+    pub fn take_edited(&mut self) -> Vec<(u32, f64)> {
+        std::mem::take(&mut self.edited)
     }
 
     /// True while texts asked of the plugin are still on their way.
@@ -306,6 +355,10 @@ impl Drop for PluginLink {
 struct Slot {
     instance: PluginInstance<Host>,
     callback: Arc<AtomicBool>,
+    name: String,
+    gui: Arc<GuiRequests>,
+    editor: Option<Editor>,
+    editor_open: Arc<AtomicBool>,
     /// A link (engine side) still refers to it.
     linked: bool,
     /// Its processor is out on the audio side.
@@ -326,10 +379,12 @@ fn run(rx: mpsc::Receiver<Msg>, wake: Arc<Wake>) {
                 Ok(msg) => handle(msg, &mut plugins, &mut next),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    // The engine is exiting. A processor may still be running on
-                    // the audio thread: destroying its instance now could crash
-                    // it, so those instances are left for the process exit.
-                    for (_, slot) in plugins.drain() {
+                    // The engine is exiting. Editors close first. A processor
+                    // may still be running on the audio thread: destroying its
+                    // instance now could crash it, so those instances are left
+                    // for the process exit.
+                    for (_, mut slot) in plugins.drain() {
+                        close_editor(&mut slot);
                         if slot.processing {
                             std::mem::forget(slot.instance);
                         }
@@ -337,6 +392,25 @@ fn run(rx: mpsc::Receiver<Msg>, wake: Arc<Wake>) {
                     return;
                 }
             }
+        }
+        for ev in editor::take_events() {
+            match ev {
+                WinEvent::Close(id) => {
+                    if let Some(slot) = plugins.get_mut(&id) {
+                        close_editor(slot);
+                    }
+                }
+                WinEvent::Resize(id, w, h) => {
+                    if let Some(slot) = plugins.get_mut(&id) {
+                        if let Some(ed) = &slot.editor {
+                            editor::user_resized(&mut slot.instance, ed, w, h);
+                        }
+                    }
+                }
+            }
+        }
+        for slot in plugins.values_mut() {
+            gui_requests(slot);
         }
         for slot in plugins.values_mut() {
             if slot.callback.swap(false, Ordering::AcqRel) {
@@ -383,6 +457,42 @@ fn windows_setup() {
     }
 }
 
+/// Closes a slot's editor, if open: the plugin's GUI, then our window.
+fn close_editor(slot: &mut Slot) {
+    if let Some(ed) = slot.editor.take() {
+        editor::close(&mut slot.instance, ed);
+    }
+    slot.editor_open.store(false, Ordering::Release);
+}
+
+/// Acts on what a plugin's editor asked for.
+fn gui_requests(slot: &mut Slot) {
+    let resize = slot.gui.resize.lock().ok().and_then(|mut r| r.take());
+    let closed = slot.gui.closed.lock().ok().and_then(|mut c| c.take());
+    let show = slot.gui.show.swap(false, Ordering::AcqRel);
+    let hide = slot.gui.hide.swap(false, Ordering::AcqRel);
+    if let Some(ed) = &slot.editor {
+        if let Some((w, h)) = resize {
+            editor::plugin_resized(ed, w, h);
+        }
+        if show || hide {
+            editor::plugin_visibility(ed, show);
+        }
+    }
+    if closed.is_some() {
+        // A floating editor closed by the user: release it (destroy is safe
+        // even if the plugin already did).
+        close_editor(slot);
+    }
+}
+
+/// Removes a plugin's slot: its editor closes first.
+fn remove(plugins: &mut HashMap<u64, Slot>, plugin: u64) {
+    if let Some(mut slot) = plugins.remove(&plugin) {
+        close_editor(&mut slot);
+    }
+}
+
 fn handle(msg: Msg, plugins: &mut HashMap<u64, Slot>, next: &mut u64) {
     match msg {
         Msg::Load { src, id, rate, block, reply } => {
@@ -420,15 +530,39 @@ fn handle(msg: Msg, plugins: &mut HashMap<u64, Slot>, next: &mut u64) {
                 }
                 slot.processing = false;
                 if !slot.linked {
-                    plugins.remove(&plugin);
+                    remove(plugins, plugin);
                 }
             }
+        }
+        Msg::ShowEditor { plugin, title, reply } => {
+            let r = match plugins.get_mut(&plugin) {
+                Some(slot) => match &slot.editor {
+                    Some(ed) => {
+                        editor::front(&mut slot.instance, ed);
+                        Ok(())
+                    }
+                    None => editor::open(&mut slot.instance, plugin, &title, &slot.name).map(|ed| {
+                        slot.editor = Some(ed);
+                        slot.editor_open.store(true, Ordering::Release);
+                    }),
+                },
+                None => Err("the plugin is gone".into()),
+            };
+            let _ = reply.send(r);
+        }
+        Msg::HideEditor { plugin, reply } => {
+            if let Some(slot) = plugins.get_mut(&plugin) {
+                close_editor(slot);
+            }
+            let _ = reply.send(());
         }
         Msg::Forget { plugin } => {
             if let Some(slot) = plugins.get_mut(&plugin) {
                 slot.linked = false;
+                // Nothing can ask for the editor any more.
+                close_editor(slot);
                 if !slot.processing {
-                    plugins.remove(&plugin);
+                    remove(plugins, plugin);
                 }
             }
         }
@@ -459,10 +593,16 @@ fn load(
     };
     let cid = CString::new(id).map_err(|e| e.to_string())?;
     let callback = Arc::new(AtomicBool::new(false));
-    let flag = callback.clone();
-    let mut instance =
-        PluginInstance::<Host>::new(move |_| Shared { callback: flag }, |_| Main, &entry, &cid, &host_info()?)
-            .map_err(|e| format!("{} could not start: {e}", info.name))?;
+    let gui = Arc::new(GuiRequests::default());
+    let (flag, requests) = (callback.clone(), gui.clone());
+    let mut instance = PluginInstance::<Host>::new(
+        move |_| Shared { callback: flag, gui: requests },
+        |_| Main,
+        &entry,
+        &cid,
+        &host_info()?,
+    )
+    .map_err(|e| format!("{} could not start: {e}", info.name))?;
 
     let (ins, outs) = ports(&mut instance);
     if ins.is_empty() {
@@ -482,8 +622,22 @@ fn load(
     let (params_tx, params_rx) = mailbox::channel(PARAM_RING);
     let (reported_tx, reported_rx) = mailbox::channel(REPORT_RING);
     let processor = ClapProcessor::new(plugin, stopped.into(), &ins, &outs, block as usize, params_rx, reported_tx);
-    plugins.insert(plugin, Slot { instance, callback, linked: true, processing: true });
-    Ok(Loaded { plugin, info, latency, params, processor, params_tx, reported_rx })
+    let has_editor = editor::has_editor(&mut instance);
+    let editor_open = Arc::new(AtomicBool::new(false));
+    plugins.insert(
+        plugin,
+        Slot {
+            instance,
+            callback,
+            name: info.name.clone(),
+            gui,
+            editor: None,
+            editor_open: editor_open.clone(),
+            linked: true,
+            processing: true,
+        },
+    );
+    Ok(Loaded { plugin, info, latency, has_editor, editor_open, params, processor, params_tx, reported_rx })
 }
 
 /// Channel counts of the plugin's input and output ports.

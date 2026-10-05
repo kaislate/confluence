@@ -1080,6 +1080,7 @@ dependencies = [
  "clack-extensions",
  "clack-host",
  "clack-plugin",
+ "windows",
 ]
 
 [[package]]
