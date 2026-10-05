@@ -193,3 +193,20 @@ fn requests_are_answered_promptly() {
     }
     assert!(started.elapsed() < Duration::from_millis(1000), "100 round trips took {:?}", started.elapsed());
 }
+
+/// A plugin that reports the host's own changes back: a late report of an
+/// older value must not overwrite the newer one, nor count as an edit.
+#[test]
+fn echoes_of_the_hosts_own_changes_are_not_edits() {
+    let t = PluginThread::start().unwrap();
+    let (mut link, mut p) = t.load(source(), confluence_test_plugin::ECHO_ID, RATE, BLOCK, 2).unwrap();
+    link.set_param(PARAM_GAIN, -1.0).unwrap();
+    run(p.as_mut(), 2, 1.0); // the plugin echoes -1
+    link.set_param(PARAM_GAIN, -2.0).unwrap(); // newer, not yet processed
+    link.poll();
+    assert_eq!(link.params()[0].value, -2.0, "the stale echo was ignored");
+    run(p.as_mut(), 2, 1.0); // echoes -2
+    link.poll();
+    assert_eq!(link.params()[0].value, -2.0);
+    assert!(link.take_edited().is_empty(), "echoes are not edits: {:?}", link.take_edited());
+}

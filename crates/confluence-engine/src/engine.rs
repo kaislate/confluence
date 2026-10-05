@@ -135,6 +135,9 @@ enum BusPlugin {
     Failed { info: PluginInfo, why: String, state: Option<Vec<u8>>, values: std::collections::BTreeMap<u32, f64> },
 }
 
+/// A parameter changed in a plugin's editor is saved at most this often.
+pub const EDIT_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Room left in a journal record around a plugin state chunk.
 const STATE_HEADROOM: usize = 4096;
 
@@ -262,6 +265,10 @@ pub struct Engine {
     plugins: std::collections::BTreeMap<u32, BusPlugin>,
     /// Plugin trouble the user should know about, by bus id.
     plugin_notices: std::collections::BTreeMap<u32, String>,
+    /// Editor changes not saved yet, by (send column, param).
+    edits_held: std::collections::BTreeMap<(u32, u32), f64>,
+    /// When each (send column, param) was last saved.
+    edits_saved: std::collections::HashMap<(u32, u32), std::time::Instant>,
     blocks: Arc<AtomicU64>,
     master_ppm: Arc<AtomicU64>,
     dsp_load: Arc<AtomicU32>,
@@ -316,6 +323,8 @@ impl Engine {
             returned_processors: Vec::new(),
             plugins: std::collections::BTreeMap::new(),
             plugin_notices: std::collections::BTreeMap::new(),
+            edits_held: std::collections::BTreeMap::new(),
+            edits_saved: std::collections::HashMap::new(),
             blocks,
             master_ppm,
             dsp_load,
@@ -705,9 +714,11 @@ impl Engine {
         out
     }
 
-    /// Values plugins changed themselves (in their editors) since the last
-    /// call, as journal records (buses by send column).
-    pub fn take_edited_values(&mut self) -> Vec<Command> {
+    /// Values plugins changed themselves (in their editors), as journal
+    /// records (buses by send column). A parameter is saved at most once per
+    /// [`EDIT_SAVE_INTERVAL`]: a plugin moving its own parameter all the time
+    /// must not flood the journal; the latest value is held and saved when due.
+    pub fn take_edited_values(&mut self, now: std::time::Instant) -> Vec<Command> {
         let places: Vec<(u32, u32)> = self
             .slots
             .iter()
@@ -718,11 +729,23 @@ impl Engine {
         for (bus, at) in places {
             if let Some(BusPlugin::Loaded { control, .. }) = self.plugins.get_mut(&bus) {
                 control.poll();
-                out.extend(control.take_edited().into_iter().map(|(param, value)| Command::SetParam {
-                    bus: BusRef::At(at),
-                    param,
-                    value,
-                }));
+                for (param, value) in control.take_edited() {
+                    self.edits_held.insert((at, param), value);
+                }
+            }
+        }
+        let due: Vec<(u32, u32)> = self
+            .edits_held
+            .keys()
+            .filter(|k| {
+                self.edits_saved.get(*k).is_none_or(|t| now.saturating_duration_since(*t) >= EDIT_SAVE_INTERVAL)
+            })
+            .copied()
+            .collect();
+        for (at, param) in due {
+            if let Some(value) = self.edits_held.remove(&(at, param)) {
+                self.edits_saved.insert((at, param), now);
+                out.push(Command::SetParam { bus: BusRef::At(at), param, value });
             }
         }
         out
@@ -1728,10 +1751,64 @@ mod tests {
         assert_eq!(e.handle(&Command::ShowEditor { bus: BusRef::Id(b) }), Response::Ok);
         assert_eq!(*titles.lock().unwrap(), ["Fake — Vocal FX"]);
         assert!(e.bus_plugins()[0].editor_open);
-        assert_eq!(e.take_edited_values(), vec![set_param_at(8, 1, -12.0)], "saved by send column");
-        assert!(e.take_edited_values().is_empty());
+        let now = std::time::Instant::now();
+        assert_eq!(e.take_edited_values(now), vec![set_param_at(8, 1, -12.0)], "saved by send column");
+        assert!(e.take_edited_values(now).is_empty());
         assert_eq!(e.handle(&Command::HideEditor { bus: BusRef::At(8) }), Response::Ok);
         assert!(!e.bus_plugins()[0].editor_open);
+    }
+
+    /// A plugin whose editor reports whatever the test pushes.
+    struct Editing(FakePlugin, Arc<Mutex<Vec<(u32, f64)>>>);
+
+    impl PluginControl for Editing {
+        fn info(&self) -> PluginInfo {
+            self.0.info()
+        }
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn params(&self) -> Vec<ParamState> {
+            self.0.params()
+        }
+        fn set_param(&mut self, id: u32, value: f64) -> Result<(), String> {
+            self.0.set_param(id, value)
+        }
+        fn poll(&mut self) -> bool {
+            false
+        }
+        fn save_state(&mut self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn load_state(&mut self, _state: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn take_edited(&mut self) -> Vec<(u32, f64)> {
+            std::mem::take(&mut *self.1.lock().unwrap())
+        }
+    }
+
+    /// A plugin moving its own parameter all the time must not flood the
+    /// journal: at most one record per parameter every couple of seconds,
+    /// and the latest value always gets saved.
+    #[test]
+    fn values_changed_in_an_editor_are_saved_at_a_bounded_rate() {
+        let (mut e, _a) = small();
+        let b = e.add_bus(&bus_at("FX", 1, 8)).unwrap();
+        let feed = Arc::new(Mutex::new(Vec::new()));
+        let plugin = Editing(FakePlugin { gain: 0.0, state: Arc::new(Mutex::new(Vec::new())) }, feed.clone());
+        e.set_plugin(b, Some((Box::new(plugin), halves()))).unwrap();
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        feed.lock().unwrap().push((1, -1.0));
+        assert_eq!(e.take_edited_values(at(0)), vec![set_param_at(8, 1, -1.0)], "the first change at once");
+        for (n, ms) in (1..=10).zip((100..).step_by(100)) {
+            feed.lock().unwrap().push((1, -1.0 - n as f64));
+            assert!(e.take_edited_values(at(ms)).is_empty(), "held back at {ms} ms");
+        }
+        assert!(e.take_edited_values(at(1900)).is_empty());
+        assert_eq!(e.take_edited_values(at(2000)), vec![set_param_at(8, 1, -11.0)], "then the latest value");
+        assert!(e.take_edited_values(at(5000)).is_empty(), "nothing new: nothing saved");
     }
 
     #[test]

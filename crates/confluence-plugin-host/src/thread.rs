@@ -34,6 +34,10 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
 /// Parameter changes in flight to one plugin's audio side.
 const PARAM_RING: usize = 1024;
+/// After the host sets a parameter, the plugin's reports of it are taken as
+/// echoes of the host's own changes (some plugins report every change back,
+/// and a late report may carry an older value) for this long.
+const ECHO_WINDOW: Duration = Duration::from_millis(500);
 /// Values one plugin reports in flight to the engine.
 const REPORT_RING: usize = 1024;
 
@@ -156,6 +160,7 @@ impl PluginThread {
             has_editor: loaded.has_editor,
             editor_open: loaded.editor_open,
             edited: Vec::new(),
+            host_sets: Vec::new(),
         };
         Ok((link, Box::new(loaded.processor)))
     }
@@ -201,6 +206,8 @@ pub struct PluginLink {
     editor_open: Arc<AtomicBool>,
     /// Writable values the plugin changed itself (in its editor), not yet taken.
     edited: Vec<(u32, f64)>,
+    /// When the host last set each parameter (reports right after are echoes).
+    host_sets: Vec<(u32, std::time::Instant)>,
 }
 
 impl PluginLink {
@@ -232,6 +239,8 @@ impl PluginLink {
         }
         self.params_tx.try_send((id, v)).map_err(|_| format!("{name} is not taking changes this fast"))?;
         p.value = v;
+        self.host_sets.retain(|(q, _)| *q != id);
+        self.host_sets.push((id, std::time::Instant::now()));
         self.refresh_text(id);
         Ok(())
     }
@@ -258,7 +267,11 @@ impl PluginLink {
             }
         }
         let mut changed = Vec::new();
+        self.host_sets.retain(|(_, at)| at.elapsed() < ECHO_WINDOW);
         while let Some((id, value)) = self.reported_rx.try_recv() {
+            if self.host_sets.iter().any(|(q, _)| *q == id) {
+                continue; // an echo of the host's own change
+            }
             if let Some(p) = self.params.iter_mut().find(|p| p.id == id) {
                 if p.value != value {
                     p.value = value;
@@ -436,9 +449,13 @@ fn run(rx: mpsc::Receiver<Msg>, wake: Arc<Wake>) {
 /// Waits for a request, a window message, or the callback poll interval.
 #[cfg(windows)]
 fn wait(_rx: &mpsc::Receiver<Msg>, wake: &Wake) {
-    use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjects, QS_ALLINPUT};
-    // SAFETY: one valid event handle; a timeout, not an infinite wait.
-    let _ = unsafe { MsgWaitForMultipleObjects(Some(&[wake.handle()]), false, POLL.as_millis() as u32, QS_ALLINPUT) };
+    use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT};
+    // SAFETY: one valid event handle; a timeout, not an infinite wait. With
+    // MWMO_INPUTAVAILABLE, messages left in the queue by a bounded pump wake
+    // it at once.
+    let _ = unsafe {
+        MsgWaitForMultipleObjectsEx(Some(&[wake.handle()]), POLL.as_millis() as u32, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+    };
 }
 
 #[cfg(not(windows))]
@@ -446,16 +463,32 @@ fn wait(_rx: &mpsc::Receiver<Msg>, _wake: &Wake) {
     std::thread::sleep(Duration::from_millis(1));
 }
 
-/// Runs every window message waiting for this thread (plugin editors).
+/// At most this many window messages per pass of the loop...
+#[cfg(windows)]
+const PUMP_MESSAGES: usize = 256;
+/// ...or this long: an editor that never lets its queue empty (one that
+/// reposts messages to itself) must not keep requests and callbacks waiting.
+#[cfg(windows)]
+const PUMP_TIME: Duration = Duration::from_millis(10);
+
+/// Runs the window messages waiting for this thread (plugin editors), within
+/// a bound; the rest wait for the next pass.
 #[cfg(windows)]
 fn pump_messages() {
     use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
+    let started = std::time::Instant::now();
     let mut msg = MSG::default();
-    // SAFETY: standard message loop on this thread's own queue.
-    unsafe {
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+    for _ in 0..PUMP_MESSAGES {
+        // SAFETY: standard message loop on this thread's own queue.
+        unsafe {
+            if !PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                return;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        if started.elapsed() >= PUMP_TIME {
+            return;
         }
     }
 }

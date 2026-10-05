@@ -39,6 +39,9 @@ pub const GAIN_ID: &str = "dev.confluence.test.gain";
 pub const CRASH_ID: &str = "dev.confluence.test.crash";
 /// The gain plugin without an editor.
 pub const PLAIN_ID: &str = "dev.confluence.test.plain";
+/// The gain plugin (no editor) reporting every change the host makes back to
+/// it, as some plugin frameworks do.
+pub const ECHO_ID: &str = "dev.confluence.test.echo";
 /// Ends the process "successfully" (exit code 0) when created.
 pub const EXIT_ID: &str = "dev.confluence.test.exit";
 /// Gain in dB, −60…+12.
@@ -79,16 +82,19 @@ pub struct GainShared {
     edited: std::sync::atomic::AtomicBool,
     /// This instance offers an editor.
     with_gui: bool,
+    /// This instance reports the host's changes back.
+    echo: bool,
 }
 
 impl GainShared {
-    fn new(with_gui: bool) -> Self {
+    fn new(with_gui: bool, echo: bool) -> Self {
         GainShared {
             gain_db: AtomicF64::zero(),
             fail: AtomicF64::zero(),
             peak: AtomicF64::zero(),
             edited: std::sync::atomic::AtomicBool::new(false),
             with_gui,
+            echo,
         }
     }
 
@@ -176,6 +182,14 @@ impl<'a> PluginAudioProcessor<'a, GainShared, GainMain<'a>> for GainProcessor<'a
     fn process(&mut self, _process: Process, mut audio: Audio, events: Events) -> Result<ProcessStatus, PluginError> {
         for e in events.input {
             self.shared.handle(e);
+            if self.shared.echo {
+                if let Some(CoreEventSpace::ParamValue(v)) = e.as_core_event() {
+                    if let Some(id) = v.param_id() {
+                        let ev = ParamValueEvent::new(0, id, Pckn::match_all(), v.value());
+                        let _ = events.output.try_push(ev);
+                    }
+                }
+            }
         }
         if self.shared.fail.get() >= 0.5 {
             return Err(PluginError::Message("test failure"));
@@ -332,11 +346,12 @@ pub struct Factory {
     crash: PluginDescriptor,
     exit: PluginDescriptor,
     plain: PluginDescriptor,
+    echo: PluginDescriptor,
 }
 
 impl PluginFactoryImpl for Factory {
     fn plugin_count(&self) -> u32 {
-        4
+        5
     }
 
     fn plugin_descriptor(&self, index: u32) -> Option<&PluginDescriptor> {
@@ -345,16 +360,17 @@ impl PluginFactoryImpl for Factory {
             1 => Some(&self.crash),
             2 => Some(&self.exit),
             3 => Some(&self.plain),
+            4 => Some(&self.echo),
             _ => None,
         }
     }
 
     fn create_plugin<'a>(&'a self, host_info: HostInfo<'a>, plugin_id: &CStr) -> Option<PluginInstance<'a>> {
-        let gain = |descriptor, with_gui| {
+        let gain = |descriptor, with_gui, echo| {
             PluginInstance::new::<TestGain>(
                 host_info,
                 descriptor,
-                move |_host| Ok(GainShared::new(with_gui)),
+                move |_host| Ok(GainShared::new(with_gui, echo)),
                 |_host, shared| {
                     Ok(GainMain {
                         shared,
@@ -365,9 +381,11 @@ impl PluginFactoryImpl for Factory {
             )
         };
         if plugin_id.to_bytes() == GAIN_ID.as_bytes() {
-            Some(gain(&self.gain, true))
+            Some(gain(&self.gain, true, false))
         } else if plugin_id.to_bytes() == PLAIN_ID.as_bytes() {
-            Some(gain(&self.plain, false))
+            Some(gain(&self.plain, false, false))
+        } else if plugin_id.to_bytes() == ECHO_ID.as_bytes() {
+            Some(gain(&self.echo, false, true))
         } else if plugin_id.to_bytes() == CRASH_ID.as_bytes() {
             Some(PluginInstance::new::<TestCrash>(
                 host_info,
@@ -388,7 +406,7 @@ impl PluginFactoryImpl for Factory {
     }
 }
 
-/// The file's entry: one factory with all four plugins.
+/// The file's entry: one factory with all five plugins.
 pub struct Entry {
     factory: PluginFactoryWrapper<Factory>,
 }
@@ -415,6 +433,10 @@ impl clack_plugin::entry::Entry for Entry {
                     .with_version("1.0.0")
                     .with_features([AUDIO_EFFECT, UTILITY]),
                 plain: PluginDescriptor::new(PLAIN_ID, "Confluence Test Plain")
+                    .with_vendor("Confluence")
+                    .with_version("1.0.0")
+                    .with_features([AUDIO_EFFECT, STEREO]),
+                echo: PluginDescriptor::new(ECHO_ID, "Confluence Test Echo")
                     .with_vendor("Confluence")
                     .with_version("1.0.0")
                     .with_features([AUDIO_EFFECT, STEREO]),

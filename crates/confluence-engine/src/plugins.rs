@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,10 +25,6 @@ pub const CHECK_PASSED: &str = "confluence-check-passed";
 /// How long to wait for a finished scan's output: a helper process the plugin
 /// started may keep the pipes open.
 const OUTPUT_GRACE: Duration = Duration::from_secs(2);
-/// Windows `CREATE_NO_WINDOW`: a scan started by an engine without a console
-/// (as the window starts it) would otherwise open a console window.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The standard CLAP folders on Windows, then each folder in `CLAP_PATH`.
 pub fn default_dirs() -> Vec<PathBuf> {
@@ -71,77 +68,331 @@ fn stamp(path: &Path) -> Option<Stamp> {
     Some((m.len(), m.modified().ok()))
 }
 
+/// Readers report through channels, so a pipe held open by a helper process
+/// the plugin started cannot keep us waiting.
+fn read_all(mut r: Box<dyn Read + Send>) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = r.read_to_string(&mut s);
+        let _ = tx.send(s);
+    });
+    rx
+}
+
+/// What became of a scan process.
+enum Ended {
+    Exited(i32),
+    TimedOut,
+}
+
 /// Runs `exe` with `args` (a scan process) and returns its stdout, or why it failed.
 fn run_scan(exe: &Path, args: &[&std::ffi::OsStr], file: &Path) -> Result<String, String> {
-    let mut cmd = Command::new(exe);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+    let (ended, out, err) = spawn_scan(exe, args)?;
+    let collect = |rx: std::sync::mpsc::Receiver<String>| rx.recv_timeout(OUTPUT_GRACE).unwrap_or_default();
+    match ended {
+        Ended::TimedOut => Err(format!("{} did not finish loading in 10 s", file.display())),
+        Ended::Exited(0) => Ok(collect(out)),
+        Ended::Exited(SCAN_FAILED) => Err(collect(err).trim().to_string()),
+        Ended::Exited(_) => Err(format!("{} crashed while loading; it was not loaded", file.display())),
     }
-    let mut child = cmd.spawn().map_err(|e| format!("could not start the plugin check: {e}"))?;
-    // Readers report through channels, so a pipe held open by a helper
-    // process the plugin started cannot keep us waiting.
-    let read = |mut r: Box<dyn Read + Send>| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = r.read_to_string(&mut s);
-            let _ = tx.send(s);
-        });
-        rx
+}
+
+/// Starts a scan process inside a job that kills it if the engine ends
+/// (`win::spawn_in_job`), waits for it up to the scan timeout, and returns
+/// how it ended with readers of its output.
+#[cfg(windows)]
+fn spawn_scan(
+    exe: &Path,
+    args: &[&std::ffi::OsStr],
+) -> Result<(Ended, std::sync::mpsc::Receiver<String>, std::sync::mpsc::Receiver<String>), String> {
+    let child = win::spawn_in_job(exe, args).map_err(|e| format!("could not start the plugin check: {e}"))?;
+    let (out, err) = (read_all(Box::new(child.stdout)), read_all(Box::new(child.stderr)));
+    let ended = match child.process.wait(SCAN_TIMEOUT) {
+        Some(code) => Ended::Exited(code),
+        None => {
+            child.process.kill();
+            Ended::TimedOut
+        }
     };
-    let out = child.stdout.take().map(|o| read(Box::new(o)));
-    let err = child.stderr.take().map(|e| read(Box::new(e)));
+    Ok((ended, out, err))
+}
+
+#[cfg(not(windows))]
+fn spawn_scan(
+    exe: &Path,
+    args: &[&std::ffi::OsStr],
+) -> Result<(Ended, std::sync::mpsc::Receiver<String>, std::sync::mpsc::Receiver<String>), String> {
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start the plugin check: {e}"))?;
+    let empty = || -> Box<dyn Read + Send> { Box::new(std::io::empty()) };
+    let out = read_all(child.stdout.take().map(|o| Box::new(o) as Box<dyn Read + Send>).unwrap_or_else(empty));
+    let err = read_all(child.stderr.take().map(|o| Box::new(o) as Box<dyn Read + Send>).unwrap_or_else(empty));
     let deadline = Instant::now() + SCAN_TIMEOUT;
-    let status = loop {
+    let ended = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(st)) => break Ended::Exited(st.code().unwrap_or(-1)),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{} did not finish loading in 10 s", file.display()));
+                break Ended::TimedOut;
             }
         }
     };
-    let collect = |rx: Option<std::sync::mpsc::Receiver<String>>| {
-        rx.and_then(|rx| rx.recv_timeout(OUTPUT_GRACE).ok()).unwrap_or_default()
-    };
-    let (stdout, stderr) = (collect(out), collect(err));
-    match status.code() {
-        Some(0) => Ok(stdout),
-        Some(SCAN_FAILED) => Err(stderr.trim().to_string()),
-        _ => Err(format!("{} crashed while loading; it was not loaded", file.display())),
-    }
+    Ok((ended, out, err))
 }
 
-/// Puts the engine in a job that is closed, killing everything in it, when
-/// the engine exits for any reason. Processes the engine starts (plugin scans)
-/// are created inside the job, so none can outlive it, not even one caught
-/// half-created (still suspended) when the engine was killed. Call once, early.
+/// Scan processes created inside a kill-on-close job, so none outlives the
+/// engine, not even one caught half-created when the engine was killed. Only
+/// scan processes go in it: whatever plugins start from the engine itself (a
+/// browser opened by an editor) is left alone.
 #[cfg(windows)]
-pub fn end_children_with_engine() -> Result<(), String> {
+mod win {
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::path::Path;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use windows::core::{w, PWSTR};
+    use windows::Win32::Foundation::{
+        CloseHandle, SetHandleInformation, GENERIC_READ, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+    };
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-    use windows::Win32::System::Threading::GetCurrentProcess;
-    // SAFETY: an unnamed job, configured before the engine joins it. Its handle
-    // is never closed: it closes when the engine process ends.
-    unsafe {
-        let job = CreateJobObjectW(None, None).map_err(|e| e.to_string())?;
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
+    use windows::Win32::System::Pipes::CreatePipe;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, InitializeProcThreadAttributeList,
+        TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
+        EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    };
+
+    /// A running scan process. Its handle closes when dropped.
+    pub struct Process(HANDLE);
+
+    impl Process {
+        /// Waits up to `timeout`; its exit code, or `None` if still running.
+        pub fn wait(&self, timeout: Duration) -> Option<i32> {
+            // SAFETY: a valid process handle we own.
+            unsafe {
+                if WaitForSingleObject(self.0, timeout.as_millis() as u32) != WAIT_OBJECT_0 {
+                    return None;
+                }
+                let mut code = 0u32;
+                GetExitCodeProcess(self.0, &mut code).ok()?;
+                Some(code as i32)
+            }
+        }
+
+        pub fn kill(&self) {
+            // SAFETY: as above.
+            unsafe {
+                let _ = TerminateProcess(self.0, 1);
+                let _ = WaitForSingleObject(self.0, 5000);
+            }
+        }
+    }
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            // SAFETY: we own the handle.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    pub struct Child {
+        pub process: Process,
+        pub stdout: File,
+        pub stderr: File,
+    }
+
+    /// The job scan processes are created in, as an integer (handles are not
+    /// `Sync`). Never closed: it closes when the engine ends, killing them.
+    fn job() -> Result<HANDLE, String> {
+        static JOB: OnceLock<Result<isize, String>> = OnceLock::new();
+        let job = JOB.get_or_init(|| {
+            // SAFETY: an unnamed job, configured before use.
+            unsafe {
+                let job = CreateJobObjectW(None, None).map_err(|e| e.to_string())?;
+                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(job.0 as isize)
+            }
+        });
+        job.clone().map(|h| HANDLE(h as *mut _))
+    }
+
+    /// One argument quoted for a Windows command line.
+    fn quote(arg: &OsStr, out: &mut Vec<u16>) {
+        let a: Vec<u16> = arg.encode_wide().collect();
+        let needs = a.is_empty() || a.iter().any(|&c| c == b' ' as u16 || c == b'\t' as u16 || c == b'"' as u16);
+        if !needs {
+            out.extend(a);
+            return;
+        }
+        out.push(b'"' as u16);
+        let mut backslashes = 0;
+        for &c in &a {
+            if c == b'\\' as u16 {
+                backslashes += 1;
+                continue;
+            }
+            if c == b'"' as u16 {
+                out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+            } else {
+                out.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+            }
+            backslashes = 0;
+            out.push(c);
+        }
+        out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+        out.push(b'"' as u16);
+    }
+
+    /// An inheritable anonymous pipe: (our read end, its write end).
+    fn pipe(sa: &SECURITY_ATTRIBUTES) -> Result<(HANDLE, HANDLE), String> {
+        let (mut r, mut w) = (HANDLE::default(), HANDLE::default());
+        // SAFETY: out-params for a new pipe; our end is then made non-inheritable.
+        unsafe {
+            CreatePipe(&mut r, &mut w, Some(sa), 0).map_err(|e| e.to_string())?;
+            SetHandleInformation(r, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)).map_err(|e| e.to_string())?;
+        }
+        Ok((r, w))
+    }
+
+    /// Starts `exe args` without a console, inside the scan job, with its
+    /// stdout and stderr piped to us and stdin from NUL. Only those three
+    /// handles are inherited.
+    pub fn spawn_in_job(exe: &Path, args: &[&OsStr]) -> Result<Child, String> {
+        let job = job()?;
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: true.into(),
+        };
+        let (out_r, out_w) = pipe(&sa)?;
+        let (err_r, err_w) = pipe(&sa)?;
+        // SAFETY: opening the NUL device for the child's stdin.
+        let nul = unsafe {
+            CreateFileW(
+                w!("NUL"),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                Some(&sa),
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+        }
         .map_err(|e| e.to_string())?;
-        AssignProcessToJobObject(job, GetCurrentProcess()).map_err(|e| e.to_string())
+        let close = |hs: &[HANDLE]| {
+            for h in hs {
+                // SAFETY: handles we created.
+                let _ = unsafe { CloseHandle(*h) };
+            }
+        };
+
+        let mut cmdline = Vec::new();
+        quote(exe.as_os_str(), &mut cmdline);
+        for a in args {
+            cmdline.push(b' ' as u16);
+            quote(a, &mut cmdline);
+        }
+        cmdline.push(0);
+
+        let inherit = [nul, out_w, err_w];
+        let jobs = [job];
+        let mut size = 0usize;
+        // SAFETY: the first call only reports the size the list needs.
+        let _ = unsafe { InitializeProcThreadAttributeList(None, 2, None, &mut size) };
+        let mut buf = vec![0u8; size];
+        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr().cast());
+        let started = (|| -> Result<PROCESS_INFORMATION, String> {
+            // SAFETY: `buf` is the size asked for and outlives the list's use;
+            // the attribute values (`inherit`, `jobs`) outlive CreateProcessW.
+            unsafe {
+                InitializeProcThreadAttributeList(Some(list), 2, None, &mut size).map_err(|e| e.to_string())?;
+                let result = (|| {
+                    UpdateProcThreadAttribute(
+                        list,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                        Some(inherit.as_ptr().cast()),
+                        std::mem::size_of_val(&inherit),
+                        None,
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    UpdateProcThreadAttribute(
+                        list,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                        Some(jobs.as_ptr().cast()),
+                        std::mem::size_of_val(&jobs),
+                        None,
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let mut si = STARTUPINFOEXW::default();
+                    si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+                    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                    si.StartupInfo.hStdInput = nul;
+                    si.StartupInfo.hStdOutput = out_w;
+                    si.StartupInfo.hStdError = err_w;
+                    si.lpAttributeList = list;
+                    let mut pi = PROCESS_INFORMATION::default();
+                    CreateProcessW(
+                        None,
+                        Some(PWSTR(cmdline.as_mut_ptr())),
+                        None,
+                        None,
+                        true,
+                        EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+                        None,
+                        None,
+                        &si.StartupInfo,
+                        &mut pi,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(pi)
+                })();
+                DeleteProcThreadAttributeList(list);
+                result
+            }
+        })();
+        // The child has its own copies now (or failed to start).
+        close(&inherit);
+        let pi = match started {
+            Ok(pi) => pi,
+            Err(e) => {
+                close(&[out_r, err_r]);
+                return Err(e);
+            }
+        };
+        close(&[pi.hThread]);
+        // SAFETY: we own these read ends; File takes them over.
+        let (stdout, stderr) = unsafe { (File::from_raw_handle(out_r.0), File::from_raw_handle(err_r.0)) };
+        Ok(Child { process: Process(pi.hProcess), stdout, stderr })
     }
 }
 

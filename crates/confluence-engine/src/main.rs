@@ -280,6 +280,8 @@ mod app {
 
     /// How often state is diffed and telemetry sent, in control-loop ticks of 10 ms.
     const PUBLISH_TICKS: u64 = 10;
+    /// The journal is rewritten as the current state once it grows past this.
+    const JOURNAL_COMPACT_BYTES: u64 = 4 << 20;
     /// How often the device list is refreshed.
     const DEVICE_SCAN: Duration = Duration::from_secs(2);
 
@@ -469,10 +471,6 @@ mod app {
     }
 
     pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
-        // Plugin scans this engine starts end with it, whatever ends it.
-        if let Err(e) = plugins::end_children_with_engine() {
-            eprintln!("confluence-engine: warning: plugin scans may outlive the engine: {e}");
-        }
         if let Err(e) = disable_power_throttling() {
             eprintln!("confluence-engine: warning: could not disable power throttling: {e}");
         }
@@ -599,10 +597,17 @@ mod app {
                 // Catches changes no command made: devices lost or back, a DAW attaching.
                 publish(&mut s);
                 // Values changed in plugin editors are saved like any other change.
-                let edited = s.engine.take_edited_values();
+                let edited = s.engine.take_edited_values(Instant::now());
                 for c in &edited {
                     if let Err(e) = s.journal.append(c) {
                         eprintln!("confluence-engine: warning: a plugin edit was not saved: {e}");
+                    }
+                }
+                // A long session of edits: rewrite the journal as the current state.
+                if s.journal.size() > JOURNAL_COMPACT_BYTES {
+                    let State { engine, journal, .. } = &mut *s;
+                    if let Err(e) = journal.compact(&state_commands(engine)) {
+                        eprintln!("confluence-engine: warning: the journal could not be compacted: {e}");
                     }
                 }
                 let h = health(&mut s);

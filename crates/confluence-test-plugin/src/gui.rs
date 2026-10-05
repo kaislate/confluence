@@ -14,9 +14,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, RegisterClassW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, PostMessageW, RegisterClassW,
     SetWindowLongPtrW, ShowWindow, GWLP_USERDATA, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_LBUTTONDOWN, WM_PAINT,
-    WNDCLASSW, WS_CHILD, WS_VISIBLE,
+    WM_RBUTTONDOWN, WM_USER, WNDCLASSW, WS_CHILD, WS_VISIBLE,
 };
 
 use crate::{GainMain, GainShared};
@@ -53,6 +53,13 @@ fn class() -> PCWSTR {
 
 unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        // Test hook: a right click starts a message flood (each message posts
+        // the next), like a badly behaved editor that never lets its queue empty.
+        WM_RBUTTONDOWN | WM_USER => {
+            // SAFETY: posting to our own window.
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_USER, WPARAM(0), LPARAM(0)) };
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
             // SAFETY: set to the plugin's shared state, which outlives the window.
             let shared = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const GainShared;

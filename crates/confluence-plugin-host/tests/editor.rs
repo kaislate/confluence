@@ -12,7 +12,7 @@ use confluence_test_plugin::{DEACTIVATIONS, GAIN_ID, PARAM_GAIN, PLAIN_ID};
 use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, PostMessageW, SendMessageW, WM_CLOSE, WM_LBUTTONDOWN,
+    FindWindowExW, FindWindowW, PostMessageW, SendMessageW, WM_CLOSE, WM_LBUTTONDOWN, WM_RBUTTONDOWN,
 };
 
 fn source() -> Source {
@@ -129,4 +129,24 @@ fn a_plugin_without_an_editor_says_so() {
     assert!(!link.has_editor());
     let err = link.show_editor("Confluence Test Plain — none").unwrap_err();
     assert!(err.contains("has no editor"), "{err}");
+}
+
+/// An editor that never lets its message queue empty must not stop the
+/// plugin thread from answering requests (or closing that editor).
+#[test]
+fn a_flooding_editor_does_not_starve_the_plugin_thread() {
+    let t = PluginThread::start().unwrap();
+    let (mut link, _p) = load(&t, GAIN_ID);
+    let title = "Confluence Test Gain — flooding";
+    link.show_editor(title).unwrap();
+    let w = window(title).unwrap();
+    // SAFETY: lookup, then start the flood in the plugin's own window.
+    let child = unsafe { FindWindowExW(Some(w), None, w!("ConfluenceTestGainEditor"), None) }.unwrap();
+    unsafe { PostMessageW(Some(child), WM_RBUTTONDOWN, WPARAM(0), LPARAM(0)) }.unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    link.save_state().unwrap();
+    assert!(started.elapsed() < Duration::from_millis(500), "answered in {:?}", started.elapsed());
+    link.hide_editor();
+    assert!(window(title).is_none(), "the flooding editor could still be closed");
 }
