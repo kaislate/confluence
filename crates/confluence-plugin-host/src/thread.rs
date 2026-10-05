@@ -266,7 +266,17 @@ fn run(rx: mpsc::Receiver<Msg>) {
         match rx.recv_timeout(POLL) {
             Ok(msg) => handle(msg, &mut plugins, &mut next),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                // The engine is exiting. A processor may still be running on
+                // the audio thread: destroying its instance now could crash
+                // it, so those instances are left for the process exit.
+                for (_, slot) in plugins.drain() {
+                    if slot.processing {
+                        std::mem::forget(slot.instance);
+                    }
+                }
+                return;
+            }
         }
         for slot in plugins.values_mut() {
             if slot.callback.swap(false, Ordering::AcqRel) {

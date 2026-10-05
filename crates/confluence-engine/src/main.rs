@@ -31,14 +31,18 @@ mod app {
     use std::sync::{Arc, Mutex, MutexGuard, Weak};
     use std::time::{Duration, Instant};
 
-    use confluence_api::{Command, DeviceInfo, EngineStatus, Event, Response, SlotHealth};
+    use confluence_api::{
+        BusRef, Command, DeviceInfo, EngineStatus, Event, ParamState, PluginInfo, Response, SlotHealth, MAX_FRAME_BYTES,
+    };
     use confluence_engine::clock::InternalClock;
     use confluence_engine::devices::{start_asio_master, DeviceManager};
     use confluence_engine::ipc::{default_pipe_name, pipe_path, PipeServer, Service};
     use confluence_engine::journal::Journal;
+    use confluence_engine::plugins::{self, Scanner};
     use confluence_engine::publish::{published_state, Publisher};
     use confluence_engine::rt::disable_power_throttling;
-    use confluence_engine::{Engine, EngineConfig};
+    use confluence_engine::{Engine, EngineConfig, PluginControl, PluginParts};
+    use confluence_plugin_host::{PluginLink, PluginThread, Source};
     use confluence_provider_asio::AsioDevice;
 
     #[derive(clap::Parser)]
@@ -106,6 +110,155 @@ mod app {
         device_list: Arc<Mutex<Vec<DeviceInfo>>>,
         /// The master clock's binding, for status.
         master: String,
+        /// Owns every plugin instance (CLAP main-thread calls happen there).
+        plugin_thread: PluginThread,
+        /// Finds CLAP plugins in the background.
+        scanner: Scanner,
+        /// This program, run as the load-check process.
+        exe: PathBuf,
+    }
+
+    /// A plugin as the engine controls it.
+    struct Link(PluginLink);
+
+    impl PluginControl for Link {
+        fn info(&self) -> PluginInfo {
+            self.0.info().clone()
+        }
+        fn latency(&self) -> u32 {
+            self.0.latency()
+        }
+        fn params(&self) -> Vec<ParamState> {
+            self.0.params().to_vec()
+        }
+        fn set_param(&mut self, id: u32, value: f64) -> Result<(), String> {
+            self.0.set_param(id, value)
+        }
+        fn poll(&mut self) -> bool {
+            self.0.poll()
+        }
+        fn save_state(&mut self) -> Result<Vec<u8>, String> {
+            self.0.save_state()
+        }
+        fn load_state(&mut self, state: &[u8]) -> Result<(), String> {
+            self.0.load_state(state)
+        }
+    }
+
+    /// Checks plugin `id` of `path` in a separate process, then loads it here.
+    fn open_plugin(
+        exe: &std::path::Path,
+        thread: &PluginThread,
+        path: &str,
+        id: &str,
+        rate: f64,
+        block: u32,
+        channels: u32,
+    ) -> Result<PluginParts, String> {
+        plugins::check(exe, std::path::Path::new(path), id, rate, block)?;
+        let (link, processor) = thread.load(Source::File(PathBuf::from(path)), id, rate, block, channels)?;
+        Ok((Box::new(Link(link)), processor))
+    }
+
+    /// A bus's first send column and channel count.
+    fn bus_place(engine: &Engine, bus: u32) -> Option<(u32, u32)> {
+        engine.slots().into_iter().find(|s| s.id == bus).map(|s| (s.first_output, s.outputs))
+    }
+
+    /// `cmd` as the journal stores it: buses named by send column, not by id
+    /// (ids change between runs).
+    fn journal_form(engine: &Engine, cmd: &Command) -> Command {
+        let at = |bus: &BusRef| match engine.resolve_bus(bus).ok().and_then(|b| bus_place(engine, b)) {
+            Some((first, _)) => BusRef::At(first),
+            None => *bus,
+        };
+        match cmd {
+            Command::UnloadPlugin { bus } => Command::UnloadPlugin { bus: at(bus) },
+            Command::SetParam { bus, param, value } => Command::SetParam { bus: at(bus), param: *param, value: *value },
+            Command::SetPluginState { bus, state } => Command::SetPluginState { bus: at(bus), state: state.clone() },
+            Command::LoadPlugin { bus, path, plugin_id } => {
+                Command::LoadPlugin { bus: at(bus), path: path.clone(), plugin_id: plugin_id.clone() }
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Replays a journaled `LoadPlugin` at start-up. A plugin that cannot be
+    /// loaded keeps its bus silent and stays in the journal.
+    fn replay_load(
+        engine: &mut Engine,
+        exe: &std::path::Path,
+        thread: &PluginThread,
+        bus: &BusRef,
+        path: &str,
+        id: &str,
+    ) {
+        let Ok(b) = engine.resolve_bus(bus) else { return };
+        let Some((_, channels)) = bus_place(engine, b) else { return };
+        let (rate, block) = (engine.config().sample_rate, engine.config().block as u32);
+        match open_plugin(exe, thread, path, id, rate, block, channels) {
+            Ok(plugin) => {
+                let _ = engine.set_plugin(b, Some(plugin));
+            }
+            Err(why) => {
+                eprintln!("confluence-engine: warning: plugin {id} could not be loaded: {why}");
+                let info = PluginInfo {
+                    path: path.to_string(),
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    vendor: String::new(),
+                    version: String::new(),
+                };
+                let _ = engine.set_failed_plugin(b, info, why);
+            }
+        }
+    }
+
+    /// `LoadPlugin` over the pipe: the check and the load take seconds, so
+    /// they run without the lock.
+    fn load_plugin(state: &Mutex<State>, bus: &BusRef, path: &str, id: &str) -> Response {
+        let (exe, thread, rate, block, at, channels) = {
+            let s = lock(state);
+            let b = match s.engine.resolve_bus(bus) {
+                Ok(b) => b,
+                Err(e) => return Response::Error(e.to_string()),
+            };
+            let Some((at, channels)) = bus_place(&s.engine, b) else {
+                return Response::Error(format!("no slot with id {b}"));
+            };
+            let cfg = s.engine.config();
+            (s.exe.clone(), s.plugin_thread.clone(), cfg.sample_rate, cfg.block as u32, at, channels)
+        };
+        let opened = open_plugin(&exe, &thread, path, id, rate, block, channels);
+        let mut s = lock(state);
+        let plugin = match opened {
+            Ok(p) => p,
+            Err(e) => return Response::Error(e),
+        };
+        // The bus may have gone while the plugin was loading.
+        let b = match s.engine.resolve_bus(&BusRef::At(at)) {
+            Ok(b) => b,
+            Err(e) => {
+                thread.reclaim(plugin.1);
+                return Response::Error(e.to_string());
+            }
+        };
+        if let Err(e) = s.engine.set_plugin(b, Some(plugin)) {
+            return Response::Error(e.to_string());
+        }
+        let record = Command::LoadPlugin { bus: BusRef::At(at), path: path.to_string(), plugin_id: id.to_string() };
+        if let Err(e) = s.journal.append(&record) {
+            publish(&mut s);
+            return Response::Error(format!("applied but not saved: {e}"));
+        }
+        Response::Applied { version: publish(&mut s) }
+    }
+
+    /// Adds what `published_state` does not know about: plugins.
+    fn with_plugins(mut st: confluence_api::State, engine: &mut Engine, scanner: &Scanner) -> confluence_api::State {
+        (st.plugins, st.bad_plugins) = scanner.list();
+        st.bus_plugins = engine.bus_plugins();
+        st
     }
 
     /// How often state is diffed and telemetry sent, in control-loop ticks of 10 ms.
@@ -141,6 +294,7 @@ mod app {
         let status = status(s, &health);
         let list = s.device_list.lock().map(|l| l.clone()).unwrap_or_default();
         let now = published_state(&mut s.engine, &s.devices, &list, status);
+        let now = with_plugins(now, &mut s.engine, &s.scanner);
         s.publisher.publish(now)
     }
 
@@ -166,6 +320,8 @@ mod app {
             // driver can take seconds): do them without the lock, so the
             // engine keeps ticking and other clients keep being answered.
             match cmd {
+                Command::ListPlugins => return Response::Plugins(lock(state).scanner.list().0),
+                Command::LoadPlugin { bus, path, plugin_id } => return load_plugin(state, bus, path, plugin_id),
                 Command::ListDevices => {
                     return match DeviceManager::list_devices() {
                         Ok(d) => {
@@ -233,7 +389,7 @@ mod app {
                 // so they do not come back, on other devices, after a restart.
                 let saved = match cmd {
                     Command::RemoveSlot { .. } => journal.compact(&state_commands(engine)),
-                    _ if cmd.is_mutation() => journal.append(cmd),
+                    _ if cmd.is_mutation() => journal.append(&journal_form(engine, cmd)),
                     _ => Ok(()),
                 };
                 if let Err(e) = saved {
@@ -282,6 +438,22 @@ mod app {
                 first_output: Some(s.first_output),
             })
             .collect();
+        let buses: Vec<(u32, u32)> =
+            engine.slots().into_iter().filter(|s| s.is_bus()).map(|s| (s.id, s.first_output)).collect();
+        for (id, at) in buses {
+            let Some((info, state)) = engine.plugin_snapshot(id) else { continue };
+            out.push(Command::LoadPlugin { bus: BusRef::At(at), path: info.path, plugin_id: info.id });
+            match state {
+                Some(state) if state.len() + 4096 <= MAX_FRAME_BYTES as usize => {
+                    out.push(Command::SetPluginState { bus: BusRef::At(at), state });
+                }
+                Some(state) => eprintln!(
+                    "confluence-engine: warning: {} bytes of plugin state are too many to save; its settings are not saved",
+                    state.len()
+                ),
+                None => {}
+            }
+        }
         if let Response::Points(points) = engine.handle(&Command::ListPoints) {
             out.extend(points.into_iter().map(|p| Command::SetPoint {
                 input: p.input,
@@ -315,9 +487,23 @@ mod app {
             None => (args.rate, args.block),
         };
         let (mut engine, audio) = Engine::new(EngineConfig::new(rate, block));
+        let plugin_thread = PluginThread::start()?;
+        let exe = std::env::current_exe()?;
         for cmd in &replay {
-            engine.handle(cmd);
+            match cmd {
+                Command::LoadPlugin { bus, path, plugin_id } => {
+                    replay_load(&mut engine, &exe, &plugin_thread, bus, path, plugin_id)
+                }
+                _ => {
+                    engine.handle(cmd);
+                }
+            }
         }
+        let plugin_dirs = match &args.clap_path {
+            Some(dirs) => std::env::split_paths(dirs).collect(),
+            None => plugins::default_dirs(),
+        };
+        let scanner = Scanner::start(exe.clone(), plugin_dirs);
         journal.compact(&state_commands(&mut engine))?;
 
         let (mut devices, mut warnings) =
@@ -359,7 +545,8 @@ mod app {
             dsp_load: 0.0,
             xruns: 0,
         };
-        let publisher = Publisher::new(published_state(&mut engine, &devices, &[], first));
+        let first = with_plugins(published_state(&mut engine, &devices, &[], first), &mut engine, &scanner);
+        let publisher = Publisher::new(first);
         let state = Arc::new(Mutex::new(State {
             engine,
             journal,
@@ -367,6 +554,9 @@ mod app {
             publisher,
             device_list: device_list.clone(),
             master: args.master.clone(),
+            plugin_thread,
+            scanner,
+            exe,
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         {
@@ -394,6 +584,9 @@ mod app {
             std::thread::sleep(Duration::from_millis(10));
             let mut s = lock(&state);
             s.engine.tick();
+            for p in s.engine.take_returned_processors() {
+                s.plugin_thread.reclaim(p);
+            }
             ticks += 1;
             if ticks.is_multiple_of(PUBLISH_TICKS) {
                 // Catches changes no command made: devices lost or back, a DAW attaching.
@@ -404,6 +597,14 @@ mod app {
             }
         }
         server.stop();
+        {
+            // Plugins keep settings that no command changed (e.g. a loaded file): save them.
+            let mut s = lock(&state);
+            let State { engine, journal, .. } = &mut *s;
+            if let Err(e) = journal.compact(&state_commands(engine)) {
+                eprintln!("confluence-engine: warning: the final save failed: {e}");
+            }
+        }
         // Ends every subscription, so their connection threads let go of the state.
         lock(&state).publisher.close();
         // Soft devices first (their bridges feed the engine), then the master.

@@ -230,3 +230,99 @@ fn an_insert_bus_and_its_routes_survive_a_restart() {
     assert!(!slots.iter().any(|s| s.is_bus()));
     shutdown(child, &mut c);
 }
+
+/// `target/debug/confluence_test_plugin.dll`, built by `cargo build --workspace`.
+fn test_plugin_dll() -> std::path::PathBuf {
+    let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_confluence-engine"));
+    let path = exe.parent().unwrap().join("confluence_test_plugin.dll");
+    assert!(path.is_file(), "{} is missing: run `cargo build --workspace` first", path.display());
+    path
+}
+
+/// The engine with its plugin folder set to `clap_dir` (never the user's own).
+fn spawn_with_plugins(pipe: &str, journal: &std::path::Path, clap_dir: &std::path::Path) -> Engine {
+    let mut cmd = engine_command(pipe, journal);
+    cmd.arg("--clap-path").arg(clap_dir);
+    Engine(Some(cmd.spawn().unwrap()))
+}
+
+fn bus_plugins(pipe: &str) -> Vec<confluence_api::LoadedPlugin> {
+    let (state, _sub) = confluence_client::Subscription::connect(pipe, Duration::from_secs(10)).unwrap();
+    state.bus_plugins
+}
+
+#[test]
+fn a_plugin_on_a_bus_keeps_its_settings_across_restarts() {
+    use confluence_api::{BusRef, PluginStatus};
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let clap_dir = dir.path().join("clap");
+    std::fs::create_dir(&clap_dir).unwrap();
+    let file = clap_dir.join("Test.clap");
+    std::fs::copy(test_plugin_dll(), &file).unwrap();
+    let path = file.display().to_string();
+    let pipe = format!("confluence-plugin-restart-{}", std::process::id());
+
+    let child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let add = Command::AddBus { name: "FX".into(), channels: 2, first_input: None, first_output: None };
+    let Response::Added { ids, .. } = c.call(add).unwrap() else { panic!() };
+    let bus = BusRef::Id(ids[0]);
+    let load = Command::LoadPlugin { bus, path: path.clone(), plugin_id: "dev.confluence.test.gain".into() };
+    let r = c.call(load).unwrap();
+    assert!(matches!(r, Response::Applied { .. }), "{r:?}");
+    let r = c.call(Command::SetParam { bus, param: 1, value: -6.0 }).unwrap();
+    assert!(matches!(r, Response::Applied { .. }), "{r:?}");
+    let shown = bus_plugins(&pipe);
+    assert_eq!(shown.len(), 1);
+    assert_eq!((shown[0].info.name.as_str(), &shown[0].status), ("Confluence Test Gain", &PluginStatus::Running));
+    assert_eq!(shown[0].params[0].text, "-6.0 dB");
+    // The crash plugin is caught by the load check; the engine carries on.
+    let crash = Command::LoadPlugin { bus, path: path.clone(), plugin_id: "dev.confluence.test.crash".into() };
+    let Response::Error(e) = c.call(crash).unwrap() else { panic!("the crash plugin must be refused") };
+    assert!(e.contains("crashed while loading"), "{e}");
+    assert!(matches!(c.call(Command::Status).unwrap(), Response::Status(_)));
+    assert_eq!(bus_plugins(&pipe)[0].info.name, "Confluence Test Gain", "the bus kept its plugin");
+    // The plugins found in the folder are listed.
+    let Response::Plugins(found) = c.call(Command::ListPlugins).unwrap() else { panic!() };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut found = found;
+    while found.len() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        let Response::Plugins(f) = c.call(Command::ListPlugins).unwrap() else { panic!() };
+        found = f;
+    }
+    assert_eq!(found.len(), 2, "{found:?}");
+    shutdown(child, &mut c);
+
+    let child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let shown = bus_plugins(&pipe);
+    assert_eq!(shown.len(), 1, "the plugin came back");
+    assert_eq!(shown[0].status, PluginStatus::Running);
+    assert_eq!(shown[0].params[0].value, -6.0, "with its setting");
+    shutdown(child, &mut c);
+
+    // Its file disappears: the bus is kept silent and the plugin remembered.
+    std::fs::rename(&file, clap_dir.join("away.bin")).unwrap();
+    let child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let shown = bus_plugins(&pipe);
+    assert!(matches!(shown[0].status, PluginStatus::Failed(_)), "{:?}", shown[0].status);
+    shutdown(child, &mut c);
+    std::fs::rename(clap_dir.join("away.bin"), &file).unwrap();
+    let child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let shown = bus_plugins(&pipe);
+    assert_eq!(shown[0].status, PluginStatus::Running, "back when the file is back");
+    assert_eq!(shown[0].params[0].value, -6.0);
+    assert!(matches!(
+        c.call(Command::UnloadPlugin { bus: BusRef::Id(shown[0].bus) }).unwrap(),
+        Response::Applied { .. }
+    ));
+    shutdown(child, &mut c);
+    let child = spawn_with_plugins(&pipe, &journal, &clap_dir);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert!(bus_plugins(&pipe).is_empty(), "unloading is saved too");
+    shutdown(child, &mut c);
+}
