@@ -182,3 +182,51 @@ fn a_removed_slots_routes_stay_removed_after_a_restart() {
     assert_eq!(routes, vec![(10, 11)]);
     shutdown(child, &mut c);
 }
+
+#[test]
+fn an_insert_bus_and_its_routes_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    // A saved device that is not installed holds inputs/outputs 0..2 offline.
+    let binding = r#"{"master":null,"devices":[{"kind":"Asio","name":"no such driver (test)",
+        "first_input":0,"inputs":2,"first_output":0,"outputs":2}]}"#;
+    std::fs::write(dir.path().join("devices.json"), binding).unwrap();
+    let pipe = format!("confluence-bus-restart-{}", std::process::id());
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let add = Command::AddBus { name: "Verb".into(), channels: 2, first_input: None, first_output: None };
+    let Response::Added { ids, .. } = c.call(add).unwrap() else { panic!("AddBus replies Added") };
+    let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+    let bus = slots.iter().find(|s| s.id == ids[0]).unwrap().clone();
+    assert!(bus.is_bus());
+    let set = |input, output, gain_db| Command::SetPoint { input, output, gain_db, mute: false, invert: false };
+    assert!(matches!(c.call(set(1, bus.first_output, 0.0)).unwrap(), Response::Applied { .. }));
+    assert!(matches!(c.call(set(bus.first_input, 1, -3.0)).unwrap(), Response::Applied { .. }));
+    let looped = c.call(set(bus.first_input, bus.first_output, 0.0)).unwrap();
+    assert_eq!(looped, Response::Error("this route would feed an insert bus back into itself".into()));
+    shutdown(child, &mut c);
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+    let again = slots.iter().find(|s| s.is_bus()).expect("the bus is back");
+    assert_eq!(
+        (again.name.as_str(), again.first_input, again.inputs, again.first_output, again.outputs),
+        ("Verb", bus.first_input, 2, bus.first_output, 2)
+    );
+    assert!(slots.iter().any(|s| !s.online), "the offline device kept its channels too");
+    let Response::Points(points) = c.call(Command::ListPoints).unwrap() else { panic!() };
+    let routes: Vec<(u32, u32)> = points.iter().map(|p| (p.input, p.output)).collect();
+    assert_eq!(routes.len(), 2, "{routes:?}");
+    assert!(routes.contains(&(1, bus.first_output)) && routes.contains(&(bus.first_input, 1)), "{routes:?}");
+    // Removing the bus is permanent too.
+    assert!(matches!(c.call(Command::RemoveSlot { id: again.id }).unwrap(), Response::Applied { .. }));
+    shutdown(child, &mut c);
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+    assert!(!slots.iter().any(|s| s.is_bus()));
+    shutdown(child, &mut c);
+}
