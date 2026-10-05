@@ -6,17 +6,20 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use confluence_api::{ClockRole, Command, PointState, Response, SlotHealth, SlotState};
+use confluence_api::{ClockRole, Command, PointState, Response, SlotHealth, SlotState, BUS_DEVICE};
 use confluence_core::asrc::AsrcQuality;
 use confluence_core::bridge::{soft_input, soft_output, BridgeConfig, BridgeStats, InputDeviceSide, OutputDeviceSide};
 use confluence_core::buffer::PlanarBuffer;
 use confluence_core::gain::PointParams;
 use confluence_core::mailbox::{self, Receiver, Sender};
 use confluence_core::matrix::{matrix, MatrixController};
+use confluence_core::plan::{compile, order, plan, BusSpan, PlanController};
+use confluence_core::processor::Processor;
 
 use crate::alloc::ChannelAllocator;
 use crate::audio::{
-    AudioEngine, AudioMsg, InputEntry, LoadMeter, OutputEntry, Returned, StrictEntry, StrictSide, MAX_SLOTS,
+    AudioEngine, AudioMsg, BusEntry, InputEntry, LoadMeter, OutputEntry, Returned, StrictEntry, StrictSide, MAX_BUSES,
+    MAX_SLOTS,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +71,26 @@ pub enum EngineError {
     NotOffline(u32),
     #[error("{0}")]
     Device(String),
+    #[error("this route would feed an insert bus back into itself")]
+    BusLoop,
+    #[error("an insert bus has 1 to 64 channels")]
+    BusChannels,
+    #[error("too many insert buses")]
+    TooManyBuses,
+}
+
+/// Most channels an insert bus can have.
+pub const MAX_BUS_CHANNELS: u32 = 64;
+
+/// Parameters of an insert bus.
+#[derive(Clone, Debug)]
+pub struct BusSpec {
+    pub name: String,
+    pub channels: u32,
+    /// Place the returns at this first input channel (restoring a saved layout); `None` = first fit.
+    pub first_input: Option<u32>,
+    /// Place the sends at this first output channel; `None` = first fit.
+    pub first_output: Option<u32>,
 }
 
 /// Parameters of a soft-clocked device slot.
@@ -149,6 +172,8 @@ enum SlotStats {
     Bridge(Arc<BridgeStats>),
     Master,
     Strict(Arc<dyn StrictStats>),
+    /// An insert bus: its processor's caught panics.
+    Bus(Arc<AtomicU64>),
 }
 
 struct SlotRecord {
@@ -168,6 +193,10 @@ pub struct Engine {
     soft_inputs: usize,
     soft_outputs: usize,
     strict: usize,
+    buses: usize,
+    plan: PlanController,
+    /// Buses or the routes between them changed: compile a new plan on `tick`.
+    plan_dirty: bool,
     blocks: Arc<AtomicU64>,
     master_ppm: Arc<AtomicU64>,
     dsp_load: Arc<AtomicU32>,
@@ -177,8 +206,9 @@ impl Engine {
     /// Builds a connected control/audio pair.
     pub fn new(cfg: EngineConfig) -> (Engine, AudioEngine) {
         let (matrix_ctl, router) = matrix(cfg.max_inputs, cfg.max_outputs, cfg.ramp, cfg.sample_rate as f32);
-        let (to_audio, inbox) = mailbox::channel(4 * MAX_SLOTS);
-        let (returns_tx, returns) = mailbox::channel(4 * MAX_SLOTS);
+        let (plan_ctl, plan_run) = plan(cfg.max_outputs as u32);
+        let (to_audio, inbox) = mailbox::channel(4 * (MAX_SLOTS + MAX_BUSES));
+        let (returns_tx, returns) = mailbox::channel(4 * (MAX_SLOTS + MAX_BUSES));
         let blocks = Arc::new(AtomicU64::new(0));
         let master_ppm = Arc::new(AtomicU64::new(0f64.to_bits()));
         let dsp_load = Arc::new(AtomicU32::new(0));
@@ -193,6 +223,8 @@ impl Engine {
             soft_inputs: Vec::with_capacity(MAX_SLOTS),
             soft_outputs: Vec::with_capacity(MAX_SLOTS),
             strict: Vec::with_capacity(MAX_SLOTS),
+            buses: Vec::with_capacity(MAX_BUSES),
+            plan: plan_run,
             inbox,
             returns: returns_tx,
             blocks: blocks.clone(),
@@ -213,6 +245,9 @@ impl Engine {
             soft_inputs: 0,
             soft_outputs: 0,
             strict: 0,
+            buses: 0,
+            plan: plan_ctl,
+            plan_dirty: false,
             blocks,
             master_ppm,
             dsp_load,
@@ -296,13 +331,15 @@ impl Engine {
 
     /// Registers the master slot: the device whose callback will copy its inputs
     /// into, and its outputs out of, the returned channel ranges around
-    /// `AudioEngine::process_master_block`.
+    /// `AudioEngine::process_master_block`. A saved placement that is now
+    /// taken (by a bus, or because the driver reports more channels) gives way
+    /// to first fit: the engine must start.
     pub fn add_master_slot(&mut self, spec: &MasterSlotSpec) -> Result<(u32, MasterChannels), EngineError> {
         if self.slots.iter().any(|s| s.state.role == ClockRole::Master) {
             return Err(EngineError::MasterExists);
         }
-        let first_input = claim_maybe(&mut self.inputs, spec.first_input, spec.inputs as u32, "input")?;
-        let first_output = match claim_maybe(&mut self.outputs, spec.first_output, spec.outputs as u32, "output") {
+        let first_input = claim_or_fit(&mut self.inputs, spec.first_input, spec.inputs as u32, "input")?;
+        let first_output = match claim_or_fit(&mut self.outputs, spec.first_output, spec.outputs as u32, "output") {
             Ok(f) => f,
             Err(e) => {
                 self.inputs.free(first_input, spec.inputs as u32);
@@ -383,6 +420,101 @@ impl Engine {
         Ok((id, ch))
     }
 
+    /// Adds a summing insert bus (its returns carry what its sends receive).
+    pub fn add_bus(&mut self, spec: &BusSpec) -> Result<u32, EngineError> {
+        self.add_bus_with(spec, None)
+    }
+
+    /// Adds an insert bus running `processor` (`None`: a summing bus). Its
+    /// sends are output columns and its returns input rows, `spec.channels`
+    /// each; returns reach outputs in the same block.
+    pub fn add_bus_with(&mut self, spec: &BusSpec, processor: Option<Box<dyn Processor>>) -> Result<u32, EngineError> {
+        if !(1..=MAX_BUS_CHANNELS).contains(&spec.channels) {
+            return Err(EngineError::BusChannels);
+        }
+        if self.buses >= MAX_BUSES {
+            return Err(EngineError::TooManyBuses);
+        }
+        let ch = spec.channels;
+        let first_input = claim(&mut self.inputs, spec.first_input, ch, "input")?;
+        let first_output = match claim(&mut self.outputs, spec.first_output, ch, "output") {
+            Ok(f) => f,
+            Err(e) => {
+                self.inputs.free(first_input, ch);
+                return Err(e);
+            }
+        };
+        let faults = Arc::new(AtomicU64::new(0));
+        let id = self.next_id;
+        let entry = Box::new(BusEntry {
+            id,
+            first_send: first_output as usize,
+            first_return: first_input as usize,
+            channels: ch as usize,
+            processor,
+            faults: faults.clone(),
+        });
+        if self.to_audio.try_send(AudioMsg::AddBus(entry)).is_err() {
+            self.inputs.free(first_input, ch);
+            self.outputs.free(first_output, ch);
+            return Err(EngineError::Busy);
+        }
+        // Routes left on these (free) channels would otherwise become the
+        // bus's routes, possibly a loop: a new bus starts unrouted.
+        let (ins, outs) = (first_input..first_input + ch, first_output..first_output + ch);
+        for (input, output, _) in self.matrix.points() {
+            if ins.contains(&input) || outs.contains(&output) {
+                // In range by construction; removal cannot fail.
+                let _ = self.matrix.remove_point(input, output);
+            }
+        }
+        self.next_id += 1;
+        self.buses += 1;
+        self.plan_dirty = true;
+        let state = self.state(id, &spec.name, BUS_DEVICE, ClockRole::Strict, (first_input, ch), (first_output, ch));
+        self.slots.push(SlotRecord { state, stats: SlotStats::Bus(faults) });
+        Ok(id)
+    }
+
+    fn bus_spans(&self) -> Vec<BusSpan> {
+        self.slots
+            .iter()
+            .filter(|s| matches!(s.stats, SlotStats::Bus(_)))
+            .map(|s| BusSpan {
+                id: s.state.id,
+                sends: s.state.first_output..s.state.first_output + s.state.outputs,
+                returns: s.state.first_input..s.state.first_input + s.state.inputs,
+            })
+            .collect()
+    }
+
+    /// Adds or updates a point; a new point that would loop a bus is refused.
+    fn set_point(&mut self, input: u32, output: u32, p: PointParams) -> Result<(), EngineError> {
+        let new = self.matrix.point(input, output).is_none();
+        if new && self.buses > 0 {
+            let spans = self.bus_spans();
+            let points = self.matrix.points().into_iter().map(|(i, o, _)| (i, o)).chain([(input, output)]);
+            if order(&spans, points).is_err() {
+                return Err(EngineError::BusLoop);
+            }
+        }
+        self.matrix.set_point(input, output, p).map_err(|_| EngineError::OutOfRange)?;
+        if new && self.buses > 0 {
+            self.plan_dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Compiles the plan for the current buses and routes.
+    fn replan(&mut self) {
+        let spans = self.bus_spans();
+        let points = self.matrix.points().into_iter().map(|(i, o, _)| (i, o));
+        // `set_point` never lets a loop in; if one appeared anyway, run the
+        // buses by id: one stale block somewhere, never a hang.
+        let ids = order(&spans, points).unwrap_or_else(|_| spans.iter().map(|b| b.id).collect());
+        self.plan.set(compile(&spans, &ids, self.cfg.max_outputs as u32));
+    }
+
     /// Reserves the channels of a slot whose device is currently missing.
     pub fn add_offline_slot(&mut self, spec: &OfflineSlotSpec) -> Result<u32, EngineError> {
         let first_input = claim_maybe(&mut self.inputs, Some(spec.first_input), spec.inputs, "input")?;
@@ -450,6 +582,13 @@ impl Engine {
             self.to_audio.try_send(AudioMsg::Remove(id)).map_err(|_| EngineError::Busy)?;
             self.strict -= 1;
         }
+        if matches!(rec.stats, SlotStats::Bus(_)) {
+            self.to_audio.try_send(AudioMsg::Remove(id)).map_err(|_| EngineError::Busy)?;
+            self.buses -= 1;
+            self.plan_dirty = true;
+        }
+        // Routes on the slot's channels go: edges between buses may change.
+        self.plan_dirty |= self.buses > 0;
         let rec = self.slots.remove(idx);
         let s = &rec.state;
         let ins = s.first_input..s.first_input + s.inputs;
@@ -467,12 +606,20 @@ impl Engine {
 
     /// Housekeeping: publishes matrix changes and frees state returned by the audio side.
     pub fn tick(&mut self) {
+        // The plan goes first, so a new bus route's plan and routing snapshot
+        // normally reach the audio thread at the same block start.
+        if self.plan_dirty {
+            self.replan();
+            self.plan_dirty = false;
+        }
+        self.plan.tick();
         self.matrix.tick();
         while let Some(r) = self.returns.try_recv() {
             match r {
                 Returned::Input(entry) => drop(entry),
                 Returned::Output(entry) => drop(entry),
                 Returned::Strict(entry) => drop(entry),
+                Returned::Bus(entry) => drop(entry),
             }
         }
     }
@@ -491,13 +638,16 @@ impl Engine {
                 Response::Error(format!("gain must be a number of dB, not {gain_db}"))
             }
             Command::SetPoint { input, output, gain_db, mute, invert } => {
-                match self.matrix.set_point(input, output, PointParams { gain_db, mute, invert }) {
+                match self.set_point(input, output, PointParams { gain_db, mute, invert }) {
                     Ok(()) => Response::Ok,
-                    Err(_) => Response::Error(EngineError::OutOfRange.to_string()),
+                    Err(e) => Response::Error(e.to_string()),
                 }
             }
             Command::RemovePoint { input, output } => match self.matrix.remove_point(input, output) {
-                Ok(()) => Response::Ok,
+                Ok(()) => {
+                    self.plan_dirty |= self.buses > 0;
+                    Response::Ok
+                }
                 Err(_) => Response::Error(EngineError::OutOfRange.to_string()),
             },
             Command::ListPoints => Response::Points(
@@ -530,6 +680,13 @@ impl Engine {
                 Response::Error("subscriptions and status are served by the engine process".into())
             }
             Command::Shutdown => Response::Ok,
+            Command::AddBus { ref name, channels, first_input, first_output } => {
+                let spec = BusSpec { name: name.clone(), channels, first_input, first_output };
+                match self.add_bus(&spec) {
+                    Ok(id) => Response::SlotsAdded(vec![id]),
+                    Err(e) => Response::Error(e.to_string()),
+                }
+            }
         }
     }
 
@@ -585,6 +742,20 @@ impl Engine {
                     idle_note: (attached == Some(false)).then(|| stats.idle_note()).flatten().map(String::from),
                 })
             }
+            SlotStats::Bus(faults) => Some(SlotHealth {
+                id,
+                underruns: 0,
+                overruns: 0,
+                fill_frames: 0.0,
+                target_frames: 0.0,
+                device_ppm: 0.0,
+                correction_ppm: 0.0,
+                device_lost: false,
+                device_faults: faults.load(Ordering::Relaxed),
+                driver_requests: 0,
+                attached: None,
+                idle_note: None,
+            }),
             SlotStats::None => None,
         }
     }
@@ -636,6 +807,14 @@ fn claim(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'static str
     }
 }
 
+/// As [`claim_maybe`], but a placement that is taken falls back to first fit.
+fn claim_or_fit(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'static str) -> Result<u32, EngineError> {
+    match claim_maybe(a, at, len, what) {
+        Err(EngineError::ChannelsTaken(..)) => claim_maybe(a, None, len, what),
+        other => other,
+    }
+}
+
 /// As [`claim`], but a zero-length request succeeds and reserves nothing.
 fn claim_maybe(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'static str) -> Result<u32, EngineError> {
     if len == 0 {
@@ -648,6 +827,184 @@ fn claim_maybe(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use confluence_core::processor::{BusIo, Processor};
+
+    fn small() -> (Engine, AudioEngine) {
+        let mut cfg = EngineConfig::new(48_000.0, 64);
+        cfg.max_inputs = 16;
+        cfg.max_outputs = 16;
+        Engine::new(cfg)
+    }
+
+    fn bus(name: &str, channels: u32) -> BusSpec {
+        BusSpec { name: name.into(), channels, first_input: None, first_output: None }
+    }
+
+    fn bus_at(name: &str, channels: u32, at: u32) -> BusSpec {
+        BusSpec { name: name.into(), channels, first_input: Some(at), first_output: Some(at) }
+    }
+
+    fn route(e: &mut Engine, input: u32, output: u32) -> Response {
+        e.handle(&Command::SetPoint { input, output, gain_db: 0.0, mute: false, invert: false })
+    }
+
+    /// Runs one block with `x` on every frame of input 0; returns output `o`'s first sample.
+    fn block(e: &mut Engine, a: &mut AudioEngine, x: f32, o: usize) -> f32 {
+        e.tick();
+        a.inputs_mut().channel_mut(0).fill(x);
+        a.process_block(0.0);
+        a.outputs().channel(o)[0]
+    }
+
+    /// The journal replays buses before the ASIO master is placed. A master
+    /// whose saved placement now overlaps a bus (its driver reports more
+    /// channels than last time) must still start, elsewhere, not fail the
+    /// engine on every restart.
+    #[test]
+    fn a_master_whose_saved_place_is_taken_by_a_bus_still_starts() {
+        let (mut e, _a) = Engine::new(EngineConfig::new(48_000.0, 64));
+        e.add_bus(&bus_at("Verb", 2, 8)).unwrap();
+        let spec = MasterSlotSpec { first_input: Some(0), first_output: Some(0), ..master(10, 10) };
+        let (_, ch) = e.add_master_slot(&spec).expect("the master starts");
+        assert_eq!((ch.inputs, ch.outputs), (10, 10));
+        let overlaps = |first: usize, n: usize| first < 10 && 8 < first + n;
+        assert!(!overlaps(ch.first_input, ch.inputs) && !overlaps(ch.first_output, ch.outputs), "{ch:?}");
+        // A placement that fits is still honoured.
+        let (mut e, _a) = small();
+        let spec = MasterSlotSpec { first_input: Some(2), first_output: Some(3), ..master(2, 2) };
+        let (_, ch) = e.add_master_slot(&spec).unwrap();
+        assert_eq!((ch.first_input, ch.first_output), (2, 3));
+    }
+
+    #[test]
+    fn a_bus_return_reaches_an_output_in_the_same_block() {
+        let (mut e, mut a) = small();
+        let b = e.add_bus(&bus_at("Verb", 2, 8)).unwrap();
+        assert_eq!(route(&mut e, 0, 8), Response::Ok, "input 0 to send 1");
+        assert_eq!(route(&mut e, 8, 3), Response::Ok, "return 1 to output 3");
+        // Settle the 10 ms fade-ins with silence, then a step must arrive at once.
+        for _ in 0..20 {
+            block(&mut e, &mut a, 0.0, 3);
+        }
+        assert_eq!(block(&mut e, &mut a, 1.0, 3), 1.0, "same block, no added latency");
+        let s = e.slots().into_iter().find(|s| s.id == b).unwrap();
+        assert!(s.is_bus());
+        assert_eq!((s.first_input, s.inputs, s.first_output, s.outputs), (8, 2, 8, 2));
+    }
+
+    #[test]
+    fn chained_buses_run_in_dependency_order() {
+        let (mut e, mut a) = small();
+        // B is created first (lower id) but is fed by A.
+        e.add_bus(&bus_at("B", 1, 4)).unwrap();
+        e.add_bus(&bus_at("A", 1, 6)).unwrap();
+        assert_eq!(route(&mut e, 0, 6), Response::Ok, "input to A send");
+        assert_eq!(route(&mut e, 6, 4), Response::Ok, "A return to B send");
+        assert_eq!(route(&mut e, 4, 2), Response::Ok, "B return to output 2");
+        for _ in 0..20 {
+            block(&mut e, &mut a, 0.0, 2);
+        }
+        assert_eq!(block(&mut e, &mut a, 1.0, 2), 1.0);
+    }
+
+    #[test]
+    fn a_route_that_loops_a_bus_is_refused_and_changes_nothing() {
+        let (mut e, _a) = small();
+        e.add_bus(&bus_at("A", 1, 4)).unwrap();
+        e.add_bus(&bus_at("B", 1, 6)).unwrap();
+        let err = Response::Error("this route would feed an insert bus back into itself".into());
+        assert_eq!(route(&mut e, 4, 4), err, "into itself");
+        assert_eq!(route(&mut e, 4, 6), Response::Ok, "A to B");
+        assert_eq!(route(&mut e, 6, 4), err, "B to A closes the loop");
+        let Response::Points(p) = e.handle(&Command::ListPoints) else { panic!() };
+        assert_eq!(p.len(), 1);
+        // Changing the existing route's gain is not a new edge.
+        let gain = Command::SetPoint { input: 4, output: 6, gain_db: -6.0, mute: false, invert: false };
+        assert_eq!(e.handle(&gain), Response::Ok);
+    }
+
+    #[test]
+    fn reversing_a_bus_chain_is_accepted_at_once() {
+        let (mut e, _a) = small();
+        e.add_bus(&bus_at("A", 1, 4)).unwrap();
+        e.add_bus(&bus_at("B", 1, 6)).unwrap();
+        assert_eq!(route(&mut e, 4, 6), Response::Ok);
+        assert_eq!(e.handle(&Command::RemovePoint { input: 4, output: 6 }), Response::Ok);
+        assert_eq!(route(&mut e, 6, 4), Response::Ok, "the fading route no longer counts");
+    }
+
+    #[test]
+    fn removing_a_bus_drops_its_routes_and_silences_its_returns() {
+        let (mut e, mut a) = small();
+        let b = e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        for _ in 0..20 {
+            block(&mut e, &mut a, 1.0, 3);
+        }
+        assert_eq!(e.handle(&Command::RemoveSlot { id: b }), Response::Ok);
+        let Response::Points(p) = e.handle(&Command::ListPoints) else { panic!() };
+        assert!(p.is_empty());
+        block(&mut e, &mut a, 1.0, 3);
+        assert_eq!(a.inputs_mut().channel(8)[0], 0.0, "returns silent once the bus is gone");
+        for _ in 0..40 {
+            block(&mut e, &mut a, 1.0, 3);
+        }
+        assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.0);
+        assert!(!e.slots().iter().any(|s| s.id == b));
+    }
+
+    #[test]
+    fn a_new_bus_does_not_inherit_routes_left_on_its_channels() {
+        let (mut e, _a) = small();
+        route(&mut e, 8, 8); // a leftover route on free channels
+        route(&mut e, 0, 1); // unrelated
+        e.add_bus(&bus_at("Verb", 1, 8)).unwrap();
+        let Response::Points(p) = e.handle(&Command::ListPoints) else { panic!() };
+        assert_eq!(p.iter().map(|p| (p.input, p.output)).collect::<Vec<_>>(), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn bus_sizes_and_counts_are_limited() {
+        let (mut e, _a) = Engine::new(EngineConfig::new(48_000.0, 64));
+        assert_eq!(e.add_bus(&bus("x", 0)), Err(EngineError::BusChannels));
+        assert_eq!(e.add_bus(&bus("x", 65)), Err(EngineError::BusChannels));
+        for _ in 0..MAX_BUSES {
+            e.add_bus(&bus("x", 1)).unwrap();
+        }
+        assert_eq!(e.add_bus(&bus("x", 1)), Err(EngineError::TooManyBuses));
+        assert_eq!(EngineError::BusChannels.to_string(), "an insert bus has 1 to 64 channels");
+        assert_eq!(EngineError::TooManyBuses.to_string(), "too many insert buses");
+    }
+
+    #[test]
+    fn add_bus_over_the_api_replies_with_its_slot() {
+        let (mut e, _a) = small();
+        let cmd = Command::AddBus { name: "Verb".into(), channels: 2, first_input: None, first_output: None };
+        let Response::SlotsAdded(ids) = e.handle(&cmd) else { panic!() };
+        assert_eq!(e.slots().iter().find(|s| s.id == ids[0]).map(|s| s.name.as_str()), Some("Verb"));
+    }
+
+    struct Panics;
+    impl Processor for Panics {
+        fn process(&mut self, _io: BusIo<'_>) {
+            panic!("test plugin crash");
+        }
+    }
+
+    #[test]
+    fn a_panicking_processor_silences_its_bus_and_counts_a_fault() {
+        let (mut e, mut a) = small();
+        let b = e.add_bus_with(&bus_at("Bad", 1, 8), Some(Box::new(Panics))).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        for _ in 0..3 {
+            assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.0);
+        }
+        let Response::Health { slots, .. } = e.handle(&Command::Health) else { panic!() };
+        let h = slots.iter().find(|h| h.id == b).expect("a bus reports health");
+        assert!(h.device_faults >= 3, "{h:?}");
+    }
 
     /// A NaN gain never equals itself: it would look changed in every state
     /// diff (a new version every 100 ms) and come back from the journal.

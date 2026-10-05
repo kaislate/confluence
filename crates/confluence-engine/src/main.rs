@@ -181,6 +181,16 @@ mod app {
                 None => engine.handle(cmd),
             };
             devices.annotate(&mut resp);
+            if let (Command::AddBus { .. }, Response::SlotsAdded(ids)) = (cmd, &resp) {
+                let ids = ids.clone();
+                // The engine placed the bus: save its placement, not the request,
+                // so it comes back on the same channels after a restart.
+                if let Err(e) = journal.compact(&state_commands(engine)) {
+                    publish(&mut s);
+                    return Response::Error(format!("applied but not saved: {e}"));
+                }
+                return Response::Added { ids, version: publish(&mut s) };
+            }
             if resp == Response::Ok {
                 // Removing a slot also removes its routes: rewrite the journal
                 // so they do not come back, on other devices, after a restart.
@@ -221,21 +231,30 @@ mod app {
         base.join("Confluence")
     }
 
-    /// The minimal commands that recreate the engine's current matrix.
+    /// The minimal commands that recreate the engine's insert buses (on their
+    /// channels) and then its matrix.
     fn state_commands(engine: &mut Engine) -> Vec<Command> {
-        match engine.handle(&Command::ListPoints) {
-            Response::Points(points) => points
-                .into_iter()
-                .map(|p| Command::SetPoint {
-                    input: p.input,
-                    output: p.output,
-                    gain_db: p.gain_db,
-                    mute: p.mute,
-                    invert: p.invert,
-                })
-                .collect(),
-            _ => Vec::new(),
+        let mut buses: Vec<_> = engine.slots().into_iter().filter(|s| s.is_bus()).collect();
+        buses.sort_by_key(|s| s.first_output);
+        let mut out: Vec<Command> = buses
+            .into_iter()
+            .map(|s| Command::AddBus {
+                name: s.name,
+                channels: s.inputs,
+                first_input: Some(s.first_input),
+                first_output: Some(s.first_output),
+            })
+            .collect();
+        if let Response::Points(points) = engine.handle(&Command::ListPoints) {
+            out.extend(points.into_iter().map(|p| Command::SetPoint {
+                input: p.input,
+                output: p.output,
+                gain_db: p.gain_db,
+                mute: p.mute,
+                invert: p.invert,
+            }));
         }
+        out
     }
 
     pub fn run(args: Args) -> Result<(), Box<dyn Error>> {

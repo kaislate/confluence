@@ -391,3 +391,41 @@ fn a_press_that_moves_more_than_three_pixels_is_not_a_click() {
     assert!(!engine_points(&mut c).contains(&(i, o)));
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn an_insert_bus_is_added_routed_and_cannot_loop() {
+    let d = EngineDir::new("bus");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, _) = add_vasio(&mut c, 1);
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices…").click();
+    pump_until(&mut h, "the bus row", LONG, |h| h.query_by_label("Add insert bus").is_some());
+    // The list also holds this PC's real devices: bring the row into view first.
+    h.get_by_label("Add insert bus").scroll_to_me();
+    settle(&mut h);
+    h.get_by(|n| n.placeholder() == Some("Bus name")).click();
+    settle(&mut h);
+    h.get_by(|n| n.placeholder() == Some("Bus name")).type_text("Verb");
+    settle(&mut h);
+    let r = h.get_by_label("Add insert bus").rect();
+    assert!(r.min.y >= 0.0 && r.max.y <= 800.0, "the button is on screen: {r:?}");
+    h.get_by_label("Add insert bus").click();
+    pump_until(&mut h, "the bus slot", LONG, |_| slots(&mut client(&d)).iter().any(|s| s.is_bus() && s.name == "Verb"));
+    pump_until(&mut h, "the notification", LONG, |h| h.query_by_label_contains("Added insert bus Verb").is_some());
+    let bus = slots(&mut c).into_iter().find(|s| s.is_bus()).unwrap();
+
+    let send = "VASIO 1 in 1 → Verb send 1";
+    pump_until(&mut h, "the send cell", LONG, |h| h.query_by_role_and_label(Role::Button, send).is_some());
+    h.get_by_role_and_label(Role::Button, send).click();
+    pump_until(&mut h, "the send route", LONG, |_| engine_points(&mut c).contains(&(i, bus.first_output)));
+    std::thread::sleep(Duration::from_millis(600)); // not a double-click
+    settle(&mut h);
+    let looped = "Verb return 1 → Verb send 1";
+    h.get_by_role_and_label(Role::Button, looped).click();
+    pump_until(&mut h, "the loop error", LONG, |h| h.query_by_label_contains("back into itself").is_some());
+    pump_until(&mut h, "no loop route", LONG, |h| h.state().point(bus.first_input, bus.first_output).is_none());
+    assert!(!engine_points(&mut c).contains(&(bus.first_input, bus.first_output)));
+    c.call(Command::Shutdown).unwrap();
+}

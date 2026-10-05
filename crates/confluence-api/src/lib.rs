@@ -53,6 +53,16 @@ pub enum Command {
     Subscribe,
     /// Engine status (rate, block, load, xruns, master).
     Status,
+    /// Creates an insert bus of `channels` channels: send columns that feed
+    /// it and return rows that carry its output, in the same block. The
+    /// placement fields restore a saved layout (clients pass `None`).
+    /// Replies `Added`. Remove it with `RemoveSlot`.
+    AddBus {
+        name: String,
+        channels: u32,
+        first_input: Option<u32>,
+        first_output: Option<u32>,
+    },
 }
 
 impl Command {
@@ -93,6 +103,16 @@ pub struct SlotState {
     /// First global output channel and count (0 if the slot has no outputs).
     pub first_output: u32,
     pub outputs: u32,
+}
+
+/// The `device` of an insert bus slot.
+pub const BUS_DEVICE: &str = "bus";
+
+impl SlotState {
+    /// True for an insert bus (its inputs are the bus returns, its outputs the sends).
+    pub fn is_bus(&self) -> bool {
+        self.device == BUS_DEVICE
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -340,6 +360,34 @@ pub fn read_envelope_since<R: Read, T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_bus_round_trips_and_older_variants_keep_their_index() {
+        let cmd = Command::AddBus { name: "Reverb".into(), channels: 2, first_input: Some(4), first_output: None };
+        let bytes = postcard::to_allocvec(&cmd).unwrap();
+        assert_eq!(postcard::from_bytes::<Command>(&bytes).unwrap(), cmd);
+        // Older variants keep their index (Status is 10) and AddBus comes after
+        // them, so old journals and clients decode unchanged.
+        assert_eq!(postcard::to_allocvec(&Command::Status).unwrap(), vec![10]);
+        assert_eq!(bytes[0], 11);
+    }
+
+    #[test]
+    fn a_bus_slot_is_recognised_by_its_device() {
+        let s = SlotState {
+            id: 1,
+            name: "Reverb".into(),
+            device: BUS_DEVICE.into(),
+            role: ClockRole::Strict,
+            online: true,
+            first_input: 0,
+            inputs: 2,
+            first_output: 0,
+            outputs: 2,
+        };
+        assert!(s.is_bus());
+        assert!(!SlotState { device: "vasio:1".into(), ..s }.is_bus());
+    }
 
     #[test]
     fn envelope_round_trips_through_frames() {

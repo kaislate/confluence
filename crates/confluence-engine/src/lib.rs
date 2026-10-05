@@ -18,8 +18,8 @@ pub mod sim;
 #[cfg(windows)]
 pub use confluence_rt as rt;
 
-pub use audio::{AudioEngine, StrictSide};
+pub use audio::{AudioEngine, StrictSide, MAX_BUSES};
 pub use engine::{
-    Engine, EngineConfig, EngineError, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec, StrictSlotSpec,
-    StrictStats,
+    BusSpec, Engine, EngineConfig, EngineError, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec,
+    StrictSlotSpec, StrictStats,
 };

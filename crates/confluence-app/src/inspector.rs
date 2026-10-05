@@ -132,6 +132,10 @@ fn slot_panel(
         return;
     };
     ui.heading(&slot.name);
+    if slot.is_bus() {
+        bus_panel(ui, view, slot, error, actions);
+        return;
+    }
     ui.label(format!("Device: {}", if slot.device.is_empty() { "—" } else { slot.device.as_str() }));
     ui.label(format!("Role: {:?}", slot.role));
     if slot.online {
@@ -199,6 +203,26 @@ fn slot_panel(
     ui.separator();
     if ui.add(Button::new("Remove slot…")).clicked() {
         actions.push(Action::RemoveSlot(id));
+    }
+}
+
+/// An insert bus: its channels and whether its processing has faulted.
+fn bus_panel(ui: &mut egui::Ui, view: &StoreView, slot: &SlotState, error: Color32, actions: &mut Vec<Action>) {
+    ui.label(format!("Insert bus · {} channels", slot.inputs));
+    ui.label(RichText::new("No plugins: passes audio through").weak());
+    ui.label(format!(
+        "sends {} · returns {}",
+        range_text(slot.first_output, slot.outputs),
+        range_text(slot.first_input, slot.inputs)
+    ));
+    if let Some(h) = view.health.iter().find(|h| h.id == slot.id) {
+        if h.device_faults > 0 {
+            ui.label(RichText::new(format!("Processing faults {}", h.device_faults)).color(error));
+        }
+    }
+    ui.separator();
+    if ui.add(Button::new("Remove slot…")).clicked() {
+        actions.push(Action::RemoveSlot(slot.id));
     }
 }
 
