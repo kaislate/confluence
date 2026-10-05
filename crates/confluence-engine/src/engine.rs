@@ -77,6 +77,8 @@ pub enum EngineError {
     BusChannels,
     #[error("too many insert buses")]
     TooManyBuses,
+    #[error("slot {0} is not an insert bus")]
+    NotABus(u32),
 }
 
 /// Most channels an insert bus can have.
@@ -197,6 +199,8 @@ pub struct Engine {
     plan: PlanController,
     /// Buses or the routes between them changed: compile a new plan on `tick`.
     plan_dirty: bool,
+    /// Processors the audio side gave back, for their owner to dispose of.
+    returned_processors: Vec<Box<dyn Processor>>,
     blocks: Arc<AtomicU64>,
     master_ppm: Arc<AtomicU64>,
     dsp_load: Arc<AtomicU32>,
@@ -248,6 +252,7 @@ impl Engine {
             buses: 0,
             plan: plan_ctl,
             plan_dirty: false,
+            returned_processors: Vec::new(),
             blocks,
             master_ppm,
             dsp_load,
@@ -453,6 +458,8 @@ impl Engine {
             channels: ch as usize,
             processor,
             faults: faults.clone(),
+            faulted: false,
+            silent: false,
         });
         if self.to_audio.try_send(AudioMsg::AddBus(entry)).is_err() {
             self.inputs.free(first_input, ch);
@@ -474,6 +481,35 @@ impl Engine {
         let state = self.state(id, &spec.name, BUS_DEVICE, ClockRole::Strict, (first_input, ch), (first_output, ch));
         self.slots.push(SlotRecord { state, stats: SlotStats::Bus(faults) });
         Ok(id)
+    }
+
+    /// Replaces a bus's processor (`None`: a summing bus). The old one is
+    /// stopped on the audio side and comes back through
+    /// [`take_returned_processors`](Self::take_returned_processors). Clears a fault.
+    pub fn set_bus_processor(&mut self, bus: u32, processor: Option<Box<dyn Processor>>) -> Result<(), EngineError> {
+        self.check_bus(bus)?;
+        self.to_audio.try_send(AudioMsg::SetProcessor { bus, processor }).map_err(|_| EngineError::Busy)
+    }
+
+    /// A silent bus passes nothing (a plugin that could not be loaded must not
+    /// send the dry signal on).
+    pub fn set_bus_silent(&mut self, bus: u32, silent: bool) -> Result<(), EngineError> {
+        self.check_bus(bus)?;
+        self.to_audio.try_send(AudioMsg::SetSilent { bus, silent }).map_err(|_| EngineError::Busy)
+    }
+
+    /// Processors the audio side has given back since the last call (replaced,
+    /// or from removed buses). Call after `tick`.
+    pub fn take_returned_processors(&mut self) -> Vec<Box<dyn Processor>> {
+        std::mem::take(&mut self.returned_processors)
+    }
+
+    fn check_bus(&self, bus: u32) -> Result<(), EngineError> {
+        match self.slots.iter().find(|s| s.state.id == bus) {
+            Some(s) if matches!(s.stats, SlotStats::Bus(_)) => Ok(()),
+            Some(_) => Err(EngineError::NotABus(bus)),
+            None => Err(EngineError::NoSuchSlot(bus)),
+        }
     }
 
     fn bus_spans(&self) -> Vec<BusSpan> {
@@ -619,7 +655,12 @@ impl Engine {
                 Returned::Input(entry) => drop(entry),
                 Returned::Output(entry) => drop(entry),
                 Returned::Strict(entry) => drop(entry),
-                Returned::Bus(entry) => drop(entry),
+                Returned::Bus(mut entry) => {
+                    if let Some(p) = entry.processor.take() {
+                        self.returned_processors.push(p);
+                    }
+                }
+                Returned::Processor(p) => self.returned_processors.push(p),
             }
         }
     }
@@ -827,7 +868,7 @@ fn claim_maybe(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use confluence_core::processor::{BusIo, Processor};
+    use confluence_core::processor::{BusIo, ProcessError, Processor};
 
     fn small() -> (Engine, AudioEngine) {
         let mut cfg = EngineConfig::new(48_000.0, 64);
@@ -987,9 +1028,102 @@ mod tests {
 
     struct Panics;
     impl Processor for Panics {
-        fn process(&mut self, _io: BusIo<'_>) {
+        fn process(&mut self, _io: BusIo<'_>) -> Result<(), ProcessError> {
             panic!("test plugin crash");
         }
+    }
+
+    /// Counts its calls; fails the first `fail` of them; multiplies by `gain`.
+    #[derive(Default)]
+    struct Counter {
+        calls: Arc<AtomicU64>,
+        stopped: Arc<AtomicU64>,
+        fail: u64,
+        gain: f32,
+    }
+
+    impl Processor for Counter {
+        fn process(&mut self, mut io: BusIo<'_>) -> Result<(), ProcessError> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            if n < self.fail {
+                return Err(ProcessError);
+            }
+            io.passthrough();
+            for c in 0..io.channels() {
+                for x in io.ret(c) {
+                    *x *= self.gain;
+                }
+            }
+            Ok(())
+        }
+
+        fn stop(&mut self) {
+            self.stopped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_faulted_processor_is_not_called_again() {
+        let (mut e, mut a) = small();
+        let calls = Arc::new(AtomicU64::new(0));
+        let p = Counter { calls: calls.clone(), fail: 1, gain: 1.0, ..Counter::default() };
+        let b = e.add_bus_with(&bus_at("Bad", 1, 8), Some(Box::new(p))).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        for _ in 0..30 {
+            assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.0, "silent after the fault");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "never called again");
+        let Response::Health { slots, .. } = e.handle(&Command::Health) else { panic!() };
+        assert_eq!(slots.iter().find(|h| h.id == b).unwrap().device_faults, 1);
+    }
+
+    #[test]
+    fn a_new_processor_replaces_the_old_and_the_old_comes_back() {
+        let (mut e, mut a) = small();
+        let stopped = Arc::new(AtomicU64::new(0));
+        let first = Counter { stopped: stopped.clone(), fail: 1, gain: 1.0, ..Counter::default() };
+        let b = e.add_bus_with(&bus_at("Verb", 1, 8), Some(Box::new(first))).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        for _ in 0..30 {
+            block(&mut e, &mut a, 1.0, 3); // faults on the first block
+        }
+        e.set_bus_processor(b, Some(Box::new(Counter { gain: 0.5, ..Counter::default() }))).unwrap();
+        block(&mut e, &mut a, 1.0, 3);
+        assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.5, "the new processor runs: the fault was cleared");
+        let back = e.take_returned_processors();
+        assert_eq!(back.len(), 1);
+        assert_eq!(stopped.load(Ordering::Relaxed), 1, "stopped on the audio side before coming back");
+        e.set_bus_processor(b, None).unwrap();
+        block(&mut e, &mut a, 1.0, 3);
+        assert_eq!(block(&mut e, &mut a, 1.0, 3), 1.0, "no processor: a summing bus again");
+        assert_eq!(e.take_returned_processors().len(), 1);
+    }
+
+    #[test]
+    fn a_silent_bus_passes_nothing() {
+        let (mut e, mut a) = small();
+        let b = e.add_bus(&bus_at("Missing", 1, 8)).unwrap();
+        route(&mut e, 0, 8);
+        route(&mut e, 8, 3);
+        e.set_bus_silent(b, true).unwrap();
+        for _ in 0..30 {
+            assert_eq!(block(&mut e, &mut a, 1.0, 3), 0.0);
+        }
+        e.set_bus_silent(b, false).unwrap();
+        for _ in 0..30 {
+            block(&mut e, &mut a, 1.0, 3);
+        }
+        assert_eq!(block(&mut e, &mut a, 1.0, 3), 1.0);
+    }
+
+    #[test]
+    fn only_buses_take_processors() {
+        let (mut e, _a) = small();
+        let (id, _) = e.add_soft_input(&spec("in", 2)).unwrap();
+        assert_eq!(e.set_bus_processor(id, None), Err(EngineError::NotABus(id)));
+        assert_eq!(EngineError::NotABus(7).to_string(), "slot 7 is not an insert bus");
     }
 
     #[test]
@@ -1003,7 +1137,7 @@ mod tests {
         }
         let Response::Health { slots, .. } = e.handle(&Command::Health) else { panic!() };
         let h = slots.iter().find(|h| h.id == b).expect("a bus reports health");
-        assert!(h.device_faults >= 3, "{h:?}");
+        assert_eq!(h.device_faults, 1, "a fault stops the processor: one panic, not one per block ({h:?})");
     }
 
     /// A NaN gain never equals itself: it would look changed in every state
