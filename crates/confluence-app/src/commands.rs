@@ -32,6 +32,10 @@ pub enum Edit {
     SetParam { bus: u32, param: u32, value: f64 },
     ShowEditor { bus: u32 },
     HideEditor { bus: u32 },
+    SaveScene { name: String, morph_ms: u32 },
+    RecallScene { name: String },
+    DeleteScene { name: String },
+    SetSceneMorph { name: String, morph_ms: u32 },
 }
 
 /// What a merged, rate-limited edit is about.
@@ -56,6 +60,12 @@ impl Edit {
             Edit::UnloadPlugin { bus } => Command::UnloadPlugin { bus: BusRef::Id(*bus) },
             Edit::ShowEditor { bus } => Command::ShowEditor { bus: BusRef::Id(*bus) },
             Edit::HideEditor { bus } => Command::HideEditor { bus: BusRef::Id(*bus) },
+            Edit::SaveScene { name, morph_ms } => Command::SaveScene { name: name.clone(), morph_ms: *morph_ms },
+            Edit::RecallScene { name } => Command::RecallScene { name: name.clone() },
+            Edit::DeleteScene { name } => Command::DeleteScene { name: name.clone() },
+            Edit::SetSceneMorph { name, morph_ms } => {
+                Command::SetSceneMorph { name: name.clone(), morph_ms: *morph_ms }
+            }
             Edit::SetParam { bus, param, value } => {
                 Command::SetParam { bus: BusRef::Id(*bus), param: *param, value: *value }
             }
