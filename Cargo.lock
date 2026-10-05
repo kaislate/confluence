@@ -1003,6 +1003,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "confluence-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "assert_no_alloc",
+ "clack-extensions",
+ "clack-host",
+ "clack-plugin",
+ "confluence-api",
+ "confluence-core",
+ "confluence-test-plugin",
+]
+
+[[package]]
 name = "confluence-provider-asio"
 version = "0.1.0"
 dependencies = [

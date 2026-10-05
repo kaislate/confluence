@@ -10,7 +10,7 @@ rust-version = "1.95"
 [workspace.dependencies]
 clack-host = "0.2"
 clack-plugin = "0.2"
-clack-extensions = { version = "0.2", features = ["audio-ports", "params", "state", "latency"] }
+clack-extensions = { version = "0.2", features = ["audio-ports", "params", "state", "latency", "log"] }
 rubato = "=5.0.0"
 rtrb = "0.3"
 serde = { version = "1", features = ["derive"] }
