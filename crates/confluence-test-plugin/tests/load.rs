@@ -49,14 +49,14 @@ fn the_gain_plugin_applies_its_gain_and_names_its_values() {
     let mut instance = PluginInstance::<TestHost>::new(|_| Shared, |_| (), &entry, &id, &info).unwrap();
 
     let params: PluginParams = instance.plugin_handle().get_extension().unwrap();
-    let mut handle = instance.plugin_handle();
-    assert_eq!(params.count(&mut handle), 3);
+    let handle = instance.plugin_handle();
+    assert_eq!(params.count(&handle), 3);
     let mut buf = ParamInfoBuffer::new();
-    let gain = params.get_info(&mut handle, 0, &mut buf).unwrap();
+    let gain = params.get_info(&handle, 0, &mut buf).unwrap();
     assert_eq!(gain.name, b"Gain");
     assert_eq!((gain.min_value, gain.max_value, gain.default_value), (-60.0, 12.0, 0.0));
     let mut text = [0u8; 64];
-    let shown = params.value_to_text(&mut handle, PARAM_GAIN.into(), -6.0, &mut text).unwrap();
+    let shown = params.value_to_text(&handle, PARAM_GAIN.into(), -6.0, &mut text).unwrap();
     assert_eq!(shown, b"-6.0 dB");
 
     let config = PluginAudioConfiguration { sample_rate: 48_000.0, min_frames_count: 1, max_frames_count: 64 };
@@ -73,7 +73,7 @@ fn the_gain_plugin_applies_its_gain_and_names_its_values() {
     let mut output_events = OutputEvents::from_buffer(&mut out_buf);
     let ins = in_ports.with_input_buffers([AudioPortBuffer {
         latency: 0,
-        channels: AudioPortBufferType::f32_input_only(input.iter_mut().map(|b| InputChannel::variable(b))),
+        channels: AudioPortBufferType::f32_input_only(input.iter_mut().map(InputChannel::variable)),
     }]);
     let mut outs = out_ports.with_output_buffers([AudioPortBuffer {
         latency: 0,
