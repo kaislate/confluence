@@ -331,13 +331,15 @@ impl Engine {
 
     /// Registers the master slot: the device whose callback will copy its inputs
     /// into, and its outputs out of, the returned channel ranges around
-    /// `AudioEngine::process_master_block`.
+    /// `AudioEngine::process_master_block`. A saved placement that is now
+    /// taken (by a bus, or because the driver reports more channels) gives way
+    /// to first fit: the engine must start.
     pub fn add_master_slot(&mut self, spec: &MasterSlotSpec) -> Result<(u32, MasterChannels), EngineError> {
         if self.slots.iter().any(|s| s.state.role == ClockRole::Master) {
             return Err(EngineError::MasterExists);
         }
-        let first_input = claim_maybe(&mut self.inputs, spec.first_input, spec.inputs as u32, "input")?;
-        let first_output = match claim_maybe(&mut self.outputs, spec.first_output, spec.outputs as u32, "output") {
+        let first_input = claim_or_fit(&mut self.inputs, spec.first_input, spec.inputs as u32, "input")?;
+        let first_output = match claim_or_fit(&mut self.outputs, spec.first_output, spec.outputs as u32, "output") {
             Ok(f) => f,
             Err(e) => {
                 self.inputs.free(first_input, spec.inputs as u32);
@@ -805,6 +807,14 @@ fn claim(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'static str
     }
 }
 
+/// As [`claim_maybe`], but a placement that is taken falls back to first fit.
+fn claim_or_fit(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'static str) -> Result<u32, EngineError> {
+    match claim_maybe(a, at, len, what) {
+        Err(EngineError::ChannelsTaken(..)) => claim_maybe(a, None, len, what),
+        other => other,
+    }
+}
+
 /// As [`claim`], but a zero-length request succeeds and reserves nothing.
 fn claim_maybe(a: &mut ChannelAllocator, at: Option<u32>, len: u32, what: &'static str) -> Result<u32, EngineError> {
     if len == 0 {
@@ -844,6 +854,26 @@ mod tests {
         a.inputs_mut().channel_mut(0).fill(x);
         a.process_block(0.0);
         a.outputs().channel(o)[0]
+    }
+
+    /// The journal replays buses before the ASIO master is placed. A master
+    /// whose saved placement now overlaps a bus (its driver reports more
+    /// channels than last time) must still start, elsewhere, not fail the
+    /// engine on every restart.
+    #[test]
+    fn a_master_whose_saved_place_is_taken_by_a_bus_still_starts() {
+        let (mut e, _a) = Engine::new(EngineConfig::new(48_000.0, 64));
+        e.add_bus(&bus_at("Verb", 2, 8)).unwrap();
+        let spec = MasterSlotSpec { first_input: Some(0), first_output: Some(0), ..master(10, 10) };
+        let (_, ch) = e.add_master_slot(&spec).expect("the master starts");
+        assert_eq!((ch.inputs, ch.outputs), (10, 10));
+        let overlaps = |first: usize, n: usize| first < 10 && 8 < first + n;
+        assert!(!overlaps(ch.first_input, ch.inputs) && !overlaps(ch.first_output, ch.outputs), "{ch:?}");
+        // A placement that fits is still honoured.
+        let (mut e, _a) = small();
+        let spec = MasterSlotSpec { first_input: Some(2), first_output: Some(3), ..master(2, 2) };
+        let (_, ch) = e.add_master_slot(&spec).unwrap();
+        assert_eq!((ch.first_input, ch.first_output), (2, 3));
     }
 
     #[test]
