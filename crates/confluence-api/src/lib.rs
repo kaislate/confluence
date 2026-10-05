@@ -153,6 +153,32 @@ pub enum Command {
 
 /// Largest script source accepted.
 pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+/// Largest total of all scripts' sources (state must fit a message).
+pub const MAX_SCRIPTS_BYTES: usize = 512 * 1024;
+/// Longest script name, in characters.
+pub const MAX_SCRIPT_NAME: usize = 64;
+
+/// Why a script can't be stored, if it can't: `others` is the size of every
+/// other script (not one it replaces).
+pub fn script_problem(name: &str, source: &str, others: usize) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Some("a script needs a name".into());
+    }
+    if name.chars().count() > MAX_SCRIPT_NAME {
+        return Some(format!("script names are at most {MAX_SCRIPT_NAME} characters"));
+    }
+    if name.chars().any(char::is_control) {
+        return Some("script names are one line of text".into());
+    }
+    if source.len() > MAX_SCRIPT_BYTES {
+        return Some("scripts are at most 256 KB".into());
+    }
+    if others + source.len() > MAX_SCRIPTS_BYTES {
+        return Some("all scripts together are at most 512 KB".into());
+    }
+    None
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScriptStatus {
@@ -766,5 +792,27 @@ mod tests {
         write_frame(&mut wire, &Envelope::new(1, Command::ListSlots)).unwrap();
         wire.truncate(wire.len() - 1);
         assert!(read_frame::<_, Envelope<Command>>(&mut &wire[..]).is_err());
+    }
+
+    #[test]
+    fn scripts_are_checked_against_the_limits() {
+        assert_eq!(script_problem("a", "", 0), None);
+        assert_eq!(script_problem(" ", "", 0), Some("a script needs a name".into()));
+        assert_eq!(script_problem(&"n".repeat(65), "", 0), Some("script names are at most 64 characters".into()));
+        assert_eq!(
+            script_problem(
+                "a
+b", "", 0
+            ),
+            Some("script names are one line of text".into())
+        );
+        let big = "-".repeat(MAX_SCRIPT_BYTES + 1);
+        assert_eq!(script_problem("a", &big, 0), Some("scripts are at most 256 KB".into()));
+        let half = "-".repeat(MAX_SCRIPT_BYTES / 2);
+        assert_eq!(script_problem("a", &half, MAX_SCRIPTS_BYTES - half.len()), None);
+        assert_eq!(
+            script_problem("a", &half, MAX_SCRIPTS_BYTES - half.len() + 1),
+            Some("all scripts together are at most 512 KB".into())
+        );
     }
 }

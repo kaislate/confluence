@@ -46,6 +46,17 @@ fn status_word(s: &ScriptStatus) -> &'static str {
     }
 }
 
+/// Why the editor's script can't be saved, if it can't. A rename must not
+/// overwrite another script, and must not delete the old one for a script
+/// the engine would refuse.
+fn save_problem(state: &State, opened: Option<&str>, name: &str, source: &str) -> Option<String> {
+    if opened != Some(name) && state.scripts.iter().any(|s| s.name == name) {
+        return Some(format!("A script named {name} already exists"));
+    }
+    let others = state.scripts.iter().filter(|s| Some(s.name.as_str()) != opened && s.name != name);
+    confluence_api::script_problem(name, source, others.map(|s| s.source.len()).sum())
+}
+
 /// Draws the window's contents; returns what the user asked for.
 pub fn show(ui: &mut egui::Ui, state: &State, w: &mut ScriptsUi, editable: bool) -> Vec<Edit> {
     let mut edits = Vec::new();
@@ -92,9 +103,14 @@ pub fn show(ui: &mut egui::Ui, state: &State, w: &mut ScriptsUi, editable: bool)
             ui.label("Name");
             ui.add(TextEdit::singleline(&mut w.name).desired_width(160.0));
             let name = w.name.trim().to_string();
-            let save = ui.add_enabled(!name.is_empty(), egui::Button::new("Save"));
-            save.widget_info(|| WidgetInfo::labeled(WidgetType::Button, !name.is_empty(), "Save script"));
-            if save.clicked() {
+            let problem = save_problem(state, w.opened.as_deref(), &name, &w.source);
+            let ok = problem.is_none();
+            let save = ui.add_enabled(ok, egui::Button::new("Save"));
+            save.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ok, "Save script"));
+            if let Some(p) = &problem {
+                ui.colored_label(ui.visuals().warn_fg_color, p);
+            }
+            if save.clicked() && ok {
                 let enabled = saved.is_none_or(|s| s.enabled);
                 edits.push(Edit::SetScript { name: name.clone(), source: w.source.clone(), enabled });
                 if let Some(old) = w.opened.as_ref().filter(|old| **old != name) {
@@ -245,5 +261,35 @@ mod tests {
                 Edit::DeleteScript { name: "old".into() },
             ]
         );
+    }
+
+    #[test]
+    fn a_rename_onto_another_script_is_refused() {
+        let mut h =
+            harness(state(vec![info("a", true, ScriptStatus::Running), info("b", true, ScriptStatus::Running)]));
+        h.run();
+        h.get_by_label("Open a").click();
+        h.run();
+        h.state_mut().0.name = "b".into();
+        h.run();
+        assert!(h.query_by_label_contains("A script named b already exists").is_some());
+        h.get_by_label("Save script").click();
+        h.run();
+        assert!(h.state().1.is_empty(), "nothing sent: b is not overwritten, a not deleted");
+    }
+
+    #[test]
+    fn a_script_too_big_is_not_sent() {
+        let mut h = harness(state(vec![info("a", true, ScriptStatus::Running)]));
+        h.run();
+        h.get_by_label("Open a").click();
+        h.run();
+        h.state_mut().0.name = "renamed".into();
+        h.state_mut().0.source = "-".repeat(confluence_api::MAX_SCRIPT_BYTES + 1);
+        h.run();
+        assert!(h.query_by_label_contains("at most 256 KB").is_some());
+        h.get_by_label("Save script").click();
+        h.run();
+        assert!(h.state().1.is_empty(), "the original is not deleted");
     }
 }

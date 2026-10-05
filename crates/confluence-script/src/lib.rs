@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub use confluence_api::{ScriptInfo, ScriptStatus, MAX_SCRIPT_BYTES};
+pub use confluence_api::{ScriptInfo, ScriptStatus, MAX_SCRIPTS_BYTES, MAX_SCRIPT_BYTES};
 use mlua::{Function, Lua, Table, Value, VmState};
 
 /// Memory a script may use.
@@ -16,6 +16,10 @@ pub const MEMORY_LIMIT: usize = 16 << 20;
 pub const CALL_BUDGET: Duration = Duration::from_millis(20);
 /// Log lines kept per script.
 pub const LOG_LINES: usize = 50;
+/// Longest log line kept, in bytes (longer ones are cut, with "…").
+pub const LOG_LINE_BYTES: usize = 1024;
+/// Time a script may use in any second, summed over its calls.
+pub const BUSY_BUDGET: Duration = Duration::from_millis(100);
 
 /// A MIDI message as scripts receive it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +38,15 @@ pub trait Routes {
 
 type Log = Arc<Mutex<VecDeque<String>>>;
 
-fn push_log(log: &Log, line: String) {
+fn push_log(log: &Log, mut line: String) {
+    if line.len() > LOG_LINE_BYTES {
+        let mut end = LOG_LINE_BYTES;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+        line.push('…');
+    }
     if let Ok(mut l) = log.lock() {
         if l.len() == LOG_LINES {
             l.pop_front();
@@ -52,6 +64,9 @@ struct Script {
     /// When the current call must stop: nanoseconds after `epoch`.
     deadline: Arc<AtomicU64>,
     epoch: Instant,
+    /// Time used since `window` began (reset each second).
+    used: Duration,
+    window: Instant,
 }
 
 impl Script {
@@ -128,11 +143,9 @@ impl ScriptHost {
     /// Stores a script (replacing one with that name); starts it if enabled.
     pub fn set(&mut self, name: &str, source: &str, enabled: bool) -> Result<(), String> {
         let name = name.trim();
-        if name.is_empty() {
-            return Err("a script needs a name".into());
-        }
-        if source.len() > MAX_SCRIPT_BYTES {
-            return Err("scripts are at most 256 KB".into());
+        let others: usize = self.scripts.iter().filter(|(n, _)| *n != name).map(|(_, s)| s.source.len()).sum();
+        if let Some(problem) = confluence_api::script_problem(name, source, others) {
+            return Err(problem);
         }
         let log = self.scripts.get(name).map(|s| s.log.clone()).unwrap_or_default();
         let mut s = Script {
@@ -143,6 +156,8 @@ impl ScriptHost {
             lua: None,
             deadline: Arc::new(AtomicU64::new(0)),
             epoch: Instant::now(),
+            used: Duration::ZERO,
+            window: Instant::now(),
         };
         if enabled {
             s.start();
@@ -176,9 +191,16 @@ impl ScriptHost {
         for s in self.scripts.values_mut() {
             let Some(lua) = &s.lua else { continue };
             s.arm();
+            let started = Instant::now();
             let r = call_on_midi(lua, msg, &routes);
+            if started.duration_since(s.window) >= Duration::from_secs(1) {
+                (s.window, s.used) = (started, Duration::ZERO);
+            }
+            s.used += started.elapsed();
             if let Err(e) = r {
                 s.stop(e.to_string());
+            } else if s.used > BUSY_BUDGET {
+                s.stop(format!("the script used more than {} ms of a second", BUSY_BUDGET.as_millis()));
             }
         }
     }
@@ -355,6 +377,44 @@ mod tests {
     }
 
     #[test]
+    fn long_log_lines_are_cut() {
+        let mut h = ScriptHost::new();
+        h.set("big", "function on_midi(m) print(string.rep('x', 100000)) end", true).unwrap();
+        h.on_midi(&cc(1, 1), &mut Map::default());
+        let line = &h.infos()[0].log[0];
+        assert!(line.len() <= LOG_LINE_BYTES + 3 && line.ends_with('…'), "{}", line.len());
+        assert_eq!(status(&h, "big"), ScriptStatus::Running);
+    }
+
+    #[test]
+    fn a_script_that_keeps_the_engine_busy_is_stopped() {
+        let mut h = ScriptHost::new();
+        let busy = "function on_midi(m) local t = os.clock() while os.clock() - t < 0.015 do end end";
+        h.set("busy", busy, true).unwrap();
+        h.set("light", "function on_midi(m) end", true).unwrap();
+        for _ in 0..12 {
+            h.on_midi(&cc(1, 1), &mut Map::default());
+        }
+        assert!(
+            matches!(status(&h, "busy"), ScriptStatus::Stopped(why) if why.contains("100 ms")),
+            "{:?}",
+            status(&h, "busy")
+        );
+        assert_eq!(status(&h, "light"), ScriptStatus::Running);
+    }
+
+    #[test]
+    fn all_scripts_together_have_a_size_limit() {
+        let mut h = ScriptHost::new();
+        let third = "-".repeat(MAX_SCRIPTS_BYTES / 3 + 1);
+        h.set("a", &third, true).unwrap();
+        h.set("b", &third, true).unwrap();
+        assert_eq!(h.set("c", &third, true), Err("all scripts together are at most 512 KB".into()));
+        h.set("b", "-- smaller", true).expect("replacing one counts its new size only");
+        h.set("c", &third, true).unwrap();
+    }
+
+    #[test]
     fn a_disabled_script_is_not_run() {
         let mut h = ScriptHost::new();
         h.set("off", "function on_midi(m) confluence.set_route(0, 1, 0) end", false).unwrap();
@@ -405,6 +465,7 @@ mod tests {
     fn names_and_sizes_are_checked() {
         let mut h = ScriptHost::new();
         assert_eq!(h.set("  ", "", true), Err("a script needs a name".into()));
+        assert_eq!(h.set(&"n".repeat(65), "", true), Err("script names are at most 64 characters".into()));
         let big = "-".repeat(confluence_api::MAX_SCRIPT_BYTES + 1);
         assert_eq!(h.set("big", &big, true), Err("scripts are at most 256 KB".into()));
         assert_eq!(h.delete("nope"), Err("no script named nope".into()));
