@@ -11,6 +11,7 @@ pub mod engine;
 #[cfg(windows)]
 pub mod ipc;
 pub mod journal;
+pub mod midi;
 #[cfg(windows)]
 pub mod plugins;
 #[cfg(windows)]

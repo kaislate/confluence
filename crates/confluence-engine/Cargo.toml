@@ -23,6 +23,8 @@ confluence-provider-vasio = { path = "../confluence-provider-vasio" }
 confluence-provider-vaio = { path = "../confluence-provider-vaio" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Media_Audio",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
