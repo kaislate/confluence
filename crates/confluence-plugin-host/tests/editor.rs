@@ -150,3 +150,28 @@ fn a_flooding_editor_does_not_starve_the_plugin_thread() {
     link.hide_editor();
     assert!(window(title).is_none(), "the flooding editor could still be closed");
 }
+
+/// Right after the host set a parameter, a different value from the plugin
+/// is the user's change in its editor, not an echo.
+#[test]
+fn an_editor_change_right_after_a_host_change_is_kept() {
+    let t = PluginThread::start().unwrap();
+    let (mut link, mut p) = load(&t, GAIN_ID);
+    let title = "Confluence Test Gain — right after";
+    link.show_editor(title).unwrap();
+    let sends = PlanarBuffer::new(2, 64);
+    let mut returns = PlanarBuffer::new(2, 64);
+    link.set_param(PARAM_GAIN, -3.0).unwrap();
+    p.process(BusIo::new(&sends, 0, &mut returns, 0, 2)).unwrap(); // the plugin takes −3
+    let w = window(title).unwrap();
+    // SAFETY: lookup, then a click on the plugin's own window, well within the echo window.
+    let child = unsafe { FindWindowExW(Some(w), None, w!("ConfluenceTestGainEditor"), None) }.unwrap();
+    unsafe { SendMessageW(child, WM_LBUTTONDOWN, Some(WPARAM(0)), Some(LPARAM(0))) };
+    p.process(BusIo::new(&sends, 0, &mut returns, 0, 2)).unwrap();
+    wait_for("the editor's change", || {
+        link.poll();
+        link.params()[0].value == -12.0
+    });
+    assert_eq!(link.take_edited(), vec![(PARAM_GAIN, -12.0)]);
+    link.hide_editor();
+}

@@ -27,6 +27,8 @@ struct ParamGlide {
     param: u32,
     from: f64,
     to: f64,
+    /// The last value the plugin accepted: a value is sent only when it moves.
+    sent: f64,
 }
 
 struct Morph {
@@ -56,6 +58,24 @@ impl Scenes {
         if let Some(m) = &mut self.morph {
             m.routes.retain(|g| (g.input, g.output) != (input, output));
         }
+        self.current = None;
+    }
+
+    /// Whether a morph is moving this parameter.
+    pub(super) fn is_gliding(&self, bus: u32, param: u32) -> bool {
+        self.morph.as_ref().is_some_and(|m| m.params.iter().any(|g| (g.bus, g.param) == (bus, param)))
+    }
+
+    /// The bus's plugin was replaced, unloaded or given a new state: the
+    /// morph no longer moves its parameters.
+    pub(super) fn bus_changed(&mut self, bus: u32) {
+        if let Some(m) = &mut self.morph {
+            m.params.retain(|g| g.bus != bus);
+        }
+    }
+
+    /// The mix changed by other means than a recall.
+    pub(super) fn mix_changed(&mut self) {
         self.current = None;
     }
 
@@ -165,9 +185,36 @@ impl Engine {
     /// at once if `instant` (start-up replay) or its morph time is 0.
     pub fn recall_scene_at(&mut self, name: &str, now: Instant, instant: bool) -> Result<(), EngineError> {
         let scene = self.scene(name).cloned().ok_or_else(|| EngineError::NoScene(name.into()))?;
+        // What a running morph was moving and this scene does not cover is
+        // finished at once, not left part-way.
+        if let Some(old) = self.scenes.morph.take() {
+            for g in old.routes {
+                let covered = scene.points.iter().any(|p| (p.input, p.output) == (g.input, g.output));
+                if !covered && self.matrix.point(g.input, g.output).is_some() {
+                    let end = PointParams { gain_db: g.to_db, mute: g.to_mute, invert: g.invert };
+                    let _ = self.matrix.set_point(g.input, g.output, end);
+                }
+            }
+            for g in old.params {
+                let at = self.slots.iter().find(|s| s.state.id == g.bus).map(|s| s.state.first_output);
+                let covered = scene.params.iter().any(|sp| Some(sp.bus_at) == at && sp.param == g.param);
+                if !covered {
+                    if let Some(BusPlugin::Loaded { control, .. }) = self.plugins.get_mut(&g.bus) {
+                        let _ = control.set_param(g.param, g.to);
+                    }
+                }
+            }
+        }
+        // Editor changes waiting to be saved are superseded by the recall.
+        for sp in &scene.params {
+            self.edits_held.remove(&(sp.bus_at, sp.param));
+        }
         let mut routes = Vec::new();
         for p in &scene.points {
             let Some(cur) = self.matrix.point(p.input, p.output) else { continue };
+            if (cur.gain_db, cur.mute, cur.invert) == (p.gain_db, p.mute, p.invert) {
+                continue; // already there
+            }
             let from_db = if cur.mute { SILENT_DB } else { cur.gain_db.max(SILENT_DB) };
             if cur.mute || cur.invert != p.invert {
                 // Unmute at silence (it glides up from there); phase switches now.
@@ -188,10 +235,13 @@ impl Engine {
             let Ok(bus) = self.resolve_bus(&BusRef::At(sp.bus_at)) else { continue };
             let Some(BusPlugin::Loaded { control, .. }) = self.plugins.get_mut(&bus) else { continue };
             let Some(q) = control.params().into_iter().find(|q| q.id == sp.param && !q.read_only) else { continue };
+            if q.value == sp.value {
+                continue; // already there
+            }
             if q.stepped {
                 let _ = control.set_param(sp.param, sp.value);
             } else {
-                params.push(ParamGlide { bus, param: sp.param, from: q.value, to: sp.value });
+                params.push(ParamGlide { bus, param: sp.param, from: q.value, to: sp.value, sent: q.value });
             }
         }
         let duration = if instant { Duration::ZERO } else { Duration::from_millis(u64::from(scene.morph_ms)) };
@@ -203,7 +253,16 @@ impl Engine {
 
     /// Moves the running morph to where it should be at `now`.
     pub fn advance_morph(&mut self, now: Instant) {
-        let Some(m) = &self.scenes.morph else { return };
+        if self.scenes.morph.is_none() {
+            return;
+        }
+        // Changes made in a plugin's own editor stop that parameter's glide.
+        self.collect_plugin_edits();
+        let Some(m) = &mut self.scenes.morph else { return };
+        // A route removed meanwhile (by the user, a slot removal, a new bus)
+        // stays removed.
+        let matrix = &self.matrix;
+        m.routes.retain(|g| matrix.point(g.input, g.output).is_some());
         let t = if m.duration.is_zero() {
             1.0
         } else {
@@ -219,12 +278,20 @@ impl Engine {
             };
             let _ = self.matrix.set_point(g.input, g.output, p);
         }
-        for g in &m.params {
-            if let Some(BusPlugin::Loaded { control, .. }) = self.plugins.get_mut(&g.bus) {
-                let _ = control.set_param(g.param, g.from + (g.to - g.from) * t);
+        let mut unsent = false;
+        for g in &mut m.params {
+            let Some(BusPlugin::Loaded { control, .. }) = self.plugins.get_mut(&g.bus) else { continue };
+            let v = if t >= 1.0 { g.to } else { g.from + (g.to - g.from) * t };
+            if v != g.sent {
+                match control.set_param(g.param, v) {
+                    Ok(()) => g.sent = v,
+                    Err(_) => unsent = true,
+                }
             }
+            unsent |= g.sent != g.to && t >= 1.0;
         }
-        if t >= 1.0 {
+        // Done once every final value went through (a full queue: next tick).
+        if t >= 1.0 && !unsent {
             self.scenes.morph = None;
         }
     }
