@@ -40,6 +40,12 @@ pub fn diff(old: &State, new: &State) -> Vec<Change> {
     if old.scenes != new.scenes || old.current_scene != new.current_scene || old.morphing != new.morphing {
         out.push(Change::ScenesChanged(new.scenes.clone(), new.current_scene.clone(), new.morphing));
     }
+    if old.midi_inputs != new.midi_inputs
+        || old.midi_bindings != new.midi_bindings
+        || old.midi_learning != new.midi_learning
+    {
+        out.push(Change::MidiChanged(new.midi_inputs.clone(), new.midi_bindings.clone(), new.midi_learning));
+    }
     if old.plugins != new.plugins || old.bad_plugins != new.bad_plugins {
         out.push(Change::PluginsChanged(new.plugins.clone(), new.bad_plugins.clone()));
     }
@@ -106,6 +112,11 @@ impl State {
                     self.scenes = scenes.clone();
                     self.current_scene = current.clone();
                     self.morphing = *morphing;
+                }
+                Change::MidiChanged(inputs, bindings, learning) => {
+                    self.midi_inputs = inputs.clone();
+                    self.midi_bindings = bindings.clone();
+                    self.midi_learning = *learning;
                 }
                 Change::PluginsChanged(found, bad) => {
                     self.plugins = found.clone();
@@ -178,6 +189,9 @@ mod tests {
             scenes: Vec::new(),
             current_scene: None,
             morphing: false,
+            midi_inputs: Vec::new(),
+            midi_bindings: Vec::new(),
+            midi_learning: None,
         }
     }
 
@@ -208,6 +222,21 @@ mod tests {
                 read_only: false,
             }],
         }
+    }
+
+    #[test]
+    fn midi_changes_are_found_and_applied() {
+        let a = state(vec![slot(1, true)], vec![]);
+        let mut b = a.clone();
+        b.midi_inputs = vec!["nanoKONTROL2".into()];
+        b.midi_bindings =
+            vec![crate::MidiBinding { device: "nanoKONTROL2".into(), channel: 1, cc: 7, input: 0, output: 0 }];
+        b.midi_learning = Some((0, 1));
+        let changes = diff(&a, &b);
+        assert_eq!(changes, vec![Change::MidiChanged(b.midi_inputs.clone(), b.midi_bindings.clone(), Some((0, 1)))]);
+        let mut applied = a.clone();
+        applied.apply(&changes);
+        assert_eq!(applied, b);
     }
 
     #[test]

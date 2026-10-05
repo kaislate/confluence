@@ -70,6 +70,16 @@ enum Cmd {
     RecallScene { name: String },
     /// Delete scene NAME.
     DeleteScene { name: String },
+    /// Show MIDI inputs and bindings.
+    Midi,
+    /// The next CC that arrives binds to the gain of route IN → OUT.
+    LearnMidi { input: u32, output: u32 },
+    /// Handle a MIDI message as if DEVICE sent it (bytes in decimal or 0x hex).
+    InjectMidi {
+        device: String,
+        #[arg(value_parser = parse_byte, num_args = 1..=3)]
+        bytes: Vec<u8>,
+    },
     /// Set parameter PARAM of the plugin on insert bus BUS.
     SetParam {
         bus: u32,
@@ -135,12 +145,45 @@ impl Cmd {
             }
             Cmd::RecallScene { ref name } => Command::RecallScene { name: name.clone() },
             Cmd::DeleteScene { ref name } => Command::DeleteScene { name: name.clone() },
+            Cmd::Midi => Command::Subscribe,
+            Cmd::LearnMidi { input, output } => Command::LearnMidi { input, output },
+            Cmd::InjectMidi { ref device, ref bytes } => {
+                Command::InjectMidi { device: device.clone(), bytes: bytes.clone() }
+            }
             Cmd::HideEditor { bus } => Command::HideEditor { bus: BusRef::Id(bus) },
             Cmd::SetParam { bus, param, value } => Command::SetParam { bus: BusRef::Id(bus), param, value },
             Cmd::Status => Command::Status,
             Cmd::Watch => Command::Subscribe,
         }
     }
+}
+
+/// MIDI inputs, bindings and learn, from a state snapshot.
+fn render_midi(s: &confluence_api::State) -> String {
+    let mut lines = vec![if s.midi_inputs.is_empty() {
+        "MIDI inputs: none".to_string()
+    } else {
+        format!("MIDI inputs: {}", s.midi_inputs.join(", "))
+    }];
+    if s.midi_bindings.is_empty() {
+        lines.push("no bindings".into());
+    }
+    for b in &s.midi_bindings {
+        lines.push(format!("CC {} ch {} {} -> in {} out {}", b.cc, b.channel, b.device, b.input, b.output));
+    }
+    if let Some((i, o)) = s.midi_learning {
+        lines.push(format!("learning: in {i} -> out {o}"));
+    }
+    lines.join("\n")
+}
+
+/// A byte given as decimal or `0x` hex.
+fn parse_byte(s: &str) -> Result<u8, String> {
+    let r = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u8::from_str_radix(hex, 16),
+        None => s.parse(),
+    };
+    r.map_err(|e| format!("{s}: {e}"))
 }
 
 fn render(resp: &Response) -> String {
@@ -254,6 +297,10 @@ fn main() -> ExitCode {
         }
     };
     match client.call(cli.command.to_command()) {
+        Ok(Response::Snapshot(s)) if matches!(cli.command, Cmd::Midi) => {
+            println!("{}", render_midi(&s));
+            ExitCode::SUCCESS
+        }
         Ok(resp) => {
             println!("{}", render(&resp));
             if matches!(resp, Response::Error(_)) {
@@ -303,6 +350,12 @@ fn render_change(c: &Change) -> String {
         }
         Change::BusPluginSet(p) => format!("bus #{}: {} {:?}", p.bus, p.info.name, p.status),
         Change::BusPluginRemoved { bus } => format!("bus #{bus}: plugin removed"),
+        Change::MidiChanged(inputs, bindings, learning) => format!(
+            "MIDI: {} inputs, {} bindings{}",
+            inputs.len(),
+            bindings.len(),
+            learning.map(|(i, o)| format!(", learning {i} -> {o}")).unwrap_or_default()
+        ),
         Change::ScenesChanged(s, current, morphing) => format!(
             "{} scenes, current: {}{}",
             s.len(),
@@ -424,6 +477,45 @@ v7  slot #3 removed"
     }
 
     #[test]
+    fn midi_state_is_shown() {
+        let mut st = confluence_api::State {
+            version: 3,
+            status: EngineStatus {
+                master: "internal".into(),
+                sample_rate: 48_000.0,
+                block: 256,
+                blocks: 0,
+                dsp_load: 0.0,
+                xruns: 0,
+            },
+            slots: Vec::new(),
+            points: Vec::new(),
+            devices: Vec::new(),
+            notices: Vec::new(),
+            plugins: Vec::new(),
+            bad_plugins: Vec::new(),
+            bus_plugins: Vec::new(),
+            scenes: Vec::new(),
+            current_scene: None,
+            morphing: false,
+            midi_inputs: vec!["nanoKONTROL2".into()],
+            midi_bindings: vec![confluence_api::MidiBinding {
+                device: "nanoKONTROL2".into(),
+                channel: 1,
+                cc: 7,
+                input: 3,
+                output: 4,
+            }],
+            midi_learning: None,
+        };
+        let text = render_midi(&st);
+        assert!(text.contains("nanoKONTROL2"), "{text}");
+        assert!(text.contains("CC 7 ch 1 nanoKONTROL2 -> in 3 out 4"), "{text}");
+        st.midi_learning = Some((3, 4));
+        assert!(render_midi(&st).contains("learning: in 3 -> out 4"));
+    }
+
+    #[test]
     fn plugin_commands_parse() {
         let parse = |args: &[&str]| {
             let mut all = vec!["confluence-cli"];
@@ -445,6 +537,11 @@ v7  slot #3 removed"
         );
         assert_eq!(parse(&["recall-scene", "Verse"]), Command::RecallScene { name: "Verse".into() });
         assert_eq!(parse(&["delete-scene", "Verse"]), Command::DeleteScene { name: "Verse".into() });
+        assert_eq!(parse(&["learn-midi", "1", "2"]), Command::LearnMidi { input: 1, output: 2 });
+        assert_eq!(
+            parse(&["inject-midi", "nanoKONTROL2", "0xB0", "7", "100"]),
+            Command::InjectMidi { device: "nanoKONTROL2".into(), bytes: vec![0xB0, 7, 100] }
+        );
         assert_eq!(parse(&["hide-editor", "4"]), Command::HideEditor { bus: BusRef::Id(4) });
         assert_eq!(
             parse(&["set-param", "4", "1", "-6.5"]),

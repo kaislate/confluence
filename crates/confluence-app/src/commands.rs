@@ -36,6 +36,9 @@ pub enum Edit {
     RecallScene { name: String },
     DeleteScene { name: String },
     SetSceneMorph { name: String, morph_ms: u32 },
+    LearnMidi { input: u32, output: u32 },
+    CancelMidiLearn,
+    RemoveMidiBinding { device: String, channel: u8, cc: u8 },
 }
 
 /// What a merged, rate-limited edit is about.
@@ -62,6 +65,11 @@ impl Edit {
             Edit::HideEditor { bus } => Command::HideEditor { bus: BusRef::Id(*bus) },
             Edit::SaveScene { name, morph_ms } => Command::SaveScene { name: name.clone(), morph_ms: *morph_ms },
             Edit::RecallScene { name } => Command::RecallScene { name: name.clone() },
+            Edit::LearnMidi { input, output } => Command::LearnMidi { input: *input, output: *output },
+            Edit::CancelMidiLearn => Command::CancelMidiLearn,
+            Edit::RemoveMidiBinding { device, channel, cc } => {
+                Command::RemoveMidiBinding { device: device.clone(), channel: *channel, cc: *cc }
+            }
             Edit::DeleteScene { name } => Command::DeleteScene { name: name.clone() },
             Edit::SetSceneMorph { name, morph_ms } => {
                 Command::SetSceneMorph { name: name.clone(), morph_ms: *morph_ms }

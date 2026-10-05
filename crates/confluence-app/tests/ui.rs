@@ -537,3 +537,32 @@ fn a_scene_saved_from_the_bar_brings_a_route_back() {
     });
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_route_learns_a_midi_control_from_the_window() {
+    let d = EngineDir::new("midi");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_vasio(&mut c, 1);
+    let mut h = harness(app_for(&d));
+    let cell = "VASIO 1 in 1 → VASIO 1 out 1";
+    pump_until(&mut h, "the cell", LONG, |h| h.query_by_role_and_label(Role::Button, cell).is_some());
+    // A click on an empty cell routes it and selects it.
+    h.get_by_role_and_label(Role::Button, cell).click();
+    pump_until(&mut h, "the route in the engine", LONG, |_| engine_points(&mut c).contains(&(i, o)));
+    pump_until(&mut h, "the MIDI Learn button", LONG, |h| h.query_by_label("MIDI Learn").is_some());
+    settle(&mut h);
+    h.get_by_label("MIDI Learn").click();
+    pump_until(&mut h, "learning", LONG, |h| h.query_by_label_contains("Move a control").is_some());
+    // A control is moved (injected: no MIDI hardware in tests).
+    let moved = Command::InjectMidi { device: "Test Controller".into(), bytes: vec![0xB0, 21, 64] };
+    assert!(matches!(c.call(moved).unwrap(), Response::Applied { .. }));
+    pump_until(&mut h, "the binding", LONG, |h| h.query_by_label("CC 21 · ch 1 · Test Controller").is_some());
+    settle(&mut h);
+    h.get_by_label("Forget").click();
+    pump_until(&mut h, "no binding in the engine", LONG, |_| {
+        let (state, _sub) = confluence_client::Subscription::connect(&d.pipe, Duration::from_secs(5)).unwrap();
+        state.midi_bindings.is_empty()
+    });
+    c.call(Command::Shutdown).unwrap();
+}

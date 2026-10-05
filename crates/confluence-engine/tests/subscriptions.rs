@@ -24,6 +24,10 @@ impl Drop for Engine {
 fn spawn(pipe: &str, dir: &std::path::Path) -> Engine {
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
     cmd.args(["--pipe", pipe, "--journal"]).arg(dir.join("journal.bin")).arg("--devices").arg(dir.join("devices.json"));
+    // Never this PC's MIDI devices or plugins.
+    let no_plugins = dir.join("no-plugins");
+    let _ = std::fs::create_dir_all(&no_plugins);
+    cmd.arg("--no-midi").arg("--clap-path").arg(no_plugins);
     Engine(Some(cmd.spawn().unwrap()))
 }
 
@@ -247,6 +251,9 @@ fn open_connections_do_not_hold_up_shutdown() {
         .arg(dir.path().join("journal.bin"))
         .arg("--devices")
         .arg(dir.path().join("devices.json"))
+        .arg("--no-midi")
+        .arg("--clap-path")
+        .arg(dir.path())
         .stderr(std::process::Stdio::piped());
     let mut engine = Engine(Some(cmd.spawn().unwrap()));
     let (_, _never_read) = Subscription::connect(&pipe, Duration::from_secs(10)).unwrap();

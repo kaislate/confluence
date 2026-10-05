@@ -123,6 +123,9 @@ mod tests {
                 .collect(),
             current_scene: current.map(String::from),
             morphing,
+            midi_inputs: Vec::new(),
+            midi_bindings: Vec::new(),
+            midi_learning: None,
         }
     }
 

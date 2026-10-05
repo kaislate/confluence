@@ -115,6 +115,9 @@ mod tests {
             scenes: Vec::new(),
             current_scene: None,
             morphing: false,
+            midi_inputs: Vec::new(),
+            midi_bindings: Vec::new(),
+            midi_learning: None,
         }
     }
 
