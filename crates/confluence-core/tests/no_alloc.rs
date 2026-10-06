@@ -41,6 +41,7 @@ fn bridges_do_not_allocate() {
         master_block: 256,
         quality: AsrcQuality::Sinc64,
         margin_frames: 24,
+        max_growth_frames: None,
     };
     let (mut in_dev, mut in_eng, _) = soft_input(cfg).unwrap();
     let (mut out_eng, mut out_dev, _) = soft_output(cfg).unwrap();

@@ -1,0 +1,477 @@
+//! One received stream: puts packets back in order, reassembles blocks split
+//! across packets, conceals losses, and hands whole blocks (with their arrival
+//! time) to the slot's bridge, which does the clock recovery.
+
+use crate::packet::Header;
+
+/// Packet times a gap is at least waited for before it is concealed.
+const HOLD_PACKETS: f64 = 2.0;
+/// The longest a gap is waited for, however out of order packets arrive.
+pub const MAX_HOLD_S: f64 = 0.020;
+/// How much longer than the reordering seen a gap is waited for.
+const HOLD_MARGIN: f64 = 1.25;
+/// Per block handed on, the wait shrinks by this fraction back toward its
+/// minimum: at 1 ms packets it halves in about 6 minutes, so a network that
+/// misbehaves every few seconds or minutes keeps the wait it needs.
+const HOLD_DECAY: f64 = 2e-6;
+/// A packet this far ahead of the expected one (in seconds) means the sender's
+/// clock jumped: follow it rather than conceal the gap.
+const AHEAD_RESYNC_S: f64 = 0.2;
+/// A packet this far behind (in seconds) means the sender restarted.
+const BEHIND_RESYNC_S: f64 = 1.0;
+/// Blocks held at most; beyond, the oldest gap is concealed at once.
+const MAX_PENDING: usize = 64;
+
+/// What a receiver has seen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReceiverStats {
+    pub packets: u64,
+    /// Blocks concealed (never arrived, or arrived incomplete).
+    pub lost: u64,
+    /// Packets that arrived after their block was concealed.
+    pub late: u64,
+    /// Packets that arrived after a later one.
+    pub reordered: u64,
+    /// Times the sender's timeline was picked up afresh.
+    pub resyncs: u64,
+    /// Packets at a rate or block size this receiver does not take.
+    pub mismatched: u64,
+}
+
+struct Pending {
+    ts: u32,
+    frames: usize,
+    data: Vec<f32>,
+    got: u64,
+    need: u64,
+    first_arrival: f64,
+    last_arrival: f64,
+}
+
+/// Reorders, reassembles and conceals one stream for a slot of `channels`.
+pub struct Receiver {
+    channels: usize,
+    rate: u32,
+    expected: Option<u32>,
+    /// The newest block seen, and when it arrived.
+    newest: Option<(u32, f64)>,
+    /// How long a gap is waited for (learned from the reordering seen).
+    hold: f64,
+    /// The last gap concealed: its blocks `start..end` and when the block after
+    /// it arrived (to learn how late its packets turn up).
+    concealed: Option<(u32, u32, f64)>,
+    pending: Vec<Pending>,
+    /// The last block that arrived whole (what concealment repeats).
+    last: Vec<f32>,
+    /// The last block handed on (what a returning stream crossfades from).
+    prev: Vec<f32>,
+    /// Blocks concealed in a row.
+    lost_run: u32,
+    stats: ReceiverStats,
+}
+
+fn mask(channels: u8) -> u64 {
+    if channels >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << channels) - 1
+    }
+}
+
+/// `a - b` on the wrapping RTP timeline.
+fn diff(a: u32, b: u32) -> i64 {
+    a.wrapping_sub(b) as i32 as i64
+}
+
+impl Receiver {
+    pub fn new(channels: usize, rate: u32) -> Receiver {
+        Receiver {
+            channels: channels.max(1),
+            rate,
+            expected: None,
+            newest: None,
+            hold: 0.0,
+            concealed: None,
+            pending: Vec::new(),
+            last: Vec::new(),
+            prev: Vec::new(),
+            lost_run: 0,
+            stats: ReceiverStats::default(),
+        }
+    }
+
+    pub fn stats(&self) -> ReceiverStats {
+        self.stats
+    }
+
+    /// How long a gap is waited for now, in seconds.
+    pub fn hold(&self) -> f64 {
+        self.hold
+    }
+
+    /// Frames the slot's bridge must hold beyond its base to ride out a wait
+    /// for a late packet (see `InputDeviceSide::set_latency_floor`).
+    pub fn latency_floor(&self) -> f64 {
+        self.hold * self.rate as f64
+    }
+
+    /// A packet turned up `late` seconds after a newer one: wait that long (and a bit).
+    fn learn(&mut self, late: f64, frames: usize) {
+        let min = HOLD_PACKETS * frames as f64 / self.rate as f64;
+        self.hold = (late * HOLD_MARGIN).max(self.hold).clamp(min, MAX_HOLD_S);
+    }
+
+    fn resync(&mut self, ts: u32) {
+        self.pending.clear();
+        self.expected = Some(ts);
+        self.newest = None;
+        self.stats.resyncs += 1;
+    }
+
+    /// Takes a packet (`samples` interleaved, `h.channels` per frame) that
+    /// arrived at `arrival` seconds; hands on whatever is now in order.
+    pub fn push(&mut self, h: &Header, samples: &[f32], arrival: f64, out: &mut dyn FnMut(&[f32], f64)) {
+        self.stats.packets += 1;
+        let pc = h.channels as usize;
+        if h.rate != self.rate || pc == 0 || samples.len() % pc != 0 {
+            self.stats.mismatched += 1;
+            return;
+        }
+        let frames = samples.len() / pc;
+        let ts = h.timestamp;
+        match self.expected {
+            None => self.expected = Some(ts),
+            Some(e) => {
+                let d = diff(ts, e);
+                if d < -(BEHIND_RESYNC_S * self.rate as f64) as i64 || d > (AHEAD_RESYNC_S * self.rate as f64) as i64 {
+                    self.resync(ts);
+                } else if d < 0 {
+                    self.stats.late += 1;
+                    if let Some((start, end, after)) = self.concealed {
+                        if diff(ts, start) >= 0 && diff(end, ts) > 0 {
+                            self.learn(arrival - after, frames);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        match self.newest {
+            Some((n, at)) if diff(ts, n) < 0 => {
+                self.stats.reordered += 1;
+                self.learn(arrival - at, frames);
+            }
+            _ => self.newest = Some((ts, arrival)),
+        }
+        let c = self.channels;
+        let i = match self.pending.iter().position(|p| p.ts == ts) {
+            Some(i) => i,
+            None => {
+                self.pending.push(Pending {
+                    ts,
+                    frames,
+                    data: vec![0.0; frames * c],
+                    got: 0,
+                    need: mask(h.total_channels),
+                    first_arrival: arrival,
+                    last_arrival: arrival,
+                });
+                self.pending.len() - 1
+            }
+        };
+        let p = &mut self.pending[i];
+        if p.frames != frames {
+            self.stats.mismatched += 1;
+            return;
+        }
+        for k in 0..pc {
+            let sc = h.first_channel as usize + k;
+            if sc < 64 {
+                p.got |= 1 << sc;
+            }
+            if sc < c {
+                for f in 0..frames {
+                    p.data[f * c + sc] = samples[f * pc + k];
+                }
+            }
+        }
+        p.last_arrival = arrival;
+        self.release(arrival, out);
+    }
+
+    /// Conceals gaps that have waited long enough (call every millisecond or so).
+    pub fn poll(&mut self, now: f64, out: &mut dyn FnMut(&[f32], f64)) {
+        self.release(now, out);
+    }
+
+    fn release(&mut self, now: f64, out: &mut dyn FnMut(&[f32], f64)) {
+        while let Some(e) = self.expected {
+            if let Some(i) = self.pending.iter().position(|p| p.ts == e && p.got & p.need == p.need) {
+                let p = self.pending.swap_remove(i);
+                self.expected = Some(e.wrapping_add(p.frames as u32));
+                self.emit_real(p.data, p.last_arrival, out);
+                continue;
+            }
+            let Some(i) = (0..self.pending.len()).min_by_key(|&i| diff(self.pending[i].ts, e)) else { return };
+            let p = &self.pending[i];
+            let hold = self.hold.max(HOLD_PACKETS * p.frames as f64 / self.rate as f64);
+            if now < p.first_arrival + hold && self.pending.len() <= MAX_PENDING {
+                return;
+            }
+            if p.ts == e {
+                // Waited long enough and still incomplete: what came is used.
+                let p = self.pending.swap_remove(i);
+                self.stats.lost += 1;
+                self.expected = Some(e.wrapping_add(p.frames as u32));
+                self.emit_real(p.data, now, out);
+                continue;
+            }
+            let (gap, frames) = (diff(p.ts, e) as usize, p.frames);
+            self.concealed = Some((e, p.ts, p.first_arrival));
+            let mut done = 0;
+            while done < gap {
+                let n = frames.min(gap - done);
+                self.emit_concealed(n, now, out);
+                done += n;
+            }
+            self.expected = Some(e.wrapping_add(gap as u32));
+        }
+    }
+
+    fn emit_real(&mut self, mut data: Vec<f32>, time: f64, out: &mut dyn FnMut(&[f32], f64)) {
+        let c = self.channels;
+        if self.lost_run > 0 {
+            // Crossfade from what was played in its place.
+            let frames = data.len() / c;
+            for f in 0..frames {
+                let w = (f + 1) as f32 / frames as f32;
+                for ch in 0..c {
+                    let from = self.prev.get(f * c + ch).copied().unwrap_or(0.0);
+                    data[f * c + ch] = from * (1.0 - w) + data[f * c + ch] * w;
+                }
+            }
+            self.lost_run = 0;
+        }
+        self.hold *= 1.0 - HOLD_DECAY;
+        out(&data, time);
+        self.last.clone_from(&data);
+        self.prev = data;
+    }
+
+    fn emit_concealed(&mut self, frames: usize, time: f64, out: &mut dyn FnMut(&[f32], f64)) {
+        let c = self.channels;
+        self.lost_run += 1;
+        self.stats.lost += 1;
+        let mut data = vec![0.0; frames * c];
+        if self.lost_run <= 3 && !self.last.is_empty() {
+            for (i, d) in data.iter_mut().enumerate() {
+                *d = self.last[i % self.last.len()];
+            }
+            if self.lost_run == 3 {
+                for f in 0..frames {
+                    let g = 1.0 - (f + 1) as f32 / frames as f32;
+                    for d in &mut data[f * c..(f + 1) * c] {
+                        *d *= g;
+                    }
+                }
+            }
+        }
+        out(&data, time);
+        self.prev = data;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::{Format, Header};
+
+    const FRAMES: usize = 48;
+
+    fn header(ts: u32, first: u8, channels: u8, total: u8) -> Header {
+        Header {
+            seq: 0,
+            timestamp: ts,
+            ssrc: 7,
+            format: Format::F32,
+            total_channels: total,
+            first_channel: first,
+            channels,
+            rate: 48_000,
+            stream: "Main".into(),
+        }
+    }
+
+    /// A block whose every sample is `v` (per packet channel count).
+    fn block(v: f32, channels: usize) -> Vec<f32> {
+        vec![v; FRAMES * channels]
+    }
+
+    /// Collects what the receiver releases: (first sample of each frame of channel 0, time).
+    #[derive(Default)]
+    struct Out {
+        frames: Vec<f32>,
+        all: Vec<f32>,
+        times: Vec<f64>,
+    }
+
+    impl Out {
+        fn sink(&mut self, channels: usize) -> impl FnMut(&[f32], f64) + '_ {
+            move |data, t| {
+                self.frames.extend(data.chunks(channels).map(|f| f[0]));
+                self.all.extend_from_slice(data);
+                self.times.push(t);
+            }
+        }
+    }
+
+    fn rx(channels: usize) -> Receiver {
+        Receiver::new(channels, 48_000)
+    }
+
+    const PT: f64 = 0.001; // one packet time
+
+    #[test]
+    fn packets_in_order_are_released_at_once() {
+        let mut r = rx(2);
+        let mut out = Out::default();
+        r.push(&header(1000, 0, 2, 2), &block(0.1, 2), 0.0, &mut out.sink(2));
+        r.push(&header(1048, 0, 2, 2), &block(0.2, 2), PT, &mut out.sink(2));
+        assert_eq!(out.frames.len(), 96);
+        assert_eq!((out.frames[0], out.frames[95]), (0.1, 0.2));
+        assert_eq!(out.times, [0.0, PT]);
+        assert_eq!(r.stats().packets, 2);
+    }
+
+    #[test]
+    fn a_block_split_across_packets_is_released_when_whole() {
+        let mut r = rx(4);
+        let mut out = Out::default();
+        r.push(&header(0, 2, 2, 4), &block(0.3, 2), 0.0, &mut out.sink(4));
+        assert!(out.all.is_empty(), "half a block");
+        r.push(&header(0, 0, 2, 4), &block(0.1, 2), 0.0001, &mut out.sink(4));
+        assert_eq!(out.all.len(), FRAMES * 4);
+        assert_eq!(&out.all[..4], &[0.1, 0.1, 0.3, 0.3]);
+    }
+
+    #[test]
+    fn channels_are_fitted_to_the_slot() {
+        let mut wide = rx(4);
+        let mut out = Out::default();
+        wide.push(&header(0, 0, 2, 2), &block(0.5, 2), 0.0, &mut out.sink(4));
+        assert_eq!(&out.all[..4], &[0.5, 0.5, 0.0, 0.0], "missing channels are silent");
+        let mut narrow = rx(1);
+        let mut out = Out::default();
+        narrow.push(&header(0, 0, 2, 2), &block(0.5, 2), 0.0, &mut out.sink(1));
+        assert_eq!(out.all.len(), FRAMES, "extra channels are dropped");
+    }
+
+    #[test]
+    fn reordered_packets_are_put_back_in_order() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        r.push(&header(0, 0, 1, 1), &block(0.1, 1), 0.0, &mut out.sink(1));
+        r.push(&header(96, 0, 1, 1), &block(0.3, 1), PT, &mut out.sink(1));
+        r.push(&header(48, 0, 1, 1), &block(0.2, 1), 1.2 * PT, &mut out.sink(1));
+        assert_eq!(out.frames.len(), 144);
+        assert_eq!((out.frames[0], out.frames[48], out.frames[96]), (0.1, 0.2, 0.3));
+        assert_eq!(r.stats().reordered, 1);
+        assert_eq!(r.stats().lost, 0);
+    }
+
+    #[test]
+    fn a_lost_packet_is_concealed_after_a_short_wait() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        r.push(&header(0, 0, 1, 1), &block(0.1, 1), 0.0, &mut out.sink(1));
+        r.push(&header(96, 0, 1, 1), &block(0.3, 1), 2.0 * PT, &mut out.sink(1));
+        assert_eq!(out.frames.len(), 48, "held while 48 may still come");
+        r.poll(4.0 * PT, &mut out.sink(1));
+        assert_eq!(out.frames.len(), 144, "concealed, then released");
+        assert_eq!(out.frames[50], 0.1, "the last block repeated");
+        assert!(out.frames[96] < 0.3 && out.frames[96] > 0.1, "crossfaded into the next");
+        assert_eq!(out.frames[143], 0.3);
+        assert_eq!(r.stats().lost, 1);
+        // It turns up after all: too late.
+        r.push(&header(48, 0, 1, 1), &block(0.2, 1), 4.5 * PT, &mut out.sink(1));
+        assert_eq!(out.frames.len(), 144);
+        assert_eq!(r.stats().late, 1);
+    }
+
+    #[test]
+    fn a_long_loss_fades_to_silence() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        r.push(&header(0, 0, 1, 1), &block(0.5, 1), 0.0, &mut out.sink(1));
+        r.push(&header(6 * 48, 0, 1, 1), &block(0.5, 1), 6.0 * PT, &mut out.sink(1));
+        r.poll(9.0 * PT, &mut out.sink(1));
+        assert_eq!(out.frames.len(), 7 * 48, "five concealed blocks keep the timing");
+        assert_eq!(out.frames[48], 0.5, "first two repeat");
+        assert_eq!(out.frames[2 * 48], 0.5);
+        assert!(out.frames[3 * 48 + 47] < 0.05, "the third fades out");
+        assert_eq!(out.frames[4 * 48], 0.0, "then silence");
+        assert_eq!(r.stats().lost, 5);
+    }
+
+    #[test]
+    fn a_restarted_sender_is_followed_without_a_flood_of_concealment() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        r.push(&header(1_000_000, 0, 1, 1), &block(0.1, 1), 0.0, &mut out.sink(1));
+        // Restarted: timestamps begin again far behind.
+        r.push(&header(5, 0, 1, 1), &block(0.2, 1), 2.0, &mut out.sink(1));
+        r.push(&header(53, 0, 1, 1), &block(0.3, 1), 2.0 + PT, &mut out.sink(1));
+        assert_eq!(out.frames.len(), 144);
+        // And far ahead (a long pause in the sender's clock).
+        r.push(&header(9_000_000, 0, 1, 1), &block(0.4, 1), 3.0, &mut out.sink(1));
+        assert_eq!(out.frames.len(), 192);
+        assert_eq!(r.stats().lost, 0);
+        assert_eq!(r.stats().resyncs, 2);
+    }
+
+    #[test]
+    fn the_wait_for_a_gap_grows_with_the_reordering_seen() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        r.push(&header(0, 0, 1, 1), &block(0.1, 1), 0.0, &mut out.sink(1));
+        let mut t = PT;
+        let mut lost_after_learning = None;
+        for i in 0..40u32 {
+            let (a, b) = ((2 * i + 1) * 48, (2 * i + 2) * 48);
+            // B overtakes A by 3 packet times on the way.
+            r.push(&header(b, 0, 1, 1), &block(0.2, 1), t, &mut out.sink(1));
+            for k in 1..=6 {
+                r.poll(t + k as f64 * 0.5 * PT, &mut out.sink(1));
+            }
+            r.push(&header(a, 0, 1, 1), &block(0.1, 1), t + 3.0 * PT, &mut out.sink(1));
+            t += 2.0 * PT + 3.0 * PT;
+            if i == 3 {
+                lost_after_learning = Some(r.stats().lost);
+            }
+        }
+        assert!(lost_after_learning.unwrap() <= 2, "{:?}", r.stats());
+        assert_eq!(r.stats().lost, lost_after_learning.unwrap(), "learned: no more losses {:?}", r.stats());
+        assert!(r.hold() > 3.0 * PT && r.hold() <= MAX_HOLD_S, "{}", r.hold());
+        assert_eq!(r.latency_floor(), r.hold() * 48_000.0, "the bridge must cover the wait");
+    }
+
+    #[test]
+    fn packets_at_another_rate_are_refused() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        let h = Header { rate: 44_100, ..header(0, 0, 1, 1) };
+        r.push(&h, &block(0.1, 1), 0.0, &mut out.sink(1));
+        assert!(out.frames.is_empty());
+        assert_eq!(r.stats().mismatched, 1);
+    }
+
+    #[test]
+    fn timestamps_wrap_around() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        r.push(&header(u32::MAX - 47, 0, 1, 1), &block(0.1, 1), 0.0, &mut out.sink(1));
+        r.push(&header(0, 0, 1, 1), &block(0.2, 1), PT, &mut out.sink(1));
+        assert_eq!(out.frames.len(), 96);
+        assert_eq!(r.stats().resyncs, 0);
+    }
+}

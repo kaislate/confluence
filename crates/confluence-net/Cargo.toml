@@ -11,3 +11,4 @@ confluence-core = { path = "../confluence-core" }
 
 [lints]
 workspace = true
+

@@ -59,6 +59,9 @@ pub struct BridgeConfig {
     pub quality: AsrcQuality,
     /// Safety margin added to the base target fill (spec default 2 ms).
     pub margin_frames: usize,
+    /// How far the target may grow above the base when headroom runs short;
+    /// `None` = 8 device blocks (enough for USB devices; networks need more).
+    pub max_growth_frames: Option<usize>,
 }
 
 impl BridgeConfig {
@@ -67,10 +70,13 @@ impl BridgeConfig {
         (self.device_block + self.master_block + self.margin_frames) as f64
     }
 
+    /// Frames the target may grow by.
+    pub fn max_growth(&self) -> usize {
+        self.max_growth_frames.unwrap_or(MAX_EXTRA_BLOCKS as usize * self.device_block)
+    }
+
     fn ring_frames(&self) -> usize {
-        (self.base_target() as usize + self.device_block) * 2
-            + MAX_EXTRA_BLOCKS as usize * self.device_block
-            + self.master_block * 4
+        (self.base_target() as usize + self.device_block) * 2 + self.max_growth() + self.master_block * 4
     }
 }
 
@@ -88,6 +94,9 @@ pub struct BridgeStats {
     /// Output bridges: the device has called back at least once (it may still
     /// be priming). Until then the engine queues nothing.
     device_started: AtomicBool,
+    /// Input bridges: frames above the base target the device side needs
+    /// (a network receiver's wait for late packets), as f64 bits.
+    floor_bits: AtomicU64,
 }
 
 impl Default for BridgeStats {
@@ -101,6 +110,7 @@ impl Default for BridgeStats {
             correction_ppm_bits: AtomicU64::new(0),
             device_min_headroom: AtomicI64::new(i64::MAX),
             device_started: AtomicBool::new(false),
+            floor_bits: AtomicU64::new(0),
         }
     }
 }
@@ -218,7 +228,17 @@ impl Tracker {
     }
 
     /// Returns the fill-controller correction in ppm (positive = ring too full).
+    /// The lowest target allowed: the base, raised by the device side's floor.
+    fn floor_target(&self) -> f64 {
+        let floor = f64::from_bits(self.stats.floor_bits.load(Ordering::Relaxed));
+        self.cfg.base_target() + floor.min(self.cfg.max_growth() as f64)
+    }
+
     fn correction(&mut self, fill: f64) -> f64 {
+        let floor = self.floor_target();
+        if floor > self.target {
+            self.move_target(floor);
+        }
         let dt = self.dt();
         let alpha = (dt / FILL_FILTER_S).min(1.0);
         let filtered = match self.fill_filtered {
@@ -284,7 +304,7 @@ impl Tracker {
             self.quiet_windows += 1;
             if self.quiet_windows >= QUIET_WINDOWS_TO_SHRINK {
                 self.quiet_windows = 0;
-                self.move_target((self.target - block / 8.0).max(self.cfg.base_target()));
+                self.move_target((self.target - block / 8.0).max(self.floor_target()));
             }
         } else {
             self.quiet_windows = 0;
@@ -292,7 +312,7 @@ impl Tracker {
     }
 
     fn grow(&mut self, frames: f64) {
-        let max = self.cfg.base_target() + MAX_EXTRA_BLOCKS * self.cfg.device_block as f64;
+        let max = self.cfg.base_target() + self.cfg.max_growth() as f64;
         self.move_target((self.target + frames).min(max));
     }
 
@@ -370,6 +390,13 @@ pub fn soft_input(cfg: BridgeConfig) -> Result<(InputDeviceSide, InputEngineSide
 }
 
 impl InputDeviceSide {
+    /// The device side can stall for up to `frames` (e.g. a network receiver
+    /// waiting for a late packet): the target is kept at least that far above
+    /// its base, within the growth limit.
+    pub fn set_latency_floor(&self, frames: f64) {
+        self.stats.floor_bits.store(frames.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
     /// Device callback: `data` holds whole interleaved frames captured ending at `time` (seconds).
     pub fn write_interleaved(&mut self, data: &[f32], time: f64) {
         let frames = data.len() / self.channels;
@@ -637,6 +664,7 @@ mod tests {
             master_block: 256,
             quality: AsrcQuality::Sinc64,
             margin_frames: 24,
+            max_growth_frames: None,
         }
     }
 
@@ -656,6 +684,37 @@ mod tests {
         let (mut dev, _eng, stats) = soft_input(cfg()).unwrap();
         dev.write_interleaved(&vec![0.0; 2 * 1_000_000], 0.0);
         assert_eq!(stats.snapshot().overruns, 1);
+    }
+
+    /// A running input bridge, its floor set to `floor` just before one more block.
+    fn target_with_floor(floor: Option<f64>) -> f64 {
+        let (mut dev, mut eng, stats) = soft_input(cfg()).unwrap();
+        let mut out = PlanarBuffer::new(2, 256);
+        let block = vec![0.0f32; 2 * 128];
+        let mut t = 0.0;
+        for i in 0..400 {
+            if i == 399 {
+                if let Some(f) = floor {
+                    dev.set_latency_floor(f);
+                }
+            }
+            dev.write_interleaved(&block, t);
+            dev.write_interleaved(&block, t + 128.0 / 48_000.0);
+            t += 256.0 / 48_000.0;
+            eng.read(&mut out, 0, t, 0.0);
+        }
+        let h = stats.snapshot();
+        assert_eq!(h.underruns, 0, "{h:?}");
+        h.target_frames
+    }
+
+    #[test]
+    fn a_latency_floor_raises_the_target_at_once_within_the_growth_limit() {
+        let c = cfg();
+        assert_eq!(target_with_floor(None), c.base_target());
+        assert_eq!(target_with_floor(Some(500.0)), c.base_target() + 500.0, "raised at once");
+        let max = c.base_target() + c.max_growth() as f64;
+        assert_eq!(target_with_floor(Some(5_000.0)), max, "never past the growth limit");
     }
 
     #[test]

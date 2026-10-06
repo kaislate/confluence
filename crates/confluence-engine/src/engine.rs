@@ -1250,6 +1250,7 @@ impl Engine {
             master_block: self.cfg.block,
             quality: spec.quality,
             margin_frames: self.cfg.margin_frames,
+            max_growth_frames: None,
         }
     }
 }
