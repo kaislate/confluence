@@ -133,7 +133,7 @@ impl Receiver {
     pub fn push(&mut self, h: &Header, samples: &[f32], arrival: f64, out: &mut dyn FnMut(&[f32], f64)) {
         self.stats.packets += 1;
         let pc = h.channels as usize;
-        if h.rate != self.rate || pc == 0 || samples.len() % pc != 0 {
+        if h.rate != self.rate || pc == 0 || !samples.len().is_multiple_of(pc) {
             self.stats.mismatched += 1;
             return;
         }
