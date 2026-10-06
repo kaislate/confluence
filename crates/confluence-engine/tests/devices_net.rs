@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use confluence_api::{DeviceKind, Peer};
+use confluence_api::{Command, DeviceKind, Peer, Response};
 use confluence_core::buffer::PlanarBuffer;
-use confluence_engine::devices::{DeviceManager, NetCtx};
+use confluence_engine::clock::InternalClock;
+use confluence_engine::devices::{AsioOpener, DeviceManager, NetCtx};
 use confluence_engine::{Engine, EngineConfig};
 use confluence_net::discovery::FakeDiscovery;
 use confluence_net::host::{NetHost, SendSpec};
@@ -124,4 +125,85 @@ fn an_engine_name_not_found_by_discovery_is_looked_up_by_name() {
     devices.add(&mut engine, DeviceKind::NetSend, "studio-pc/Main").unwrap();
     assert_eq!(*lookups.lock().unwrap(), ["studio-pc"]);
     assert_eq!(engine.slots()[0].outputs, 2);
+}
+
+/// Opens `fake:<name>` as a fake ASIO driver (2 in / 2 out, every input 0.25)
+/// whose probe is shared with the test.
+fn fake_asio(probes: Vec<(&'static str, Arc<confluence_provider_asio::fake::FakeProbe>)>) -> AsioOpener {
+    use confluence_provider_asio::fake::FakeConfig;
+    use confluence_provider_asio::{AsioDevice, AsioHostError, DriverSource};
+    Box::new(move |name: &str| {
+        let (_, probe) = probes.iter().find(|(n, _)| *n == name).ok_or(AsioHostError::NotInstalled(name.into()))?;
+        let mut cfg = FakeConfig::new(name);
+        cfg.probe = probe.clone();
+        AsioDevice::open(DriverSource::Fake(cfg))
+    })
+}
+
+fn route(engine: &mut Engine, input: u32, output: u32, on: bool) {
+    let cmd = if on {
+        Command::SetPoint { input, output, gain_db: 0.0, mute: false, invert: false }
+    } else {
+        Command::RemovePoint { input, output }
+    };
+    assert_eq!(engine.handle(&cmd), Response::Ok);
+}
+
+/// Runs both engines' control ticks for `ms`.
+fn run(engines: &mut [&mut Engine], ms: u64) {
+    for _ in 0..ms / 10 {
+        std::thread::sleep(Duration::from_millis(10));
+        for e in engines.iter_mut() {
+            e.tick();
+        }
+    }
+}
+
+#[test]
+fn audio_routed_to_a_send_stream_plays_from_the_other_engines_receive_stream() {
+    use confluence_provider_asio::fake::FakeProbe;
+    let (pa, pb) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
+    let peers = Arc::new(Mutex::new(Vec::new()));
+    // A: a device's input 1 (0.25) goes to channel 2 only of a send stream to B.
+    let (mut a, audio_a) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let host_b = NetHost::start(loopback(0), 2).unwrap();
+    let port_b = host_b.port();
+    let mut da = DeviceManager::new(None)
+        .with_asio_opener(fake_asio(vec![("fake:a", pa)]))
+        .with_net(net(NetHost::start(loopback(0), 1).unwrap(), &peers));
+    da.add(&mut a, DeviceKind::Asio, "fake:a").unwrap();
+    da.add(&mut a, DeviceKind::NetSend, &format!("127.0.0.1:{port_b}/Main:2")).unwrap();
+    let slots = a.slots();
+    let dev_in = slots.iter().find(|s| s.name == "fake:a in").unwrap().first_input;
+    let send = slots.iter().find(|s| s.device.starts_with("net-out:")).unwrap().first_output;
+    route(&mut a, dev_in, send + 1, true);
+    let clock_a = InternalClock::start(audio_a, 48_000.0).unwrap();
+
+    // B: the stream's channels play, one at a time, on a device's output 1.
+    let (mut b, audio_b) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut db = DeviceManager::new(None)
+        .with_asio_opener(fake_asio(vec![("fake:b", pb.clone())]))
+        .with_net(net(host_b, &peers));
+    db.add(&mut b, DeviceKind::Asio, "fake:b").unwrap();
+    db.add(&mut b, DeviceKind::NetReceive, "127.0.0.1/Main").unwrap();
+    let slots = b.slots();
+    let recv = slots.iter().find(|s| s.device.starts_with("net-in:")).unwrap().first_input;
+    let dev_out = slots.iter().find(|s| s.name == "fake:b out").unwrap().first_output;
+    route(&mut b, recv + 1, dev_out, true);
+    let clock_b = InternalClock::start(audio_b, 48_000.0).unwrap();
+
+    run(&mut [&mut a, &mut b], 1500); // the receive stream settles
+    for _ in 0..20 {
+        run(&mut [&mut a, &mut b], 50);
+        let last = pb.last_output.lock().unwrap().clone();
+        assert!(last.iter().all(|&s| (s - 0.25).abs() < 2e-3), "channel 2 arrives steadily: {:?}", &last[..4]);
+    }
+    // Channel 1 carries nothing.
+    route(&mut b, recv + 1, dev_out, false);
+    route(&mut b, recv, dev_out, true);
+    run(&mut [&mut a, &mut b], 300);
+    let last = pb.last_output.lock().unwrap().clone();
+    assert!(last.iter().all(|&s| s.abs() < 1e-3), "channel 1 is silent: {:?}", &last[..4]);
+    clock_a.stop();
+    clock_b.stop();
 }
