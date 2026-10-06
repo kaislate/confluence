@@ -140,7 +140,7 @@ mod app {
             }
         };
         eprintln!("confluence-engine: network audio on UDP port {} as {name}", host.port());
-        Some(NetCtx { host, discovery })
+        Some(NetCtx::new(host, discovery))
     }
 
     /// `--scan`: runs in a throwaway process, so a plugin that crashes takes
@@ -741,6 +741,9 @@ mod app {
             midi_tick(&mut s);
             ticks += 1;
             if ticks.is_multiple_of(PUBLISH_TICKS) {
+                // Network streams whose engine was not found come back once it is.
+                let State { devices, engine, .. } = &mut *s;
+                devices.retry_offline_net(engine);
                 // Catches changes no command made: devices lost or back, a DAW attaching.
                 publish(&mut s);
                 // Values changed in plugin editors are saved like any other change.

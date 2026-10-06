@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use confluence_api::{ClockRole, Command, DeviceInfo, DeviceKind, Response};
 use confluence_core::asrc::AsrcQuality;
@@ -43,6 +44,10 @@ pub struct Binding {
     /// USB devices. Tried first when the binding is restored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_id: Option<String>,
+    /// A network receive stream's sample rate: it comes back at it before the
+    /// stream is heard again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u32>,
 }
 
 impl Binding {
@@ -90,8 +95,9 @@ enum Loaded {
     Vasio,
     /// As VASIO: the driver is attached when the slot is created.
     Vaio,
-    /// A network stream (nothing to load: the slot opens it).
-    Net(NetName),
+    /// A network stream (the slot opens it), and its peer's address if the
+    /// name had to be looked up (discovery is asked again when it is attached).
+    Net(NetName, Option<std::net::SocketAddr>),
 }
 
 /// Finds a WASAPI endpoint by its saved id, else by name.
@@ -104,7 +110,13 @@ fn find_saved_endpoint(direction: Direction, name: &str, id: Option<&str>) -> Re
 
 /// Loads a device: the slow part of adding one (driver `init`, endpoint or
 /// process lookup, stream set-up). Needs neither the engine nor the manager.
-fn load(opener: &AsioOpener, kind: DeviceKind, name: &str, endpoint_id: Option<&str>) -> Result<Loaded, String> {
+fn load(
+    opener: &AsioOpener,
+    kind: DeviceKind,
+    name: &str,
+    endpoint_id: Option<&str>,
+    net: Option<&NetLookupSnapshot>,
+) -> Result<Loaded, String> {
     Ok(match kind {
         DeviceKind::Asio => Loaded::Asio(opener(name).map_err(|e| e.to_string())?),
         DeviceKind::Vasio => {
@@ -115,7 +127,11 @@ fn load(opener: &AsioOpener, kind: DeviceKind, name: &str, endpoint_id: Option<&
             parse_vaio(name)?;
             Loaded::Vaio
         }
-        DeviceKind::NetSend | DeviceKind::NetReceive => Loaded::Net(parse_net(name)?),
+        DeviceKind::NetSend | DeviceKind::NetReceive => {
+            let n = parse_net(name)?;
+            let looked_up = net.and_then(|net| net.look_up(&n));
+            Loaded::Net(n, looked_up)
+        }
         DeviceKind::WasapiRender | DeviceKind::WasapiCapture | DeviceKind::AppCapture => {
             let target = match kind {
                 DeviceKind::WasapiRender => {
@@ -146,6 +162,7 @@ pub struct PendingAdd {
     /// An offline device's saved endpoint id, tried before its name.
     endpoint_id: Option<String>,
     opener: Arc<AsioOpener>,
+    net: Option<NetLookupSnapshot>,
 }
 
 impl PendingAdd {
@@ -153,7 +170,7 @@ impl PendingAdd {
     /// device is not left reserved as "being opened".
     pub fn load(self) -> LoadedAdd {
         let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            load(&self.opener, self.kind, &self.name, self.endpoint_id.as_deref())
+            load(&self.opener, self.kind, &self.name, self.endpoint_id.as_deref(), self.net.as_ref())
         }));
         let device = format!("{}:{}", self.kind.prefix(), self.name);
         let loaded = opened.unwrap_or_else(|_| Err(format!("opening {device} panicked")));
@@ -222,10 +239,56 @@ pub struct LoadedAdd {
     loaded: Result<Loaded, String>,
 }
 
+/// Looks up a computer's name (and port) as the system resolves names (DNS,
+/// LLMNR, mDNS): for engines discovery has not found.
+pub type NetLookup = Arc<dyn Fn(&str, u16) -> Option<std::net::SocketAddr> + Send + Sync>;
+
 /// The engine's network audio: its host and how it finds other engines.
 pub struct NetCtx {
     pub host: NetHost,
     pub discovery: Box<dyn Discovery>,
+    lookup: NetLookup,
+}
+
+impl NetCtx {
+    pub fn new(host: NetHost, discovery: Box<dyn Discovery>) -> NetCtx {
+        NetCtx { host, discovery, lookup: Arc::new(system_lookup) }
+    }
+
+    /// Looks names up with `lookup` instead of the system's resolver (tests).
+    pub fn with_lookup(mut self, lookup: NetLookup) -> NetCtx {
+        self.lookup = lookup;
+        self
+    }
+
+    fn snapshot(&self) -> NetLookupSnapshot {
+        NetLookupSnapshot { peers: self.discovery.peers(), lookup: self.lookup.clone() }
+    }
+}
+
+/// The first IPv4 address the system resolves `name` to.
+fn system_lookup(name: &str, port: u16) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    (name, port).to_socket_addrs().ok()?.find(|a| a.is_ipv4())
+}
+
+/// What a stream's peer may be looked up with while it is loaded (without the
+/// engine lock: a lookup can take seconds).
+pub struct NetLookupSnapshot {
+    peers: Vec<confluence_api::Peer>,
+    lookup: NetLookup,
+}
+
+impl NetLookupSnapshot {
+    /// The address of `n`'s peer when it is a name discovery has not found.
+    fn look_up(&self, n: &NetName) -> Option<std::net::SocketAddr> {
+        let known = n.peer.parse::<std::net::Ipv4Addr>().is_ok()
+            || self.peers.iter().any(|p| p.name.eq_ignore_ascii_case(&n.peer));
+        if known {
+            return None;
+        }
+        (self.lookup)(&n.peer, n.port.unwrap_or(confluence_net::DEFAULT_PORT))
+    }
 }
 
 pub struct DeviceManager {
@@ -254,6 +317,8 @@ pub struct DeviceManager {
     save_blocked: Option<&'static str>,
     /// The ASIO master's slot and driver health, for `annotate`.
     master_health: Option<(u32, Arc<AsioHealth>)>,
+    /// Offline network streams that failed to come back, and when to try again.
+    net_retry_failed: Vec<(String, Instant)>,
 }
 
 impl DeviceManager {
@@ -274,6 +339,7 @@ impl DeviceManager {
             unplaced: Vec::new(),
             save_blocked: None,
             master_health: None,
+            net_retry_failed: Vec::new(),
         }
     }
 
@@ -343,6 +409,7 @@ impl DeviceManager {
             first_output: ch.first_output as u32,
             outputs: ch.outputs as u32,
             endpoint_id: None,
+            rate: None,
         });
         self.save()
     }
@@ -443,7 +510,10 @@ impl DeviceManager {
         self.loading.push((kind, name.to_string()));
         let endpoint_id =
             self.bound.iter().find(|b| same_device(&b.binding, kind, name)).and_then(|b| b.binding.endpoint_id.clone());
-        Ok(PendingAdd { kind, name: name.to_string(), endpoint_id, opener: self.asio_open.clone() })
+        let net = matches!(kind, DeviceKind::NetSend | DeviceKind::NetReceive)
+            .then(|| self.net.as_ref().map(NetCtx::snapshot))
+            .flatten();
+        Ok(PendingAdd { kind, name: name.to_string(), endpoint_id, opener: self.asio_open.clone(), net })
     }
 
     /// Last step of adding a device: attaches what was loaded to the engine
@@ -574,7 +644,8 @@ impl DeviceManager {
                 warnings.push(format!("{} is now the master clock device; its device binding was dropped", b.device()));
                 continue;
             }
-            let opened = load(&self.asio_open, b.kind, &b.name, b.endpoint_id.as_deref())
+            let net = self.net.as_ref().map(NetCtx::snapshot);
+            let opened = load(&self.asio_open, b.kind, &b.name, b.endpoint_id.as_deref(), net.as_ref())
                 .and_then(|loaded| self.attach(engine, b.kind, &b.name, Some(&b), loaded))
                 .and_then(|(bound, start)| start_now(engine, bound, start));
             match opened {
@@ -592,6 +663,36 @@ impl DeviceManager {
             }
         }
         warnings
+    }
+
+    /// Re-adds offline network streams whose engine discovery has now found
+    /// (call regularly). Returns whether any came back.
+    pub fn retry_offline_net(&mut self, engine: &mut Engine) -> bool {
+        let Some(net) = &self.net else { return false };
+        let peers = net.discovery.peers();
+        let now = Instant::now();
+        let due: Vec<(DeviceKind, String)> = self
+            .bound
+            .iter()
+            .filter(|b| b.handles.is_empty() && matches!(b.binding.kind, DeviceKind::NetSend | DeviceKind::NetReceive))
+            .filter(|b| {
+                parse_net(&b.binding.name).is_ok_and(|n| peers.iter().any(|p| p.name.eq_ignore_ascii_case(&n.peer)))
+            })
+            .filter(|b| !self.net_retry_failed.iter().any(|(name, at)| *name == b.binding.name && now < *at))
+            .map(|b| (b.binding.kind, b.binding.name.clone()))
+            .collect();
+        let mut back = false;
+        for (kind, name) in due {
+            self.net_retry_failed.retain(|(n, _)| *n != name);
+            match self.add(engine, kind, &name) {
+                Ok(_) => back = true,
+                Err(e) => {
+                    eprintln!("confluence-engine: {}:{name} is still offline: {e}", kind.prefix());
+                    self.net_retry_failed.push((name, now + NET_RETRY_AFTER));
+                }
+            }
+        }
+        back
     }
 
     /// Holds a missing device's channels with an offline slot.
@@ -762,7 +863,7 @@ impl DeviceManager {
             Loaded::Asio(dev) => self.open_asio(engine, name, device, at, dev).map(|(b, s)| (b, Some(s))),
             Loaded::Vasio => self.open_vasio(engine, name, device, at).map(|b| (b, None)),
             Loaded::Vaio => self.open_vaio(engine, name, device, at).map(|b| (b, None)),
-            Loaded::Net(n) => self.open_net(engine, kind, name, device, at, n).map(|b| (b, None)),
+            Loaded::Net(n, looked_up) => self.open_net(engine, kind, name, at, n, looked_up).map(|b| (b, None)),
             Loaded::Wasapi(mut stream, endpoint_id) => {
                 let f = stream.format();
                 let mut binding = Binding { endpoint_id, ..binding_of(kind, name) };
@@ -811,15 +912,22 @@ impl DeviceManager {
         engine: &mut Engine,
         kind: DeviceKind,
         name: &str,
-        device: String,
         at: Option<&Binding>,
         n: NetName,
+        looked_up: Option<std::net::SocketAddr>,
     ) -> Result<Bound, String> {
+        let device = format!("{}:{}", kind.prefix(), name);
         let net = self.net.as_ref().ok_or("network audio is off in this engine")?;
         let rate = engine.config().sample_rate;
-        let addr = resolve(net, &n)?;
+        let addr = match resolve(net, &n) {
+            Ok(a) => a,
+            Err(e) => looked_up.ok_or(e)?,
+        };
+        // Coming back: on its saved channels (others may be routed after them).
+        let saved_inputs = at.map(|b| b.inputs as usize).filter(|&c| c > 0);
+        let saved_outputs = at.map(|b| b.outputs as usize).filter(|&c| c > 0);
         if kind == DeviceKind::NetSend {
-            let channels = n.channels.unwrap_or(2);
+            let channels = n.channels.or(saved_outputs).unwrap_or(2);
             let spec = StrictSlotSpec {
                 name: format!("{} to {}", n.stream, n.peer),
                 device,
@@ -850,8 +958,9 @@ impl DeviceManager {
         }
         let from = addr.ip();
         let heard = net.host.heard().into_iter().find(|h| h.from == from && h.stream == n.stream);
-        let channels = n.channels.or(heard.as_ref().map(|h| h.channels as usize)).unwrap_or(2);
-        let stream_rate = heard.as_ref().map_or(rate, |h| h.rate as f64);
+        let channels = n.channels.or(saved_inputs).or(heard.as_ref().map(|h| h.channels as usize)).unwrap_or(2);
+        let stream_rate =
+            heard.as_ref().map(|h| h.rate as f64).or(at.and_then(|b| b.rate).map(f64::from)).unwrap_or(rate);
         let packet = (stream_rate / 1000.0).round().max(1.0) as usize;
         let mut spec = self.soft_spec(
             format!("{} from {}", n.stream, n.peer),
@@ -869,6 +978,7 @@ impl DeviceManager {
         let binding = Binding {
             first_input: slot.map_or(0, |s| s.first_input),
             inputs: channels as u32,
+            rate: Some(stream_rate as u32),
             ..binding_of(kind, name)
         };
         Ok(Bound { binding, slots: vec![id], handles: vec![Handle::NetReceive(h)] })
@@ -920,6 +1030,7 @@ impl DeviceManager {
             first_output: ch.first_output as u32,
             outputs: daw_inputs as u32,
             endpoint_id: None,
+            rate: None,
         };
         let handles = stats.map(Handle::Vasio).into_iter().collect();
         Ok(Bound { binding, slots: vec![id], handles })
@@ -963,6 +1074,7 @@ impl DeviceManager {
             first_output: 0,
             outputs: 0,
             endpoint_id: None,
+            rate: None,
         };
         let handles = stats.map(Handle::Vaio).into_iter().collect();
         Ok(Bound { binding, slots: vec![id], handles })
@@ -1039,6 +1151,7 @@ impl DeviceManager {
             first_output: 0,
             outputs: outs as u32,
             endpoint_id: None,
+            rate: None,
         };
         for s in engine.slots().into_iter().filter(|s| slots.contains(&s.id)) {
             if s.inputs > 0 {
@@ -1190,7 +1303,16 @@ fn start_now(engine: &mut Engine, mut bound: Bound, start: Option<PendingStart>)
 
 /// A binding with only its identity filled in (for comparisons).
 fn binding_of(kind: DeviceKind, name: &str) -> Binding {
-    Binding { kind, name: name.to_string(), first_input: 0, inputs: 0, first_output: 0, outputs: 0, endpoint_id: None }
+    Binding {
+        kind,
+        name: name.to_string(),
+        first_input: 0,
+        inputs: 0,
+        first_output: 0,
+        outputs: 0,
+        endpoint_id: None,
+        rate: None,
+    }
 }
 
 /// Whether `binding` is the device `kind`/`name` (VASIO: the same instance,
@@ -1213,6 +1335,9 @@ fn same_device(binding: &Binding, kind: DeviceKind, name: &str) -> bool {
     }
 }
 
+/// An offline network stream whose engine is found but that fails to open is
+/// tried again after this long.
+const NET_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// A receive stream silent this long is reported lost.
 const NET_SILENT_MS: u64 = 1000;
 /// The most latency a receive stream may grow to absorb a bad network.

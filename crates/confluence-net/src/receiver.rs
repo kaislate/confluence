@@ -280,9 +280,9 @@ impl Receiver {
             None => self.expected = Some(ts),
             Some(e) => {
                 let d = diff(ts, e);
-                if d < -(BEHIND_RESYNC_S * self.rate as f64) as i64 || d > (AHEAD_RESYNC_S * self.rate as f64) as i64 {
-                    self.resync(ts);
-                } else if d < 0 && self.late_streak(arrival, frames) {
+                let far =
+                    d < -(BEHIND_RESYNC_S * self.rate as f64) as i64 || d > (AHEAD_RESYNC_S * self.rate as f64) as i64;
+                if far || (d < 0 && self.late_streak(arrival, frames)) {
                     self.resync(ts);
                 } else if d < 0 {
                     self.stats.late += 1;
