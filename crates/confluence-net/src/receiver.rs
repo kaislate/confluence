@@ -1,6 +1,11 @@
 //! One received stream: puts packets back in order, reassembles blocks split
 //! across packets, conceals losses, and hands whole blocks (with their arrival
 //! time) to the slot's bridge, which does the clock recovery.
+//!
+//! Losses are concealed on time: from the earliest arrivals against the
+//! sender's timestamps the receiver knows when each block is due, and a block
+//! overdue by the wait is concealed then, without waiting for a later packet
+//! (a burst of losses must not drain the bridge).
 
 use crate::packet::Header;
 
@@ -21,6 +26,22 @@ const AHEAD_RESYNC_S: f64 = 0.2;
 const BEHIND_RESYNC_S: f64 = 1.0;
 /// Blocks held at most; beyond, the oldest gap is concealed at once.
 const MAX_PENDING: usize = 64;
+/// When blocks are due is judged from the earliest arrivals over the last one
+/// to two of these (seconds): long enough to see the best case, short enough
+/// to follow the sender's clock drifting against ours.
+const DUE_WINDOW_S: f64 = 0.5;
+/// Nothing arriving for this long (seconds) means the stream stopped: stop
+/// concealing (the bridge then runs dry and restarts when it returns).
+const MAX_CONCEAL_S: f64 = 0.5;
+/// The share of packets expected to arrive within the spread: the rest (a
+/// stall, a delay spike) are concealed if overdue, and teach the wait if they
+/// then turn up.
+const SPREAD_QUANTILE: f64 = 0.99;
+/// How fast (seconds per packet) the spread follows the jitter seen.
+const SPREAD_STEP_S: f64 = 2e-5;
+/// The sender's timeline is re-anchored this often (in frames), well within
+/// the wrapping timestamp's range.
+const REANCHOR_FRAMES: i64 = 1 << 24;
 
 /// What a receiver has seen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,7 +88,67 @@ pub struct Receiver {
     prev: Vec<f32>,
     /// Blocks concealed in a row.
     lost_run: u32,
+    /// The time the last block was handed on with: the bridge recovers the
+    /// sender's clock from these, so they never go backwards.
+    last_time: f64,
+    /// When blocks are due, from arrival offsets `arrival - (ts - anchor) / rate`.
+    due: Due,
+    /// Frames per block (from the last packet).
+    block_frames: usize,
+    /// Since when blocks have been concealed on time with nothing arriving.
+    concealing_since: Option<f64>,
+    /// Blocks `start..end` concealed on time (late packets of these teach the wait).
+    timed: Option<(u32, u32)>,
     stats: ReceiverStats,
+}
+
+/// Arrival offsets (arrival minus the sender's time since the anchor): the
+/// earliest over a sliding window, and how much later than that packets come.
+struct Due {
+    anchor: u32,
+    /// When the current window began (`None` before the first packet).
+    since: Option<f64>,
+    current: f64,
+    previous: f64,
+    /// How much later than the earliest most packets arrive (a running
+    /// `SPREAD_QUANTILE` estimate).
+    spread: f64,
+}
+
+impl Default for Due {
+    fn default() -> Due {
+        Due { anchor: 0, since: None, current: f64::INFINITY, previous: f64::INFINITY, spread: 0.0 }
+    }
+}
+
+impl Due {
+    /// The earliest offset over the last one to two windows; infinite until
+    /// a whole window has been seen.
+    fn earliest(&self) -> f64 {
+        if self.previous.is_finite() {
+            self.current.min(self.previous)
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn observe(&mut self, offset: f64, arrival: f64) {
+        let since = *self.since.get_or_insert(arrival);
+        if arrival - since >= DUE_WINDOW_S {
+            (self.previous, self.current, self.since) = (self.current, offset, Some(arrival));
+        } else {
+            self.current = self.current.min(offset);
+        }
+        let earliest = self.current.min(self.previous);
+        let step = if offset - earliest > self.spread { SPREAD_QUANTILE } else { SPREAD_QUANTILE - 1.0 };
+        self.spread = (self.spread + SPREAD_STEP_S * step).clamp(0.0, MAX_HOLD_S);
+    }
+
+    /// The anchor moves `by` seconds later on the sender's timeline.
+    fn shift(&mut self, by: f64) {
+        self.current += by;
+        self.previous += by;
+    }
 }
 
 fn mask(channels: u8) -> u64 {
@@ -96,6 +177,11 @@ impl Receiver {
             last: Vec::new(),
             prev: Vec::new(),
             lost_run: 0,
+            last_time: f64::NEG_INFINITY,
+            due: Due::default(),
+            block_frames: 0,
+            concealing_since: None,
+            timed: None,
             stats: ReceiverStats::default(),
         }
     }
@@ -109,10 +195,12 @@ impl Receiver {
         self.hold
     }
 
-    /// Frames the slot's bridge must hold beyond its base to ride out a wait
-    /// for a late packet (see `InputDeviceSide::set_latency_floor`).
+    /// Frames the slot's bridge must hold beyond its base: a block can be
+    /// handed on as late as the spread plus the wait after its earliest
+    /// arrival (see `InputDeviceSide::set_latency_floor`).
     pub fn latency_floor(&self) -> f64 {
-        self.hold * self.rate as f64
+        let hold = self.hold.max(HOLD_PACKETS * self.block_frames as f64 / self.rate as f64);
+        (self.due.spread + hold) * self.rate as f64
     }
 
     /// A packet turned up `late` seconds after a newer one: wait that long (and a bit).
@@ -125,7 +213,33 @@ impl Receiver {
         self.pending.clear();
         self.expected = Some(ts);
         self.newest = None;
+        self.due = Due::default();
+        self.timed = None;
         self.stats.resyncs += 1;
+    }
+
+    /// Seconds from the anchor to `ts` on the sender's timeline.
+    fn since_anchor(&self, ts: u32) -> f64 {
+        diff(ts, self.due.anchor) as f64 / self.rate as f64
+    }
+
+    /// When block `ts` arrives at the latest without a stall, once known.
+    fn due_at(&self, ts: u32) -> Option<f64> {
+        let earliest = self.due.earliest();
+        earliest.is_finite().then(|| earliest + self.since_anchor(ts) + self.due.spread)
+    }
+
+    /// Learns from a packet's arrival when blocks are due.
+    fn observe(&mut self, ts: u32, arrival: f64) {
+        if self.due.since.is_none() {
+            self.due.anchor = ts;
+        } else if diff(ts, self.due.anchor).abs() > REANCHOR_FRAMES {
+            let shift = self.since_anchor(ts);
+            self.due.shift(shift);
+            self.due.anchor = ts;
+        }
+        let offset = arrival - self.since_anchor(ts);
+        self.due.observe(offset, arrival);
     }
 
     /// Takes a packet (`samples` interleaved, `h.channels` per frame) that
@@ -152,10 +266,18 @@ impl Receiver {
                             self.learn(arrival - after, frames);
                         }
                     }
+                    if let (Some((start, end)), Some(due)) = (self.timed, self.due_at(ts)) {
+                        if diff(ts, start) >= 0 && diff(end, ts) > 0 {
+                            self.learn(arrival - due, frames);
+                        }
+                    }
                     return;
                 }
             }
         }
+        self.observe(ts, arrival);
+        self.block_frames = frames;
+        self.concealing_since = None;
         match self.newest {
             Some((n, at)) if diff(ts, n) < 0 => {
                 self.stats.reordered += 1;
@@ -212,10 +334,19 @@ impl Receiver {
                 self.emit_real(p.data, p.last_arrival, out);
                 continue;
             }
-            let Some(i) = (0..self.pending.len()).min_by_key(|&i| diff(self.pending[i].ts, e)) else { return };
+            let Some(i) = (0..self.pending.len()).min_by_key(|&i| diff(self.pending[i].ts, e)) else {
+                if self.conceal_overdue(e, None, now, out) {
+                    continue;
+                }
+                return;
+            };
             let p = &self.pending[i];
             let hold = self.hold.max(HOLD_PACKETS * p.frames as f64 / self.rate as f64);
             if now < p.first_arrival + hold && self.pending.len() <= MAX_PENDING {
+                let next = (p.ts != e).then_some(p.ts);
+                if self.conceal_overdue(e, next, now, out) {
+                    continue;
+                }
                 return;
             }
             if p.ts == e {
@@ -223,19 +354,51 @@ impl Receiver {
                 let p = self.pending.swap_remove(i);
                 self.stats.lost += 1;
                 self.expected = Some(e.wrapping_add(p.frames as u32));
-                self.emit_real(p.data, now, out);
+                self.emit_real(p.data, p.last_arrival, out);
                 continue;
             }
-            let (gap, frames) = (diff(p.ts, e) as usize, p.frames);
-            self.concealed = Some((e, p.ts, p.first_arrival));
+            let (gap, frames, next) = (diff(p.ts, e) as usize, p.frames, p.first_arrival);
+            self.concealed = Some((e, p.ts, next));
+            // The missing blocks would have arrived before the next one: stamp
+            // them spread out up to its arrival, not with the (later) time now,
+            // or the bridge would see the sender's clock jump back and forth.
+            let start = if self.last_time.is_finite() { self.last_time.min(next) } else { next };
+            let blocks = gap.div_ceil(frames);
             let mut done = 0;
-            while done < gap {
+            for k in 1..=blocks {
                 let n = frames.min(gap - done);
-                self.emit_concealed(n, now, out);
+                self.emit_concealed(n, start + (next - start) * k as f64 / blocks as f64, out);
                 done += n;
             }
             self.expected = Some(e.wrapping_add(gap as u32));
         }
+    }
+
+    /// Conceals block `e` if it is overdue (and the stream has not stopped),
+    /// up to `next` (the next block held, if any). Returns whether it did.
+    fn conceal_overdue(&mut self, e: u32, next: Option<u32>, now: f64, out: &mut dyn FnMut(&[f32], f64)) -> bool {
+        let Some(due) = self.due_at(e) else { return false };
+        let frames = self.block_frames;
+        let hold = self.hold.max(HOLD_PACKETS * frames as f64 / self.rate as f64);
+        if frames == 0 || now < due + hold {
+            return false;
+        }
+        let since = *self.concealing_since.get_or_insert(now);
+        if now - since > MAX_CONCEAL_S {
+            return false;
+        }
+        let n = next.map_or(frames, |t| frames.min(diff(t, e).max(0) as usize));
+        if n == 0 {
+            return false;
+        }
+        let end = e.wrapping_add(n as u32);
+        self.timed = match self.timed {
+            Some((start, prev_end)) if prev_end == e => Some((start, end)),
+            _ => Some((e, end)),
+        };
+        self.emit_concealed(n, due.min(now), out);
+        self.expected = Some(end);
+        true
     }
 
     fn emit_real(&mut self, mut data: Vec<f32>, time: f64, out: &mut dyn FnMut(&[f32], f64)) {
@@ -253,7 +416,8 @@ impl Receiver {
             self.lost_run = 0;
         }
         self.hold *= 1.0 - HOLD_DECAY;
-        out(&data, time);
+        self.last_time = self.last_time.max(time);
+        out(&data, self.last_time);
         self.last.clone_from(&data);
         self.prev = data;
     }
@@ -276,7 +440,8 @@ impl Receiver {
                 }
             }
         }
-        out(&data, time);
+        self.last_time = self.last_time.max(time);
+        out(&data, self.last_time);
         self.prev = data;
     }
 }
@@ -452,7 +617,73 @@ mod tests {
         assert!(lost_after_learning.unwrap() <= 2, "{:?}", r.stats());
         assert_eq!(r.stats().lost, lost_after_learning.unwrap(), "learned: no more losses {:?}", r.stats());
         assert!(r.hold() > 3.0 * PT && r.hold() <= MAX_HOLD_S, "{}", r.hold());
-        assert_eq!(r.latency_floor(), r.hold() * 48_000.0, "the bridge must cover the wait");
+        assert!(r.latency_floor() >= r.hold() * 48_000.0, "the bridge must cover the wait");
+    }
+
+    /// Steady 1 ms packets (jittering by up to `jitter` packet times) from block 0
+    /// for `seconds`; returns the next block's timestamp and arrival time.
+    fn steady(r: &mut Receiver, out: &mut Out, seconds: f64, jitter: f64) -> (u32, f64) {
+        let mut rng = 0x1234_5678u64;
+        let n = (seconds / PT) as u32;
+        for i in 0..n {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (rng >> 33) as f64 / (1u64 << 31) as f64 * jitter * PT;
+            let t = i as f64 * PT + j;
+            r.push(&header(i * 48, 0, 1, 1), &block(0.1, 1), t, &mut out.sink(1));
+            r.poll(t, &mut out.sink(1));
+        }
+        (n * 48, n as f64 * PT)
+    }
+
+    #[test]
+    fn a_long_loss_is_concealed_on_time_without_waiting_for_the_next_packet() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        let (ts, t0) = steady(&mut r, &mut out, 2.0, 0.5);
+        let before = out.frames.len();
+        // Nothing arrives for 30 ms: the gap is filled as it goes, a few ms behind.
+        for k in 1..=30 {
+            r.poll(t0 + k as f64 * PT, &mut out.sink(1));
+        }
+        let filled = (out.frames.len() - before) / 48;
+        assert!((25..=30).contains(&filled), "{filled} of 30 blocks filled in on time");
+        assert!(out.times.windows(2).all(|w| w[1] >= w[0]), "times never go back");
+        let last = *out.times.last().unwrap();
+        assert!(last <= t0 + 30.0 * PT && last > t0 + 20.0 * PT, "stamped on the sender's timeline: {last}");
+        // The stream comes back where it should be: no extra latency, nothing late.
+        let next = ts + 30 * 48;
+        r.push(&header(next, 0, 1, 1), &block(0.2, 1), t0 + 30.0 * PT, &mut out.sink(1));
+        r.poll(t0 + 32.5 * PT, &mut out.sink(1));
+        assert_eq!(out.frames.len() - before, 31 * 48);
+        assert_eq!(r.stats().late, 0);
+    }
+
+    #[test]
+    fn a_stream_that_stops_is_not_concealed_for_ever() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        let (_, t0) = steady(&mut r, &mut out, 2.0, 0.0);
+        for k in 1..=3000 {
+            r.poll(t0 + k as f64 * PT, &mut out.sink(1));
+        }
+        let concealed = out.frames.len() / 48 - 2000;
+        assert!((400..=600).contains(&concealed), "{concealed} blocks concealed after the stream stopped");
+    }
+
+    #[test]
+    fn a_stall_that_delivers_late_packets_teaches_the_wait() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        let (ts, t0) = steady(&mut r, &mut out, 2.0, 0.0);
+        // The link stalls for 12 ms, then everything queued arrives at once.
+        for k in 0..12u32 {
+            r.poll(t0 + k as f64 * PT, &mut out.sink(1));
+        }
+        for k in 0..12u32 {
+            r.push(&header(ts + k * 48, 0, 1, 1), &block(0.1, 1), t0 + 12.0 * PT, &mut out.sink(1));
+        }
+        assert!(r.stats().late > 0, "concealed while stalled: {:?}", r.stats());
+        assert!(r.hold() >= 0.010, "the wait covers a stall like that now: {}", r.hold());
     }
 
     #[test]
