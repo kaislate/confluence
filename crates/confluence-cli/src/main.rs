@@ -312,6 +312,12 @@ fn render(resp: &Response) -> String {
                 if h.driver_requests > 0 {
                     line.push_str(&format!("  {} driver requests (re-add the device)", h.driver_requests));
                 }
+                if let Some(n) = h.net {
+                    line.push_str(&format!(
+                        "  net {} packets, {} lost, {} late, {} reordered",
+                        n.packets, n.lost, n.late, n.reordered
+                    ));
+                }
                 line
             }));
             lines.join("\n")
@@ -725,6 +731,11 @@ v7  slot #3 removed"
         let text = render(&Response::Health { blocks: 9, slots: vec![waiting], notices: vec!["x is odd".into()] });
         assert!(text.contains("no app playing") && !text.contains("DAW"), "the slot's own note: {text}");
         assert!(text.contains("note: x is odd"), "{text}");
+        let mut stream = h(6, false, 0, 0);
+        stream.net =
+            Some(confluence_api::NetStats { packets: 900, lost: 2, late: 1, reordered: 5, malformed: 0, silent_ms: 3 });
+        let text = render(&Response::Health { blocks: 9, slots: vec![stream], notices: Vec::new() });
+        assert!(text.contains("net 900 packets, 2 lost, 1 late, 5 reordered"), "{text}");
         let mut unexplained = h(5, false, 0, 0);
         unexplained.attached = Some(false);
         let text = render(&Response::Health { blocks: 9, slots: vec![unexplained], notices: Vec::new() });
