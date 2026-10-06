@@ -1015,6 +1015,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "confluence-net"
+version = "0.1.0"
+dependencies = [
+ "confluence-core",
+]
+
+[[package]]
 name = "confluence-plugin-host"
 version = "0.1.0"
 dependencies = [

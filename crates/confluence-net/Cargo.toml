@@ -1,0 +1,13 @@
+[package]
+name = "confluence-net"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Confluence network audio: RTP streams between engines, and discovery"
+
+[dependencies]
+confluence-core = { path = "../confluence-core" }
+
+[lints]
+workspace = true
