@@ -108,6 +108,7 @@ fn load(opener: &AsioOpener, kind: DeviceKind, name: &str, endpoint_id: Option<&
             parse_vaio(name)?;
             Loaded::Vaio
         }
+        DeviceKind::NetSend | DeviceKind::NetReceive => return Err("network streams are not available yet".into()),
         DeviceKind::WasapiRender | DeviceKind::WasapiCapture | DeviceKind::AppCapture => {
             let target = match kind {
                 DeviceKind::WasapiRender => {

@@ -1163,6 +1163,7 @@ impl Engine {
                     driver_requests: 0,
                     attached: None,
                     idle_note: None,
+                    net: None,
                 })
             }
             SlotStats::Master => Some(SlotHealth {
@@ -1178,6 +1179,7 @@ impl Engine {
                 driver_requests: 0,
                 attached: None,
                 idle_note: None,
+                net: None,
             }),
             SlotStats::Strict(stats) => {
                 let (underruns, overruns) = stats.xruns();
@@ -1195,6 +1197,7 @@ impl Engine {
                     driver_requests: 0,
                     attached,
                     idle_note: (attached == Some(false)).then(|| stats.idle_note()).flatten().map(String::from),
+                    net: None,
                 })
             }
             SlotStats::Bus(faults) => Some(SlotHealth {
@@ -1210,6 +1213,7 @@ impl Engine {
                 driver_requests: 0,
                 attached: None,
                 idle_note: None,
+                net: None,
             }),
             SlotStats::None => None,
         }

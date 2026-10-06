@@ -177,6 +177,7 @@ mod tests {
             midi_bindings: Vec::new(),
             midi_learning: None,
             scripts,
+            peers: Vec::new(),
         }
     }
 

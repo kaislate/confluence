@@ -46,6 +46,9 @@ pub fn diff(old: &State, new: &State) -> Vec<Change> {
     {
         out.push(Change::MidiChanged(new.midi_inputs.clone(), new.midi_bindings.clone(), new.midi_learning));
     }
+    if old.peers != new.peers {
+        out.push(Change::PeersChanged(new.peers.clone()));
+    }
     if old.scripts != new.scripts {
         out.push(Change::ScriptsChanged(new.scripts.clone()));
     }
@@ -122,6 +125,7 @@ impl State {
                     self.midi_learning = *learning;
                 }
                 Change::ScriptsChanged(scripts) => self.scripts = scripts.clone(),
+                Change::PeersChanged(peers) => self.peers = peers.clone(),
                 Change::PluginsChanged(found, bad) => {
                     self.plugins = found.clone();
                     self.bad_plugins = bad.clone();
@@ -197,6 +201,7 @@ mod tests {
             midi_bindings: Vec::new(),
             midi_learning: None,
             scripts: Vec::new(),
+            peers: Vec::new(),
         }
     }
 
@@ -227,6 +232,18 @@ mod tests {
                 read_only: false,
             }],
         }
+    }
+
+    #[test]
+    fn peer_changes_are_found_and_applied() {
+        let a = state(vec![slot(1, true)], vec![]);
+        let mut b = a.clone();
+        b.peers = vec![crate::Peer { name: "Lilith".into(), address: "192.168.50.12".into(), port: 6990 }];
+        let changes = diff(&a, &b);
+        assert_eq!(changes, vec![Change::PeersChanged(b.peers.clone())]);
+        let mut applied = a.clone();
+        applied.apply(&changes);
+        assert_eq!(applied, b);
     }
 
     #[test]

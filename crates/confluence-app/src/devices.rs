@@ -48,6 +48,8 @@ pub fn kind_title(kind: DeviceKind) -> &'static str {
         DeviceKind::AppCapture => "App capture",
         DeviceKind::Vasio => "VASIO",
         DeviceKind::Vaio => "VAIO",
+        DeviceKind::NetSend => "Network send",
+        DeviceKind::NetReceive => "Network receive",
     }
 }
 

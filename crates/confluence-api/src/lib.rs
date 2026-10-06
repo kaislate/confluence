@@ -10,7 +10,7 @@ pub mod taper;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 7;
+pub const API_VERSION: u16 = 8;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -342,6 +342,33 @@ pub struct SlotHealth {
     /// "no app playing" for VAIO).
     #[serde(default)]
     pub idle_note: Option<String>,
+    /// For a network receive stream: what arrived.
+    #[serde(default)]
+    pub net: Option<NetStats>,
+}
+
+/// What a network receive stream has seen since it was added.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetStats {
+    pub packets: u64,
+    /// Never arrived (concealed).
+    pub lost: u64,
+    /// Arrived after their place was concealed (dropped).
+    pub late: u64,
+    /// Arrived out of order and were put back in order.
+    pub reordered: u64,
+    /// Could not be read (dropped).
+    pub malformed: u64,
+    /// Time since the last packet, in ms.
+    pub silent_ms: u64,
+}
+
+/// Another Confluence engine found on the network.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peer {
+    pub name: String,
+    pub address: String,
+    pub port: u16,
 }
 
 /// Kinds of device the engine can open.
@@ -359,6 +386,12 @@ pub enum DeviceKind {
     /// The Confluence VAIO virtual Windows playback endpoint. `name` is `1`
     /// (Milestone 0 has one endpoint). What apps play to it becomes two engine inputs.
     Vaio,
+    /// Audio sent to another Confluence engine. `name` is
+    /// `<peer>/<stream>[:<channels>]`; `<peer>` is an engine name or an IPv4
+    /// address (with an optional `:port`).
+    NetSend,
+    /// Audio received from another Confluence engine, `<peer>/<stream>[:<channels>]`.
+    NetReceive,
 }
 
 impl DeviceKind {
@@ -371,6 +404,8 @@ impl DeviceKind {
             DeviceKind::AppCapture => "app",
             DeviceKind::Vasio => "vasio",
             DeviceKind::Vaio => "vaio",
+            DeviceKind::NetSend => "net-out",
+            DeviceKind::NetReceive => "net-in",
         }
     }
 
@@ -383,6 +418,8 @@ impl DeviceKind {
             DeviceKind::AppCapture,
             DeviceKind::Vasio,
             DeviceKind::Vaio,
+            DeviceKind::NetSend,
+            DeviceKind::NetReceive,
         ]
         .into_iter()
         .find(|k| k.prefix() == p)
@@ -535,6 +572,9 @@ pub struct State {
     pub midi_learning: Option<(u32, u32)>,
     /// Luau scripts, sorted by name.
     pub scripts: Vec<ScriptInfo>,
+    /// Other Confluence engines found on the network, sorted by name.
+    #[serde(default)]
+    pub peers: Vec<Peer>,
 }
 
 /// One difference between two published states.
@@ -566,6 +606,7 @@ pub enum Change {
     /// MIDI inputs, bindings, and the route being learned.
     MidiChanged(Vec<String>, Vec<MidiBinding>, Option<(u32, u32)>),
     ScriptsChanged(Vec<ScriptInfo>),
+    PeersChanged(Vec<Peer>),
     /// Only a parameter's value (and its text) changed.
     ParamChanged {
         bus: u32,
