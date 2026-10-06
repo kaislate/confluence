@@ -7,7 +7,13 @@ rust-version.workspace = true
 description = "Confluence network audio: RTP streams between engines, and discovery"
 
 [dependencies]
+confluence-api = { path = "../confluence-api" }
 confluence-core = { path = "../confluence-core" }
+confluence-rt = { path = "../confluence-rt" }
+rtrb.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Networking_WinSock"] }
 
 [lints]
 workspace = true

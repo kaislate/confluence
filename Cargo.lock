@@ -1018,7 +1018,11 @@ dependencies = [
 name = "confluence-net"
 version = "0.1.0"
 dependencies = [
+ "confluence-api",
  "confluence-core",
+ "confluence-rt",
+ "rtrb",
+ "windows",
 ]
 
 [[package]]
