@@ -18,6 +18,7 @@ const RATE: f64 = 48_000.0;
 const PACKET: usize = 48;
 const SENDER_BLOCK: usize = 256;
 const MASTER_BLOCK: usize = 256;
+const COARSE_TICK: f64 = 0.0156;
 
 struct Rng(u64);
 impl Rng {
@@ -40,6 +41,9 @@ struct Net {
     /// Each block comes as two packets (one per channel; the slot plays the
     /// first), lost and delayed independently: a block can arrive in part.
     split: bool,
+    /// Both network threads wake only every 15.6 ms (a PC or VM on the default
+    /// timer): packets leave and are read in clumps.
+    coarse: bool,
 }
 
 fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
@@ -76,6 +80,10 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
                     delay += 0.015;
                 }
                 let mut arrival = sent + delay;
+                if net.coarse {
+                    let wake = |t: f64| (t / COARSE_TICK).ceil() * COARSE_TICK;
+                    arrival = wake(wake(sent) + delay);
+                }
                 let mut lost = false;
                 if net.wifi {
                     // Bursty loss: 0.5% of packets start a burst of 4 on average.
@@ -105,6 +113,7 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
     let mut worst_ppm = 0f64;
     let (mut prev, mut max_jump, mut primed) = ([0f32; 2], 0f32, 0u32);
     let mut poll_at = 0.0;
+    let tick = if net.coarse { COARSE_TICK } else { 0.001 };
     loop {
         let t_master = (blocks + 1) as f64 * MASTER_BLOCK as f64 / RATE;
         if t_master > seconds - 0.1 {
@@ -114,7 +123,7 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
         while next < arrivals.len() && arrivals[next].0 <= t_master {
             while poll_at < arrivals[next].0 {
                 rx.poll(poll_at, &mut |d, t| dev.write_interleaved(d, t));
-                poll_at += 0.001;
+                poll_at += tick;
             }
             let (t, ts, part, ref s) = arrivals[next];
             let h = Header {
@@ -135,7 +144,7 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
         // The network thread polls every millisecond, packets or not.
         while poll_at <= t_master {
             rx.poll(poll_at, &mut |d, t| dev.write_interleaved(d, t));
-            poll_at += 0.001;
+            poll_at += tick;
         }
         eng.read(&mut out, 0, t_master, 0.0);
         blocks += 1;
@@ -161,6 +170,9 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
     let at_settle = xruns_at_settle.unwrap();
     assert_eq!(h.underruns + h.overruns, at_settle, "xruns after settling: {h:?}, receiver {:?}", rx.stats());
     assert!(worst_ppm < 10.0, "drift estimate off by up to {worst_ppm} ppm ({h:?}), receiver {:?}", rx.stats());
+    if net.coarse {
+        assert_eq!(rx.stats().lost, 0, "nothing is lost, so nothing may be concealed: {:?}", rx.stats());
+    }
     if !net.wifi {
         // Losses are concealed, which is a discontinuity of its own.
         assert!(max_jump < 0.02, "discontinuity {max_jump} ({h:?})");
@@ -176,6 +188,11 @@ fn a_wired_stream_with_drift_and_bursts_plays_cleanly() {
 #[test]
 fn delay_spikes_grow_the_buffer_and_then_play_cleanly() {
     run(-120.0, Net { spikes: true, ..Net::default() }, 90.0, 45.0);
+}
+
+#[test]
+fn network_threads_on_a_coarse_timer_lose_nothing() {
+    run(40.0, Net { coarse: true, ..Net::default() }, 60.0, 30.0);
 }
 
 #[test]

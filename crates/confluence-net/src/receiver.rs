@@ -37,6 +37,9 @@ const MAX_CONCEAL_S: f64 = 0.5;
 /// stall, a delay spike) are concealed if overdue, and teach the wait if they
 /// then turn up.
 const SPREAD_QUANTILE: f64 = 0.99;
+/// The most the spread may be (seconds): two network threads on a 15.6 ms
+/// timer spread packets over about 31 ms.
+const MAX_SPREAD_S: f64 = 0.035;
 /// How fast (seconds per packet) the spread follows the jitter seen.
 const SPREAD_STEP_S: f64 = 2e-5;
 /// Late packets still coming this long (in packet times, at least the wait)
@@ -123,11 +126,21 @@ struct Due {
     /// How much later than the earliest most packets arrive (a running
     /// `SPREAD_QUANTILE` estimate).
     spread: f64,
+    /// The latest offset seen before the first window completed: the spread
+    /// starts from the whole range seen then, not from nothing.
+    first_latest: f64,
 }
 
 impl Default for Due {
     fn default() -> Due {
-        Due { anchor: 0, since: None, current: f64::INFINITY, previous: f64::INFINITY, spread: 0.0 }
+        Due {
+            anchor: 0,
+            since: None,
+            current: f64::INFINITY,
+            previous: f64::INFINITY,
+            spread: 0.0,
+            first_latest: f64::NEG_INFINITY,
+        }
     }
 }
 
@@ -145,13 +158,21 @@ impl Due {
     fn observe(&mut self, offset: f64, arrival: f64) {
         let since = *self.since.get_or_insert(arrival);
         if arrival - since >= DUE_WINDOW_S {
+            if !self.previous.is_finite() {
+                // The first window: blocks are due from now on, and how much
+                // later than the earliest they come is what this window saw.
+                self.spread = self.spread.max(self.first_latest - self.current).min(MAX_SPREAD_S);
+            }
             (self.previous, self.current, self.since) = (self.current, offset, Some(arrival));
         } else {
             self.current = self.current.min(offset);
         }
+        if !self.previous.is_finite() {
+            self.first_latest = self.first_latest.max(offset);
+        }
         let earliest = self.current.min(self.previous);
         let step = if offset - earliest > self.spread { SPREAD_QUANTILE } else { SPREAD_QUANTILE - 1.0 };
-        self.spread = (self.spread + SPREAD_STEP_S * step).clamp(0.0, MAX_HOLD_S);
+        self.spread = (self.spread + SPREAD_STEP_S * step).clamp(0.0, MAX_SPREAD_S);
     }
 
     /// The anchor moves `by` seconds later on the sender's timeline.

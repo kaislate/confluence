@@ -336,6 +336,32 @@ impl Drop for SendHandle {
     }
 }
 
+/// Asks Windows for 1 ms timer resolution while it lives: on the default
+/// 15.6 ms timer the thread would send and read packets in clumps (receivers
+/// cope, at the cost of latency).
+struct FineTimer;
+
+impl FineTimer {
+    fn start() -> FineTimer {
+        #[cfg(windows)]
+        // SAFETY: plain call; undone in Drop.
+        unsafe {
+            windows::Win32::Media::timeBeginPeriod(1);
+        }
+        FineTimer
+    }
+}
+
+impl Drop for FineTimer {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        // SAFETY: undoes the call in `start`.
+        unsafe {
+            windows::Win32::Media::timeEndPeriod(1);
+        }
+    }
+}
+
 /// Waits until the socket is readable or `TICK` has passed.
 #[cfg(windows)]
 fn wait_readable(socket: &UdpSocket) {
@@ -355,6 +381,7 @@ fn wait_readable(_socket: &UdpSocket) {
 fn run(socket: UdpSocket, inner: Arc<Mutex<Inner>>, stop: Arc<AtomicBool>) {
     #[cfg(windows)]
     let _mmcss = confluence_rt::ProAudioThread::enter().ok();
+    let _timer = FineTimer::start();
     let mut buf = [0u8; 2048];
     let mut samples = vec![0.0f32; 64 * 2048];
     while !stop.load(Ordering::Relaxed) {
