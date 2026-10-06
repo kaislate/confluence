@@ -39,6 +39,10 @@ const MAX_CONCEAL_S: f64 = 0.5;
 const SPREAD_QUANTILE: f64 = 0.99;
 /// How fast (seconds per packet) the spread follows the jitter seen.
 const SPREAD_STEP_S: f64 = 2e-5;
+/// Late packets still coming this long (in packet times, at least the wait)
+/// after the first, with nothing on time between: the sender's timeline has
+/// shifted (it paused, or the path got slower) and is picked up afresh.
+const LATE_STREAK_PACKETS: f64 = 3.0;
 /// The sender's timeline is re-anchored this often (in frames), well within
 /// the wrapping timestamp's range.
 const REANCHOR_FRAMES: i64 = 1 << 24;
@@ -99,6 +103,12 @@ pub struct Receiver {
     concealing_since: Option<f64>,
     /// Blocks `start..end` concealed on time (late packets of these teach the wait).
     timed: Option<(u32, u32)>,
+    /// When the current run of late packets (with nothing on time since) began.
+    late_since: Option<f64>,
+    /// The longest wait the current run of late packets would teach: learned
+    /// when a packet on time ends the run (it was a stall), not if the run
+    /// turns out to be a shifted timeline.
+    late_lesson: f64,
     stats: ReceiverStats,
 }
 
@@ -182,6 +192,8 @@ impl Receiver {
             block_frames: 0,
             concealing_since: None,
             timed: None,
+            late_since: None,
+            late_lesson: 0.0,
             stats: ReceiverStats::default(),
         }
     }
@@ -213,9 +225,20 @@ impl Receiver {
         self.pending.clear();
         self.expected = Some(ts);
         self.newest = None;
-        self.due = Due::default();
+        // The network is the same: keep how much packets spread.
+        self.due = Due { spread: self.due.spread, ..Due::default() };
         self.timed = None;
+        self.late_since = None;
+        self.late_lesson = 0.0;
         self.stats.resyncs += 1;
+    }
+
+    /// Whether late packets have kept coming long enough (counting this one at
+    /// `arrival`) that the sender's timeline must have shifted.
+    fn late_streak(&mut self, arrival: f64, frames: usize) -> bool {
+        let since = *self.late_since.get_or_insert(arrival);
+        let packet = frames as f64 / self.rate as f64;
+        arrival - since >= (LATE_STREAK_PACKETS * packet).max(self.hold)
     }
 
     /// Seconds from the anchor to `ts` on the sender's timeline.
@@ -259,16 +282,18 @@ impl Receiver {
                 let d = diff(ts, e);
                 if d < -(BEHIND_RESYNC_S * self.rate as f64) as i64 || d > (AHEAD_RESYNC_S * self.rate as f64) as i64 {
                     self.resync(ts);
+                } else if d < 0 && self.late_streak(arrival, frames) {
+                    self.resync(ts);
                 } else if d < 0 {
                     self.stats.late += 1;
                     if let Some((start, end, after)) = self.concealed {
                         if diff(ts, start) >= 0 && diff(end, ts) > 0 {
-                            self.learn(arrival - after, frames);
+                            self.late_lesson = self.late_lesson.max(arrival - after);
                         }
                     }
                     if let (Some((start, end)), Some(due)) = (self.timed, self.due_at(ts)) {
                         if diff(ts, start) >= 0 && diff(end, ts) > 0 {
-                            self.learn(arrival - due, frames);
+                            self.late_lesson = self.late_lesson.max(arrival - due);
                         }
                     }
                     return;
@@ -276,6 +301,11 @@ impl Receiver {
             }
         }
         self.observe(ts, arrival);
+        self.late_since = None;
+        if self.late_lesson > 0.0 {
+            self.learn(self.late_lesson, frames);
+            self.late_lesson = 0.0;
+        }
         self.block_frames = frames;
         self.concealing_since = None;
         match self.newest {
@@ -691,6 +721,8 @@ mod tests {
         for k in 0..12u32 {
             r.push(&header(ts + k * 48, 0, 1, 1), &block(0.1, 1), t0 + 12.0 * PT, &mut out.sink(1));
         }
+        // And then packets come on time again.
+        r.push(&header(ts + 12 * 48, 0, 1, 1), &block(0.1, 1), t0 + 12.1 * PT, &mut out.sink(1));
         assert!(r.stats().late > 0, "concealed while stalled: {:?}", r.stats());
         assert!(r.hold() >= 0.010, "the wait covers a stall like that now: {}", r.hold());
     }
@@ -725,6 +757,31 @@ mod tests {
         assert_eq!(emitted, (n as usize + 10) * 48, "{:?}", r.stats());
         assert!(r.pending.is_empty());
         assert_eq!((r.stats().lost, r.stats().late), (1, 0), "only the half block: {:?}", r.stats());
+    }
+
+    #[test]
+    fn a_sender_that_pauses_is_picked_up_again_at_once() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        let (ts, t0) = steady(&mut r, &mut out, 2.0, 0.0);
+        // The sender's timeline stops for 100 ms (concealed meanwhile), then goes
+        // on where it left off.
+        for k in 1..=100 {
+            r.poll(t0 + k as f64 * PT, &mut out.sink(1));
+        }
+        let resume = t0 + 100.0 * PT;
+        let mut first_real = None;
+        for i in 0..50u32 {
+            let t = resume + i as f64 * PT;
+            let before = out.frames.len();
+            r.push(&header(ts + i * 48, 0, 1, 1), &block(0.7, 1), t, &mut out.sink(1));
+            r.poll(t, &mut out.sink(1));
+            if first_real.is_none() && out.frames[before..].contains(&0.7) {
+                first_real = Some(t - resume);
+            }
+        }
+        let first_real = first_real.expect("the stream never came back");
+        assert!(first_real < 0.010, "came back after {first_real} s: {:?}", r.stats());
     }
 
     #[test]
