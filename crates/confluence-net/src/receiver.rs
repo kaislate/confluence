@@ -328,6 +328,8 @@ impl Receiver {
 
     fn release(&mut self, now: f64, out: &mut dyn FnMut(&[f32], f64)) {
         while let Some(e) = self.expected {
+            // Nothing held may be behind what is expected (it was concealed).
+            self.pending.retain(|p| diff(p.ts, e) >= 0);
             if let Some(i) = self.pending.iter().position(|p| p.ts == e && p.got & p.need == p.need) {
                 let p = self.pending.swap_remove(i);
                 self.expected = Some(e.wrapping_add(p.frames as u32));
@@ -342,11 +344,14 @@ impl Receiver {
             };
             let p = &self.pending[i];
             let hold = self.hold.max(HOLD_PACKETS * p.frames as f64 / self.rate as f64);
-            if now < p.first_arrival + hold && self.pending.len() <= MAX_PENDING {
-                let next = (p.ts != e).then_some(p.ts);
-                if self.conceal_overdue(e, next, now, out) {
+            let waiting = now < p.first_arrival + hold && self.pending.len() <= MAX_PENDING;
+            if waiting && p.ts != e {
+                if self.conceal_overdue(e, Some(p.ts), now, out) {
                     continue;
                 }
+                return;
+            }
+            if waiting && !self.overdue(e, now) {
                 return;
             }
             if p.ts == e {
@@ -374,13 +379,17 @@ impl Receiver {
         }
     }
 
+    /// Whether block `e` is due and the wait after that is over.
+    fn overdue(&self, e: u32, now: f64) -> bool {
+        let hold = self.hold.max(HOLD_PACKETS * self.block_frames as f64 / self.rate as f64);
+        self.due_at(e).is_some_and(|due| now >= due + hold)
+    }
+
     /// Conceals block `e` if it is overdue (and the stream has not stopped),
     /// up to `next` (the next block held, if any). Returns whether it did.
     fn conceal_overdue(&mut self, e: u32, next: Option<u32>, now: f64, out: &mut dyn FnMut(&[f32], f64)) -> bool {
-        let Some(due) = self.due_at(e) else { return false };
-        let frames = self.block_frames;
-        let hold = self.hold.max(HOLD_PACKETS * frames as f64 / self.rate as f64);
-        if frames == 0 || now < due + hold {
+        let (Some(due), frames) = (self.due_at(e), self.block_frames) else { return false };
+        if frames == 0 || !self.overdue(e, now) {
             return false;
         }
         let since = *self.concealing_since.get_or_insert(now);
@@ -684,6 +693,38 @@ mod tests {
         }
         assert!(r.stats().late > 0, "concealed while stalled: {:?}", r.stats());
         assert!(r.hold() >= 0.010, "the wait covers a stall like that now: {}", r.hold());
+    }
+
+    #[test]
+    fn an_overdue_block_that_is_partly_there_is_used_not_concealed_over() {
+        // Two channels sent as two one-channel packets per block.
+        let mut r = rx(2);
+        let mut emitted = 0usize;
+        let mut sink = |d: &[f32], _t: f64| {
+            emitted += d.len() / 2;
+            assert!(emitted < 10_000_000, "runaway concealment");
+        };
+        let n = 2000u32;
+        for i in 0..n {
+            let t = i as f64 * PT;
+            r.push(&header(i * 48, 0, 1, 2), &block(0.1, 1), t, &mut sink);
+            r.push(&header(i * 48, 1, 1, 2), &block(0.2, 1), t, &mut sink);
+            r.poll(t, &mut sink);
+        }
+        let t0 = n as f64 * PT;
+        // Only channel 0 of the next block arrives, a little late.
+        r.push(&header(n * 48, 0, 1, 2), &block(0.1, 1), t0 + PT, &mut sink);
+        // The stream goes on (polled every half packet time).
+        for i in n + 1..n + 10 {
+            let t = (i + 1) as f64 * PT;
+            r.poll(t - 0.5 * PT, &mut sink);
+            r.push(&header(i * 48, 0, 1, 2), &block(0.1, 1), t, &mut sink);
+            r.push(&header(i * 48, 1, 1, 2), &block(0.2, 1), t, &mut sink);
+            r.poll(t, &mut sink);
+        }
+        assert_eq!(emitted, (n as usize + 10) * 48, "{:?}", r.stats());
+        assert!(r.pending.is_empty());
+        assert_eq!((r.stats().lost, r.stats().late), (1, 0), "only the half block: {:?}", r.stats());
     }
 
     #[test]

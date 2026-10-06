@@ -37,6 +37,9 @@ struct Net {
     /// Wi-Fi: about 2% of packets lost, in bursts, and the link stalls now and
     /// then and delivers what queued up in one go (in order).
     wifi: bool,
+    /// Each block comes as two packets (one per channel; the slot plays the
+    /// first), lost and delayed independently: a block can arrive in part.
+    split: bool,
 }
 
 fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
@@ -56,7 +59,8 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
 
     // Every packet with its arrival time, in arrival order.
-    let mut arrivals: Vec<(f64, u32, Vec<f32>)> = Vec::new();
+    let mut arrivals: Vec<(f64, u32, u8, Vec<f32>)> = Vec::new();
+    let parts: u8 = if net.split { 2 } else { 1 };
     let (mut losing, mut stall_until, mut last_arrival) = (false, 0.0f64, 0.0f64);
     let mut frame = 0u64;
     let mut block_end = SENDER_BLOCK as u64;
@@ -66,25 +70,27 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
             let samples: Vec<f32> = (0..PACKET)
                 .map(|n| (0.5 * (TAU * 997.0 * (frame + n as u64) as f64 / sender_rate).sin()) as f32)
                 .collect();
-            let mut delay = 0.001 + 0.003 * rng.unit();
-            if net.spikes && rng.unit() < 0.0005 {
-                delay += 0.015;
-            }
-            let mut arrival = sent + delay;
-            let mut lost = false;
-            if net.wifi {
-                // Bursty loss: 0.5% of packets start a burst of 4 on average.
-                losing = if losing { rng.unit() < 0.75 } else { rng.unit() < 0.005 };
-                lost = losing;
-                // A stall of 5 to 15 ms every second or so.
-                if arrival > stall_until && rng.unit() < 0.001 {
-                    stall_until = arrival + 0.005 + 0.010 * rng.unit();
+            for part in 0..parts {
+                let mut delay = 0.001 + 0.003 * rng.unit();
+                if net.spikes && rng.unit() < 0.0005 {
+                    delay += 0.015;
                 }
-                arrival = arrival.max(stall_until).max(last_arrival);
-                last_arrival = arrival;
-            }
-            if !lost {
-                arrivals.push((arrival, frame as u32, samples));
+                let mut arrival = sent + delay;
+                let mut lost = false;
+                if net.wifi {
+                    // Bursty loss: 0.5% of packets start a burst of 4 on average.
+                    losing = if losing { rng.unit() < 0.75 } else { rng.unit() < 0.005 };
+                    lost = losing;
+                    // A stall of 5 to 15 ms every second or so.
+                    if arrival > stall_until && rng.unit() < 0.001 {
+                        stall_until = arrival + 0.005 + 0.010 * rng.unit();
+                    }
+                    arrival = arrival.max(stall_until).max(last_arrival);
+                    last_arrival = arrival;
+                }
+                if !lost {
+                    arrivals.push((arrival, frame as u32, part, samples.clone()));
+                }
             }
             frame += PACKET as u64;
         }
@@ -110,14 +116,14 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
                 rx.poll(poll_at, &mut |d, t| dev.write_interleaved(d, t));
                 poll_at += 0.001;
             }
-            let (t, ts, ref s) = arrivals[next];
+            let (t, ts, part, ref s) = arrivals[next];
             let h = Header {
                 seq: 0,
                 timestamp: ts,
                 ssrc: 1,
                 format: Format::F32,
-                total_channels: 1,
-                first_channel: 0,
+                total_channels: parts,
+                first_channel: part,
                 channels: 1,
                 rate: RATE as u32,
                 stream: "Main".into(),
@@ -170,6 +176,11 @@ fn a_wired_stream_with_drift_and_bursts_plays_cleanly() {
 #[test]
 fn delay_spikes_grow_the_buffer_and_then_play_cleanly() {
     run(-120.0, Net { spikes: true, ..Net::default() }, 90.0, 45.0);
+}
+
+#[test]
+fn a_wifi_stream_split_across_packets_keeps_its_clock() {
+    run(-60.0, Net { wifi: true, split: true, ..Net::default() }, 120.0, 60.0);
 }
 
 #[test]
