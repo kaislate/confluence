@@ -25,6 +25,12 @@ pub struct DevicesState {
     pub bus_channels: u32,
     /// An insert bus is being added.
     pub adding_bus: bool,
+    /// The name of a stream to send.
+    pub net_stream: String,
+    /// Its channel count.
+    pub net_channels: u32,
+    /// An address to send to (an engine not found on the network).
+    pub net_address: String,
 }
 
 impl Default for DevicesState {
@@ -36,6 +42,9 @@ impl Default for DevicesState {
             bus_name: String::new(),
             bus_channels: 2,
             adding_bus: false,
+            net_stream: "Main".into(),
+            net_channels: 2,
+            net_address: String::new(),
         }
     }
 }
@@ -84,6 +93,64 @@ fn add_button(ui: &mut egui::Ui, accessible: String, enabled: bool) -> bool {
     b.clicked()
 }
 
+/// Streams from other Confluence engines (one click to play one) and sending
+/// to an engine found on the network or at an address.
+fn network(ui: &mut egui::Ui, devices: &[DeviceInfo], slots: &[SlotState], st: &mut DevicesState) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    ui.label(RichText::new("Network").strong());
+    let heard: Vec<&DeviceInfo> = devices.iter().filter(|d| d.kind == DeviceKind::NetReceive).collect();
+    if heard.is_empty() {
+        ui.label(RichText::new("No streams arriving from other engines").weak());
+    }
+    for d in heard {
+        ui.horizontal(|ui| {
+            ui.label(&d.name);
+            ui.label(RichText::new(format!("{} ch", d.inputs)).weak());
+            if in_use(d, slots) {
+                ui.label(RichText::new("in use").weak());
+            } else if st.adding.contains(&(d.kind, d.name.clone())) {
+                ui.add(Spinner::new());
+            } else if add_button(ui, format!("Add {} {}", kind_title(d.kind), d.name), true) {
+                st.adding.insert((d.kind, d.name.clone()));
+                edits.push(Edit::AddDevice { kind: d.kind, name: d.name.clone() });
+            }
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.label("Send");
+        ui.add(TextEdit::singleline(&mut st.net_stream).hint_text("stream name").desired_width(90.0));
+        ui.add(egui::DragValue::new(&mut st.net_channels).range(1..=64).suffix(" ch"));
+    });
+    let stream = st.net_stream.trim().to_string();
+    let mut send = |ui: &mut egui::Ui, to: &str, label: String, edits: &mut Vec<Edit>| {
+        let name = format!("{to}/{stream}:{}", st.net_channels);
+        let ok = !to.is_empty() && !stream.is_empty();
+        if st.adding.contains(&(DeviceKind::NetSend, name.clone())) {
+            ui.add(Spinner::new());
+            return;
+        }
+        let b = ui.add_enabled(ok, egui::Button::new("Send"));
+        b.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ok, &label));
+        if b.clicked() {
+            st.adding.insert((DeviceKind::NetSend, name.clone()));
+            edits.push(Edit::AddDevice { kind: DeviceKind::NetSend, name });
+        }
+    };
+    for d in devices.iter().filter(|d| d.kind == DeviceKind::NetSend) {
+        ui.horizontal(|ui| {
+            ui.label(format!("to {}", d.name));
+            send(ui, &d.name, format!("Send to {}", d.name), &mut edits);
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.label("to");
+        ui.add(TextEdit::singleline(&mut st.net_address).hint_text("IP address").desired_width(110.0));
+        let address = st.net_address.trim().to_string();
+        send(ui, &address, "Send to address".into(), &mut edits);
+    });
+    edits
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     devices: &[DeviceInfo],
@@ -95,6 +162,8 @@ pub fn show(
     ui.heading("Devices");
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.add_enabled_ui(editable, |ui| {
+            // First: other engines' streams are the quickest thing to add.
+            edits.extend(network(ui, devices, slots, st));
             for kind in KINDS {
                 let list: Vec<&DeviceInfo> = devices.iter().filter(|d| d.kind == kind).collect();
                 if list.is_empty() {
@@ -238,6 +307,57 @@ mod tests {
         h.step();
         assert_eq!(h.state().1, vec![Edit::AddBus { name: "Verb".into(), channels: 2 }], "two channels by default");
         assert!(h.query_by_label("Add insert bus").is_none(), "a spinner while it is being added");
+    }
+
+    fn net_harness(devices: Vec<DeviceInfo>) -> egui_kittest::Harness<'static, (DevicesState, Vec<Edit>)> {
+        egui_kittest::Harness::new_ui_state(
+            move |ui, (st, edits): &mut (DevicesState, Vec<Edit>)| {
+                edits.extend(show(ui, &devices, &[], st, true));
+            },
+            (DevicesState::default(), Vec::new()),
+        )
+    }
+
+    #[test]
+    fn a_heard_stream_is_received_with_one_click() {
+        use egui_kittest::kittest::Queryable;
+        let heard = DeviceInfo { kind: DeviceKind::NetReceive, name: "Lilith/Main".into(), inputs: 2, outputs: 0 };
+        let mut h = net_harness(vec![heard]);
+        h.run();
+        assert!(h.query_by_label("Network").is_some());
+        h.get_by_label("Add Network receive Lilith/Main").click();
+        h.step();
+        h.step();
+        assert_eq!(h.state().1, vec![Edit::AddDevice { kind: DeviceKind::NetReceive, name: "Lilith/Main".into() }]);
+    }
+
+    #[test]
+    fn audio_is_sent_to_an_engine_found_or_an_address() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let lilith = DeviceInfo { kind: DeviceKind::NetSend, name: "Lilith".into(), inputs: 0, outputs: 0 };
+        let mut h = net_harness(vec![lilith]);
+        h.run();
+        h.state_mut().0.net_stream = "Stream mix".into();
+        h.state_mut().0.net_channels = 4;
+        h.run();
+        h.get_by_label("Send to Lilith").click();
+        h.step();
+        h.step();
+        assert_eq!(
+            h.state().1,
+            vec![Edit::AddDevice { kind: DeviceKind::NetSend, name: "Lilith/Stream mix:4".into() }]
+        );
+        assert!(h.get_by_label("Send to address").accesskit_node().is_disabled(), "no address yet");
+        h.state_mut().0.net_address = " 192.168.50.12 ".into();
+        h.step(); // the first send's spinner keeps animating
+        h.step();
+        h.get_by_label("Send to address").click();
+        h.step();
+        h.step();
+        assert_eq!(
+            h.state().1[1],
+            Edit::AddDevice { kind: DeviceKind::NetSend, name: "192.168.50.12/Stream mix:4".into() }
+        );
     }
 
     #[test]

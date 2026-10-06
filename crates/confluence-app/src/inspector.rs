@@ -199,6 +199,22 @@ fn slot_panel(
         if h.attached == Some(false) {
             ui.label(h.idle_note.as_deref().unwrap_or("nothing attached"));
         }
+        if let Some(n) = h.net {
+            ui.separator();
+            ui.label(RichText::new("Network").strong());
+            ui.label(format!("Packets {} · lost {} · late {} · reordered {}", n.packets, n.lost, n.late, n.reordered));
+            if n.malformed > 0 {
+                ui.label(format!("{} unreadable packets dropped", n.malformed));
+            }
+            if n.silent_ms > 1000 {
+                let s = if n.silent_ms == u64::MAX {
+                    "No packets yet".to_string()
+                } else {
+                    format!("No packets for {:.1} s", n.silent_ms as f64 / 1000.0)
+                };
+                ui.label(RichText::new(s).color(warn));
+            }
+        }
         ui.separator();
         ui.label(RichText::new("Clock health").strong());
         let samples = history;
@@ -534,6 +550,43 @@ mod display_tests {
             h.run();
         }
         out
+    }
+
+    #[test]
+    fn a_network_streams_packets_and_losses_are_shown() {
+        let mut view = view_with(PointState { input: 0, output: 0, gain_db: 0.0, mute: false, invert: false });
+        view.health.push(confluence_api::SlotHealth {
+            id: 1,
+            underruns: 0,
+            overruns: 0,
+            fill_frames: 0.0,
+            target_frames: 0.0,
+            device_ppm: 0.0,
+            correction_ppm: 0.0,
+            device_lost: true,
+            device_faults: 0,
+            driver_requests: 0,
+            attached: None,
+            idle_note: None,
+            net: Some(confluence_api::NetStats {
+                packets: 1200,
+                lost: 3,
+                late: 1,
+                reordered: 7,
+                malformed: 0,
+                silent_ms: 2500,
+            }),
+        });
+        let look = Look::builtin();
+        let pending = std::collections::HashMap::new();
+        let sel = Selection::Slot(1);
+        let mut h = Harness::new_ui(|ui| {
+            let ui_state = PluginUi { pending: &pending, loading: None };
+            show(ui, &view, &look, &sel, None, None, true, &ui_state);
+        });
+        h.run();
+        assert!(h.query_by_label("Packets 1200 · lost 3 · late 1 · reordered 7").is_some());
+        assert!(h.query_by_label_contains("No packets for 2.5 s").is_some());
     }
 
     #[test]

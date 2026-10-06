@@ -597,3 +597,41 @@ fn a_script_is_written_in_the_window_and_runs_in_the_engine() {
     pump_until(&mut h, "running in the list", LONG, |h| h.query_by_label("running").is_some());
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_stream_from_another_engine_is_added_from_the_devices_panel() {
+    use confluence_net::host::{NetHost, SendSpec};
+    let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let d = EngineDir::new("net");
+    let _engine = Engine::spawn_with(&d, &["--net-port", &port.to_string()]);
+    let mut c = client(&d);
+    // Another engine, played by this test: a stream to ours on loopback.
+    let other = NetHost::start("127.0.0.1:0".parse().unwrap(), 77).unwrap();
+    let dest = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let (mut side, _tx) = other.add_sender(SendSpec { dest, stream: "Guest".into(), channels: 2, rate: 48_000 });
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let feeder = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let block = confluence_core::buffer::PlanarBuffer::new(2, 256);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                side.write(&block, 0);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "the Devices button", LONG, |h| h.query_by_label("Devices…").is_some());
+    settle(&mut h);
+    h.get_by_label("Devices…").click();
+    let add = "Add Network receive 127.0.0.1/Guest";
+    pump_until(&mut h, "the heard stream", LONG, |h| h.query_by_label(add).is_some());
+    settle(&mut h);
+    h.get_by_label(add).click();
+    pump_until(&mut h, "the receive slot in the engine", LONG, |_| {
+        slots(&mut c).iter().any(|s| s.device == "net-in:127.0.0.1/Guest" && s.inputs == 2)
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    feeder.join().unwrap();
+    c.call(Command::Shutdown).unwrap();
+}

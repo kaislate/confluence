@@ -26,6 +26,8 @@ egui_kittest = "0.36"
 tempfile = "3"
 confluence-provider-vasio = { path = "../confluence-provider-vasio" }
 confluence-engine = { path = "../confluence-engine" }
+confluence-core = { path = "../confluence-core" }
+confluence-net = { path = "../confluence-net" }
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [lints]

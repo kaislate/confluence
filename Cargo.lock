@@ -950,7 +950,9 @@ version = "0.1.0"
 dependencies = [
  "confluence-api",
  "confluence-client",
+ "confluence-core",
  "confluence-engine",
+ "confluence-net",
  "confluence-provider-vasio",
  "eframe",
  "egui_kittest",

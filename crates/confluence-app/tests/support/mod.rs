@@ -72,7 +72,12 @@ pub struct Engine(Option<Child>);
 
 impl Engine {
     pub fn spawn(d: &EngineDir) -> Engine {
-        let child = Process::new(engine_exe()).args(d.args()).stderr(Stdio::null()).spawn().unwrap();
+        Self::spawn_with(d, &[])
+    }
+
+    /// With more arguments (later ones override `d.args()`).
+    pub fn spawn_with(d: &EngineDir, extra: &[&str]) -> Engine {
+        let child = Process::new(engine_exe()).args(d.args()).args(extra).stderr(Stdio::null()).spawn().unwrap();
         Engine(Some(child))
     }
 
