@@ -359,8 +359,12 @@ pub struct NetStats {
     pub reordered: u64,
     /// Could not be read (dropped).
     pub malformed: u64,
-    /// Time since the last packet, in ms.
+    /// Time since the last packet this stream could play, in ms.
     pub silent_ms: u64,
+    /// Readable, but at a sample rate or block size this stream does not take
+    /// (dropped): the sender changed; add the stream again.
+    #[serde(default)]
+    pub mismatched: u64,
 }
 
 /// Another Confluence engine found on the network.

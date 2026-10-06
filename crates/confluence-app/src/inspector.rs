@@ -206,6 +206,13 @@ fn slot_panel(
             if n.malformed > 0 {
                 ui.label(format!("{} unreadable packets dropped", n.malformed));
             }
+            if n.mismatched > 0 {
+                let s = format!(
+                    "{} packets at another sample rate or block size dropped: remove the stream and add it again",
+                    n.mismatched
+                );
+                ui.label(RichText::new(s).color(warn));
+            }
             if n.silent_ms > 1000 {
                 let s = if n.silent_ms == u64::MAX {
                     "No packets yet".to_string()
@@ -575,6 +582,7 @@ mod display_tests {
                 reordered: 7,
                 malformed: 0,
                 silent_ms: 2500,
+                mismatched: 40,
             }),
         });
         let look = Look::builtin();
@@ -587,6 +595,7 @@ mod display_tests {
         h.run();
         assert!(h.query_by_label("Packets 1200 · lost 3 · late 1 · reordered 7").is_some());
         assert!(h.query_by_label_contains("No packets for 2.5 s").is_some());
+        assert!(h.query_by_label_contains("40 packets at another sample rate").is_some());
     }
 
     #[test]

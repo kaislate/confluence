@@ -142,3 +142,18 @@ fn a_removed_receiver_gets_nothing_more_and_silence_is_reported() {
     assert_eq!(tap.0.lock().unwrap().len(), before, "removed");
     wait_for("heard instead", || !b.heard().is_empty());
 }
+
+#[test]
+fn a_stream_at_another_rate_is_refused_and_counts_as_silent() {
+    let (a, b) = (start(), start());
+    let tap = Tap::default();
+    let rx = b.add_receiver(LOCAL, "Main", 2, 48_000, Box::new(tap.clone()));
+    let dest = SocketAddr::new(LOCAL, b.port());
+    let (mut side, _tx) = a.add_sender(SendSpec { dest, stream: "Main".into(), channels: 2, rate: 44_100 });
+    stream(&mut side, 2, 60); // ~320 ms
+    wait_for("refused packets", || rx.stats().mismatched > 0);
+    let s = rx.stats();
+    assert!(tap.0.lock().unwrap().is_empty(), "nothing played");
+    assert_eq!(s.malformed, 0, "readable, just not for this stream: {s:?}");
+    assert!(s.silent_ms > 1000, "refused packets are not signs of life: {s:?}");
+}

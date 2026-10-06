@@ -732,8 +732,15 @@ v7  slot #3 removed"
         assert!(text.contains("no app playing") && !text.contains("DAW"), "the slot's own note: {text}");
         assert!(text.contains("note: x is odd"), "{text}");
         let mut stream = h(6, false, 0, 0);
-        stream.net =
-            Some(confluence_api::NetStats { packets: 900, lost: 2, late: 1, reordered: 5, malformed: 0, silent_ms: 3 });
+        stream.net = Some(confluence_api::NetStats {
+            packets: 900,
+            lost: 2,
+            late: 1,
+            reordered: 5,
+            malformed: 0,
+            silent_ms: 3,
+            mismatched: 0,
+        });
         let text = render(&Response::Health { blocks: 9, slots: vec![stream], notices: Vec::new() });
         assert!(text.contains("net 900 packets, 2 lost, 1 late, 5 reordered"), "{text}");
         let mut unexplained = h(5, false, 0, 0);

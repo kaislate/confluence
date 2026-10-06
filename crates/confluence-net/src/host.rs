@@ -274,7 +274,8 @@ impl ReceiveHandle {
             lost: s.stats.lost,
             late: s.stats.late,
             reordered: s.stats.reordered,
-            malformed: s.malformed + s.stats.mismatched,
+            malformed: s.malformed,
+            mismatched: s.stats.mismatched,
             silent_ms: s.last_packet.map_or(u64::MAX, |t| t.elapsed().as_millis() as u64),
         }
     }
@@ -404,11 +405,15 @@ fn receive(g: &mut Inner, data: &[u8], from: IpAddr, now: f64, samples: &mut [f3
     let n = p.frames() * h.channels as usize;
     p.decode(&mut samples[..n]);
     let sink = &mut r.sink;
+    let refused = r.receiver.stats().mismatched;
     r.receiver.push(h, &samples[..n], now, &mut |d, t| sink.write(d, t));
     r.sink.set_latency_floor(r.receiver.latency_floor());
     let mut s = r.shared.lock().unwrap_or_else(|p| p.into_inner());
     s.stats = r.receiver.stats();
-    s.last_packet = Some(Instant::now());
+    // A packet this stream cannot play is no sign of life.
+    if s.stats.mismatched == refused {
+        s.last_packet = Some(Instant::now());
+    }
 }
 
 fn send(socket: &UdpSocket, s: &mut SendEntry) {
