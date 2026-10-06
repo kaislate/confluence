@@ -183,6 +183,10 @@ pub struct SoftSlotSpec {
     pub quality: AsrcQuality,
     /// Place the slot at this first channel (restoring a saved layout); `None` = first fit.
     pub first_channel: Option<u32>,
+    /// Safety margin of the slot's bridge; `None` = the engine's (2 ms).
+    pub margin_frames: Option<usize>,
+    /// How far the bridge's latency may grow; `None` = 8 device blocks.
+    pub max_growth_frames: Option<usize>,
 }
 
 /// Parameters of the master slot: the device whose callback drives the engine.
@@ -1249,8 +1253,8 @@ impl Engine {
             master_rate: self.cfg.sample_rate,
             master_block: self.cfg.block,
             quality: spec.quality,
-            margin_frames: self.cfg.margin_frames,
-            max_growth_frames: None,
+            margin_frames: spec.margin_frames.unwrap_or(self.cfg.margin_frames),
+            max_growth_frames: spec.max_growth_frames,
         }
     }
 }
@@ -2539,6 +2543,8 @@ mod tests {
             device_block: 128,
             quality: AsrcQuality::Sinc64,
             first_channel: None,
+            margin_frames: None,
+            max_growth_frames: None,
         }
     }
 

@@ -27,6 +27,8 @@ fn drifting_master_feeds_a_soft_output_on_another_clock() {
         device_block: 441,
         quality: AsrcQuality::Sinc64,
         first_channel: None,
+        margin_frames: None,
+        max_growth_frames: None,
     };
     let (out_id, out_dev) = engine.add_soft_output(&out_spec).unwrap();
     let out_first = engine.slots().into_iter().find(|s| s.id == out_id).unwrap().first_output;

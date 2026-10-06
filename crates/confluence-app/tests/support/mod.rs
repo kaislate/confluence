@@ -43,6 +43,12 @@ impl EngineDir {
             self.clap_dir().display().to_string(),
             // Never this PC's MIDI devices (tests inject MIDI over the pipe).
             "--no-midi".into(),
+            // Loopback only, any free port, never advertised on the network.
+            "--no-net-discovery".into(),
+            "--net-bind".into(),
+            "127.0.0.1".into(),
+            "--net-port".into(),
+            "0".into(),
         ]
     }
 

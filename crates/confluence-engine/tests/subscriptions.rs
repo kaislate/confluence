@@ -28,6 +28,7 @@ fn spawn(pipe: &str, dir: &std::path::Path) -> Engine {
     let no_plugins = dir.join("no-plugins");
     let _ = std::fs::create_dir_all(&no_plugins);
     cmd.arg("--no-midi").arg("--clap-path").arg(no_plugins);
+    cmd.args(["--no-net-discovery", "--net-bind", "127.0.0.1", "--net-port", "0"]);
     Engine(Some(cmd.spawn().unwrap()))
 }
 
@@ -252,6 +253,7 @@ fn open_connections_do_not_hold_up_shutdown() {
         .arg("--devices")
         .arg(dir.path().join("devices.json"))
         .arg("--no-midi")
+        .args(["--no-net-discovery", "--net-bind", "127.0.0.1", "--net-port", "0"])
         .arg("--clap-path")
         .arg(dir.path())
         .stderr(std::process::Stdio::piped());

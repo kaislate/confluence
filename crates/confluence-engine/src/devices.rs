@@ -27,6 +27,9 @@ use confluence_provider_vasio::config::InstanceConfig;
 use confluence_provider_vasio::{VasioSlot, VasioStats};
 use std::sync::Arc;
 
+use confluence_net::discovery::Discovery;
+use confluence_net::host::{NetHost, ReceiveHandle, SendHandle, SendSide, SendSpec};
+
 /// A device bound to slots, with the channel ranges it occupies.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
@@ -55,6 +58,8 @@ enum Handle {
     Vaio(#[allow(dead_code)] Arc<VaioStats>),
     Asio(AsioDevice),
     Wasapi(WasapiStream),
+    NetSend(#[allow(dead_code)] Arc<SendHandle>),
+    NetReceive(ReceiveHandle),
 }
 
 struct Bound {
@@ -85,6 +90,8 @@ enum Loaded {
     Vasio,
     /// As VASIO: the driver is attached when the slot is created.
     Vaio,
+    /// A network stream (nothing to load: the slot opens it).
+    Net(NetName),
 }
 
 /// Finds a WASAPI endpoint by its saved id, else by name.
@@ -108,7 +115,7 @@ fn load(opener: &AsioOpener, kind: DeviceKind, name: &str, endpoint_id: Option<&
             parse_vaio(name)?;
             Loaded::Vaio
         }
-        DeviceKind::NetSend | DeviceKind::NetReceive => return Err("network streams are not available yet".into()),
+        DeviceKind::NetSend | DeviceKind::NetReceive => Loaded::Net(parse_net(name)?),
         DeviceKind::WasapiRender | DeviceKind::WasapiCapture | DeviceKind::AppCapture => {
             let target = match kind {
                 DeviceKind::WasapiRender => {
@@ -215,7 +222,15 @@ pub struct LoadedAdd {
     loaded: Result<Loaded, String>,
 }
 
+/// The engine's network audio: its host and how it finds other engines.
+pub struct NetCtx {
+    pub host: NetHost,
+    pub discovery: Box<dyn Discovery>,
+}
+
 pub struct DeviceManager {
+    /// Network audio (`None`: off).
+    net: Option<NetCtx>,
     bound: Vec<Bound>,
     master: Option<Binding>,
     /// Name of the ASIO driver running as the master, known before restore.
@@ -245,6 +260,7 @@ impl DeviceManager {
     /// A manager that does not persist bindings.
     pub fn new(path: Option<PathBuf>) -> Self {
         Self {
+            net: None,
             bound: Vec::new(),
             master: None,
             master_name: None,
@@ -337,6 +353,39 @@ impl DeviceManager {
     }
 
     /// Where VASIO shapes are saved for the DLL; tests pass a scratch key (or `None`).
+    /// Turns network audio on.
+    pub fn with_net(mut self, net: NetCtx) -> Self {
+        self.net = Some(net);
+        self
+    }
+
+    /// Other engines found on the network.
+    pub fn peers(&self) -> Vec<confluence_api::Peer> {
+        self.net.as_ref().map(|n| n.discovery.peers()).unwrap_or_default()
+    }
+
+    /// Network streams that can be added: one send per engine found, one
+    /// receive per stream heard (`<engine or address>/<stream>`).
+    pub fn net_devices(&self) -> Vec<DeviceInfo> {
+        let Some(net) = &self.net else { return Vec::new() };
+        let peers = net.discovery.peers();
+        let mut out: Vec<DeviceInfo> = peers
+            .iter()
+            .map(|p| DeviceInfo { kind: DeviceKind::NetSend, name: p.name.clone(), inputs: 0, outputs: 0 })
+            .collect();
+        for h in net.host.heard() {
+            let from = h.from.to_string();
+            let label = peers.iter().find(|p| p.address == from).map_or(from, |p| p.name.clone());
+            out.push(DeviceInfo {
+                kind: DeviceKind::NetReceive,
+                name: format!("{label}/{}", h.stream),
+                inputs: h.channels as u32,
+                outputs: 0,
+            });
+        }
+        out
+    }
+
     pub fn with_vasio_config_root(mut self, root: Option<String>) -> Self {
         self.vasio_config_root = root;
         self
@@ -617,7 +666,7 @@ impl DeviceManager {
             }
         }
         for b in &self.bound {
-            let (mut lost, mut faults, mut requests) = (false, 0, 0);
+            let (mut lost, mut faults, mut requests, mut net) = (false, 0, 0, None);
             for h in &b.handles {
                 match h {
                     Handle::Asio(dev) => {
@@ -632,11 +681,17 @@ impl DeviceManager {
                         lost |= hl.lost.load(Ordering::Relaxed);
                         faults += hl.faults.load(Ordering::Relaxed);
                     }
-                    Handle::Vasio(_) | Handle::Vaio(_) => {}
+                    Handle::NetReceive(r) => {
+                        let st = r.stats();
+                        lost |= st.silent_ms > NET_SILENT_MS;
+                        net = Some(st);
+                    }
+                    Handle::Vasio(_) | Handle::Vaio(_) | Handle::NetSend(_) => {}
                 }
             }
             for h in slots.iter_mut().filter(|h| b.slots.contains(&h.id)) {
                 (h.device_lost, h.device_faults, h.driver_requests) = (lost, faults, requests);
+                h.net = net;
             }
         }
     }
@@ -688,6 +743,8 @@ impl DeviceManager {
             device_block: block,
             quality: self.quality,
             first_channel: at,
+            margin_frames: None,
+            max_growth_frames: None,
         }
     }
 
@@ -705,6 +762,7 @@ impl DeviceManager {
             Loaded::Asio(dev) => self.open_asio(engine, name, device, at, dev).map(|(b, s)| (b, Some(s))),
             Loaded::Vasio => self.open_vasio(engine, name, device, at).map(|b| (b, None)),
             Loaded::Vaio => self.open_vaio(engine, name, device, at).map(|b| (b, None)),
+            Loaded::Net(n) => self.open_net(engine, kind, name, device, at, n).map(|b| (b, None)),
             Loaded::Wasapi(mut stream, endpoint_id) => {
                 let f = stream.format();
                 let mut binding = Binding { endpoint_id, ..binding_of(kind, name) };
@@ -744,6 +802,76 @@ impl DeviceManager {
                 Ok((Bound { binding, slots: vec![id], handles: vec![Handle::Wasapi(stream)] }, None))
             }
         }
+    }
+
+    /// A network stream: a send slot (strict, on the master clock) or a
+    /// receive slot (soft: its bridge recovers the sender's clock).
+    fn open_net(
+        &mut self,
+        engine: &mut Engine,
+        kind: DeviceKind,
+        name: &str,
+        device: String,
+        at: Option<&Binding>,
+        n: NetName,
+    ) -> Result<Bound, String> {
+        let net = self.net.as_ref().ok_or("network audio is off in this engine")?;
+        let rate = engine.config().sample_rate;
+        let addr = resolve(net, &n)?;
+        if kind == DeviceKind::NetSend {
+            let channels = n.channels.unwrap_or(2);
+            let spec = StrictSlotSpec {
+                name: format!("{} to {}", n.stream, n.peer),
+                device,
+                inputs: 0,
+                outputs: channels,
+                first_input: None,
+                first_output: at.map(|b| b.first_output),
+            };
+            let mut handle = None;
+            let (id, ch) = engine
+                .add_strict_slot(&spec, |ch| {
+                    let (side, h) = net.host.add_sender(SendSpec {
+                        dest: addr,
+                        stream: n.stream.clone(),
+                        channels,
+                        rate: rate as u32,
+                    });
+                    let h = Arc::new(h);
+                    handle = Some(h.clone());
+                    let side = NetSendSide { side, first_output: ch.first_output };
+                    Ok((Box::new(side) as Box<dyn StrictSide>, Arc::new(NetSendStats(h)) as Arc<dyn StrictStats>))
+                })
+                .map_err(|e| e.to_string())?;
+            let binding =
+                Binding { first_output: ch.first_output as u32, outputs: ch.outputs as u32, ..binding_of(kind, name) };
+            let handles = handle.map(Handle::NetSend).into_iter().collect();
+            return Ok(Bound { binding, slots: vec![id], handles });
+        }
+        let from = addr.ip();
+        let heard = net.host.heard().into_iter().find(|h| h.from == from && h.stream == n.stream);
+        let channels = n.channels.or(heard.as_ref().map(|h| h.channels as usize)).unwrap_or(2);
+        let stream_rate = heard.as_ref().map_or(rate, |h| h.rate as f64);
+        let packet = (stream_rate / 1000.0).round().max(1.0) as usize;
+        let mut spec = self.soft_spec(
+            format!("{} from {}", n.stream, n.peer),
+            device,
+            channels,
+            stream_rate,
+            packet,
+            at.map(|b| b.first_input),
+        );
+        spec.margin_frames = Some(2 * packet);
+        spec.max_growth_frames = Some((NET_MAX_LATENCY_S * stream_rate) as usize);
+        let (id, side) = engine.add_soft_input(&spec).map_err(|e| e.to_string())?;
+        let h = net.host.add_receiver(from, &n.stream, channels, stream_rate as u32, Box::new(side));
+        let slot = engine.slots().into_iter().find(|s| s.id == id);
+        let binding = Binding {
+            first_input: slot.map_or(0, |s| s.first_input),
+            inputs: channels as u32,
+            ..binding_of(kind, name)
+        };
+        Ok(Bound { binding, slots: vec![id], handles: vec![Handle::NetReceive(h)] })
     }
 
     fn open_vasio(
@@ -1077,7 +1205,86 @@ fn same_device(binding: &Binding, kind: DeviceKind, name: &str) -> bool {
             _ => binding.name == name,
         },
         DeviceKind::Vaio => binding.name.trim() == name.trim(),
+        DeviceKind::NetSend | DeviceKind::NetReceive => match (parse_net(&binding.name), parse_net(name)) {
+            (Ok(a), Ok(b)) => a.peer.eq_ignore_ascii_case(&b.peer) && a.port == b.port && a.stream == b.stream,
+            _ => binding.name == name,
+        },
         _ => binding.name == name,
+    }
+}
+
+/// A receive stream silent this long is reported lost.
+const NET_SILENT_MS: u64 = 1000;
+/// The most latency a receive stream may grow to absorb a bad network.
+const NET_MAX_LATENCY_S: f64 = 0.040;
+
+/// A network stream's name: `<peer>[:port]/<stream>[:<channels>]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetName {
+    pub peer: String,
+    pub port: Option<u16>,
+    pub stream: String,
+    pub channels: Option<usize>,
+}
+
+pub fn parse_net(name: &str) -> Result<NetName, String> {
+    let bad = || format!("{name:?}: a network stream is <computer>/<stream>[:<channels>]");
+    let (peer, rest) = name.trim().split_once('/').ok_or_else(bad)?;
+    let (stream, channels) = match rest.rsplit_once(':') {
+        Some((s, c)) if !c.is_empty() && c.bytes().all(|d| d.is_ascii_digit()) => {
+            (s, Some(c.parse::<usize>().map_err(|_| bad())?))
+        }
+        _ => (rest, None),
+    };
+    if channels.is_some_and(|c| !(1..=confluence_net::packet::MAX_CHANNELS as usize).contains(&c)) {
+        return Err("a network stream has 1 to 64 channels".into());
+    }
+    let (peer, port) = match peer.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p.parse::<u16>().map_err(|_| bad())?)),
+        None => (peer, None),
+    };
+    if peer.trim().is_empty() {
+        return Err(bad());
+    }
+    if stream.is_empty() || stream.len() > confluence_net::packet::MAX_NAME || stream.chars().any(char::is_control) {
+        return Err("stream names are 1 to 64 characters on one line".into());
+    }
+    Ok(NetName { peer: peer.trim().to_string(), port, stream: stream.to_string(), channels })
+}
+
+/// Where a stream's peer is: an IPv4 address, or an engine found on the network.
+fn resolve(net: &NetCtx, n: &NetName) -> Result<std::net::SocketAddr, String> {
+    if let Ok(ip) = n.peer.parse::<std::net::Ipv4Addr>() {
+        return Ok((ip, n.port.unwrap_or(confluence_net::DEFAULT_PORT)).into());
+    }
+    let peers = net.discovery.peers();
+    let p = peers
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(&n.peer))
+        .ok_or_else(|| format!("{} was not found on the network", n.peer))?;
+    let ip: std::net::IpAddr = p.address.parse().map_err(|_| format!("{} has no usable address", n.peer))?;
+    Ok((ip, n.port.unwrap_or(p.port)).into())
+}
+
+/// A send stream on the audio thread: its output channels go to the network thread.
+struct NetSendSide {
+    side: SendSide,
+    first_output: usize,
+}
+
+impl StrictSide for NetSendSide {
+    fn receive(&mut self, _inputs: &mut PlanarBuffer) {}
+
+    fn send(&mut self, outputs: &PlanarBuffer) {
+        self.side.write(outputs, self.first_output);
+    }
+}
+
+struct NetSendStats(Arc<SendHandle>);
+
+impl StrictStats for NetSendStats {
+    fn xruns(&self) -> (u64, u64) {
+        (0, self.0.dropped())
     }
 }
 
@@ -1146,6 +1353,24 @@ mod tests {
         let err = devices.add(&mut engine, DeviceKind::Vaio, "1").unwrap_err();
         assert!(err.contains("48 kHz") && err.contains("44100"), "{err}");
         assert!(engine.slots().is_empty());
+    }
+
+    #[test]
+    fn network_stream_names_parse() {
+        let n = parse_net("Lilith/Main:4").unwrap();
+        assert_eq!((n.peer.as_str(), n.port, n.stream.as_str(), n.channels), ("Lilith", None, "Main", Some(4)));
+        let n = parse_net("192.168.50.12:7000/Stream 2").unwrap();
+        assert_eq!(
+            (n.peer.as_str(), n.port, n.stream.as_str(), n.channels),
+            ("192.168.50.12", Some(7000), "Stream 2", None)
+        );
+        assert!(parse_net("Lilith").is_err(), "no stream");
+        assert!(parse_net("/Main").is_err(), "no peer");
+        assert!(parse_net("Lilith/").is_err());
+        assert!(parse_net("Lilith/Main:0").is_err());
+        assert!(parse_net("Lilith/Main:65").is_err());
+        assert!(parse_net(&format!("Lilith/{}", "x".repeat(65))).is_err(), "name too long");
+        assert!(parse_net("Lilith/a\nb").is_err());
     }
 
     #[test]
