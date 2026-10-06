@@ -13,7 +13,7 @@ confluence-rt = { path = "../confluence-rt" }
 rtrb.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_Networking_WinSock"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_NetworkManagement_Dns", "Win32_Networking_WinSock"] }
 
 [lints]
 workspace = true
