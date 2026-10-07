@@ -41,6 +41,7 @@ pub enum Edit {
     RemoveMidiBinding { device: String, channel: u8, cc: u8 },
     SetScript { name: String, source: String, enabled: bool },
     DeleteScript { name: String },
+    SetSlotColor { id: u32, color: Option<confluence_api::Rgb> },
 }
 
 /// What a merged, rate-limited edit is about.
@@ -48,6 +49,7 @@ pub enum Edit {
 enum MergeKey {
     Point(u32, u32),
     Param(u32, u32),
+    Color(u32),
 }
 
 impl Edit {
@@ -77,6 +79,7 @@ impl Edit {
                 Command::SetScript { name: name.clone(), source: source.clone(), enabled: *enabled }
             }
             Edit::DeleteScript { name } => Command::DeleteScript { name: name.clone() },
+            Edit::SetSlotColor { id, color } => Command::SetSlotColor { id: *id, color: *color },
             Edit::SetSceneMorph { name, morph_ms } => {
                 Command::SetSceneMorph { name: name.clone(), morph_ms: *morph_ms }
             }
@@ -108,6 +111,8 @@ impl Edit {
         match *self {
             Edit::SetPoint { input, output, .. } => Some(MergeKey::Point(input, output)),
             Edit::SetParam { bus, param, .. } => Some(MergeKey::Param(bus, param)),
+            // A colour picker sends a colour per frame while it is dragged.
+            Edit::SetSlotColor { id, .. } => Some(MergeKey::Color(id)),
             _ => None,
         }
     }
@@ -143,7 +148,7 @@ impl Outbox {
         if let Some(k) = edit.merge_key() {
             let about = |e: &Edit| match k {
                 MergeKey::Point(i, o) => e.point() == Some((i, o)),
-                MergeKey::Param(..) => e.merge_key() == Some(k),
+                MergeKey::Param(..) | MergeKey::Color(_) => e.merge_key() == Some(k),
             };
             if let Some(last) = self.queue.iter_mut().rev().find(|e| about(e)) {
                 if last.merge_key() == Some(k) {
@@ -380,6 +385,19 @@ mod tests {
             param(4, 1, -6.0).command(),
             Command::SetParam { bus: confluence_api::BusRef::Id(4), param: 1, value: -6.0 }
         );
+    }
+
+    #[test]
+    fn a_dragged_colour_picker_sends_one_colour_per_interval() {
+        let colour = |id, c| Edit::SetSlotColor { id, color: Some([c, c, c]) };
+        let mut o = Outbox::default();
+        o.push(colour(1, 10));
+        o.push(colour(1, 20)); // replaces the queued one
+        o.push(colour(2, 30)); // another slot: kept
+        assert_eq!(o.len(), 2);
+        let t = Instant::now();
+        assert_eq!(o.next_ready(t), Some(colour(1, 20)));
+        assert_eq!(colour(1, 20).command(), Command::SetSlotColor { id: 1, color: Some([20, 20, 20]) });
     }
 
     #[test]

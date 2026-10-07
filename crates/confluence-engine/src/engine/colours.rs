@@ -13,13 +13,7 @@ const MAX_KEY: usize = 512;
 
 /// The key slot `s`'s colour is kept under.
 pub fn key(s: &SlotState) -> String {
-    if s.is_bus() {
-        format!("bus:{}", s.first_output)
-    } else if s.device.is_empty() {
-        format!("slot:{}", s.name)
-    } else {
-        s.device.clone()
-    }
+    s.color_key()
 }
 
 #[derive(Default)]

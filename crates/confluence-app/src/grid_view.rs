@@ -195,7 +195,7 @@ pub fn show(
             let x0 = origin.x + band.start as f32 * cell;
             let strip =
                 Rect::from_min_size(Pos2::new(x0, top.min.y), Vec2::new(band.channels as f32 * cell, BAND_STRIP));
-            let colour = if band.online { look.slot(band.slot) } else { look.skin.colors.offline };
+            let colour = if band.online { look.band(band) } else { look.skin.colors.offline };
             let painter = ui.painter_at(strip.intersect(top));
             look.paint_band(&painter, strip.shrink2(Vec2::new(1.0, 2.0)), colour);
             let name = if band.online { band.name.clone() } else { format!("{} OFFLINE", band.name) };
@@ -232,7 +232,7 @@ pub fn show(
             let y0 = origin.y + band.start as f32 * cell;
             let strip =
                 Rect::from_min_size(Pos2::new(left.min.x, y0), Vec2::new(HEADER_W, band.channels as f32 * cell));
-            let colour = if band.online { look.slot(band.slot) } else { look.skin.colors.offline };
+            let colour = if band.online { look.band(band) } else { look.skin.colors.offline };
             let painter = ui.painter_at(strip.intersect(left));
             look.paint_band(
                 &painter,

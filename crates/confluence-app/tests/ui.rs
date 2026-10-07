@@ -648,3 +648,24 @@ fn a_stream_from_another_engine_is_added_from_the_devices_panel() {
     feeder.join().unwrap();
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_devices_colour_is_picked_in_the_inspector() {
+    let d = EngineDir::new("colour");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 1);
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO 1 inputs").is_some());
+    h.get_by_label("VASIO 1 inputs").click();
+    let first = confluence_app::skin::Look::builtin().skin.slot_colors[0];
+    let rgb = [first.r(), first.g(), first.b()];
+    let swatch = format!("Colour #{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+    pump_until(&mut h, "the colour swatches", LONG, |h| h.query_by_label(&swatch).is_some());
+    settle(&mut h);
+    h.get_by_label(&swatch).click();
+    pump_until(&mut h, "the device coloured in the engine", LONG, |_| {
+        slots(&mut c).iter().any(|s| s.name == "VASIO 1" && s.color == Some(rgb))
+    });
+    c.call(Command::Shutdown).unwrap();
+}

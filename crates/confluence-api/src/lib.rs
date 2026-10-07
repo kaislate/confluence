@@ -339,6 +339,18 @@ impl SlotState {
     pub fn is_bus(&self) -> bool {
         self.device == BUS_DEVICE
     }
+
+    /// The key this slot's colour is kept under: its device (which all its
+    /// slots share), an insert bus's first send column, or else its name.
+    pub fn color_key(&self) -> String {
+        if self.is_bus() {
+            format!("bus:{}", self.first_output)
+        } else if self.device.is_empty() {
+            format!("slot:{}", self.name)
+        } else {
+            self.device.clone()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

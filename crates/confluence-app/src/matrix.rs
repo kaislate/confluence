@@ -28,6 +28,11 @@ pub struct Band {
     pub channels: u32,
     /// The band's first row (or column) index.
     pub start: usize,
+    /// Picks the default colour: the lowest id among the slots of this
+    /// slot's device, so a device's input and output bands match.
+    pub palette: u32,
+    /// The colour chosen for its device, if any.
+    pub color: Option<confluence_api::Rgb>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -54,7 +59,11 @@ impl Axis {
             if channels == 0 {
                 continue;
             }
+            let key = s.color_key();
+            let palette = slots.iter().filter(|o| o.color_key() == key).map(|o| o.id).min().unwrap_or(s.id);
             axis.bands.push(Band {
+                palette,
+                color: s.color,
                 slot: s.id,
                 name: s.name.clone(),
                 online: s.online,
@@ -277,6 +286,7 @@ mod tests {
             inputs,
             first_output,
             outputs,
+            color: None,
         }
     }
 
@@ -301,6 +311,22 @@ mod tests {
         assert_eq!(point_label(&slots, 1, 0), "Verb return 1 → Mic out 1");
         assert_eq!(point_label(&slots, 1, 1), "Verb return 1 → Verb send 1");
     }
+    #[test]
+    fn a_devices_bands_share_a_colour_and_carry_the_chosen_one() {
+        let dev = |s: SlotState, d: &str| SlotState { device: d.into(), ..s };
+        let slots = [
+            dev(slot(6, "VASIO 1 in", 0, 2, 0, 0), "vasio:1"),
+            dev(slot(7, "VASIO 1 out", 0, 0, 0, 2), "vasio:1"),
+            SlotState { color: Some([1, 2, 3]), ..dev(slot(8, "Game", 0, 0, 2, 2), "wasapi-out:Game") },
+        ];
+        let l = GridLayout::new(&slots, CELL_DEFAULT);
+        let (vin, vout) = (l.rows.band(6).unwrap(), l.cols.band(7).unwrap());
+        assert_eq!((vin.palette, vout.palette), (6, 6), "in and out of one device: one default colour");
+        assert_eq!(l.cols.band(8).unwrap().palette, 8);
+        assert_eq!(l.cols.band(8).unwrap().color, Some([1, 2, 3]));
+        assert_eq!(vin.color, None);
+    }
+
     #[test]
     fn bands_follow_slot_ids_and_skip_empty_directions() {
         let l = GridLayout::new(&slots(), CELL_DEFAULT);
