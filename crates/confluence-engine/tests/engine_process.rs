@@ -34,6 +34,8 @@ fn engine_command(pipe: &str, journal: &std::path::Path) -> Process {
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
     cmd.args(["--pipe", pipe, "--journal"]).arg(journal).arg("--devices").arg(journal.with_file_name("devices.json"));
     cmd.arg("--no-midi");
+    // Loopback only, any free port, never advertised: no test touches the LAN.
+    cmd.args(["--no-net-discovery", "--net-bind", "127.0.0.1", "--net-port", "0"]);
     cmd
 }
 
@@ -603,4 +605,79 @@ fn a_script_reacts_to_midi_and_survives_a_restart() {
     let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     assert_eq!(scenes_now(&pipe).scripts.len(), 2, "kept by compaction");
     shutdown(child, &mut c);
+}
+
+/// A free UDP port on loopback (taken again by an engine just after).
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn spawn_net(pipe: &str, journal: &std::path::Path, port: u16) -> Engine {
+    let mut cmd = engine_command(pipe, journal);
+    cmd.arg("--clap-path").arg(no_plugins(journal));
+    cmd.args(["--net-port", &port.to_string()]);
+    Engine(Some(cmd.spawn().unwrap()))
+}
+
+/// The health of the slot fed by device `device`.
+fn net_health(c: &mut Client, pipe: &str, device: &str) -> Option<confluence_api::SlotHealth> {
+    let (state, _sub) = confluence_client::Subscription::connect(pipe, Duration::from_secs(10)).unwrap();
+    let id = state.slots.iter().find(|s| s.device == device)?.id;
+    match c.call(Command::Health).unwrap() {
+        Response::Health { slots, .. } => slots.into_iter().find(|h| h.id == id),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn two_engines_stream_to_each_other_over_the_network() {
+    use confluence_api::DeviceKind;
+    let dir = tempfile::tempdir().unwrap();
+    let (ja, jb) = (dir.path().join("a").join("journal.bin"), dir.path().join("b").join("journal.bin"));
+    std::fs::create_dir_all(ja.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(jb.parent().unwrap()).unwrap();
+    let (pa, pb) =
+        (format!("confluence-net-a-{}", std::process::id()), format!("confluence-net-b-{}", std::process::id()));
+    let (port_a, port_b) = (free_udp_port(), free_udp_port());
+
+    let a = spawn_net(&pa, &ja, port_a);
+    let b = spawn_net(&pb, &jb, port_b);
+    let mut ca = Client::connect(&pa, Duration::from_secs(10)).unwrap();
+    let mut cb = Client::connect(&pb, Duration::from_secs(10)).unwrap();
+    let send = Command::AddDevice { kind: DeviceKind::NetSend, name: format!("127.0.0.1:{port_b}/Main:2") };
+    assert!(matches!(ca.call(send).unwrap(), Response::Added { .. } | Response::SlotsAdded(_)), "send stream added");
+
+    // B hears the stream before anyone adds it.
+    wait_until("the stream heard by B", || match cb.call(Command::ListDevices).unwrap() {
+        Response::Devices(d) => {
+            d.iter().any(|x| x.kind == DeviceKind::NetReceive && x.name == "127.0.0.1/Main" && x.inputs == 2)
+        }
+        _ => false,
+    });
+    let recv = Command::AddDevice { kind: DeviceKind::NetReceive, name: "127.0.0.1/Main".into() };
+    assert!(matches!(cb.call(recv).unwrap(), Response::Added { .. } | Response::SlotsAdded(_)), "receive stream added");
+    let device = "net-in:127.0.0.1/Main";
+    wait_until("packets in B's slot", || {
+        net_health(&mut cb, &pb, device).and_then(|h| h.net).is_some_and(|n| n.packets > 500)
+    });
+    let h = net_health(&mut cb, &pb, device).unwrap();
+    let n = h.net.unwrap();
+    assert_eq!((n.lost, n.late, n.malformed), (0, 0, 0), "{h:?}");
+    assert!(!h.device_lost, "{h:?}");
+
+    // A stops: B's stream is reported lost, its slot kept.
+    shutdown(a, &mut ca);
+    wait_until("B notices", || net_health(&mut cb, &pb, device).is_some_and(|h| h.device_lost));
+
+    // B restarts: the stream comes back on its own, from a restarted A.
+    shutdown(b, &mut cb);
+    let a = spawn_net(&pa, &ja, port_a);
+    let b = spawn_net(&pb, &jb, port_b);
+    let mut ca = Client::connect(&pa, Duration::from_secs(10)).unwrap();
+    let mut cb = Client::connect(&pb, Duration::from_secs(10)).unwrap();
+    wait_until("packets after both restarted", || {
+        net_health(&mut cb, &pb, device).and_then(|h| h.net).is_some_and(|n| n.packets > 100)
+    });
+    shutdown(a, &mut ca);
+    shutdown(b, &mut cb);
 }

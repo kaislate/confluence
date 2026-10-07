@@ -16,6 +16,8 @@ fn spec(name: &str, rate: f64, block: usize) -> SoftSlotSpec {
         quality: AsrcQuality::Sinc64,
         device: String::new(),
         first_channel: None,
+        margin_frames: None,
+        max_growth_frames: None,
     }
 }
 

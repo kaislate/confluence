@@ -35,7 +35,7 @@ mod app {
         BusRef, Command, DeviceInfo, EngineStatus, Event, ParamState, PluginInfo, Response, SlotHealth,
     };
     use confluence_engine::clock::InternalClock;
-    use confluence_engine::devices::{start_asio_master, DeviceManager};
+    use confluence_engine::devices::{start_asio_master, DeviceManager, NetCtx};
     use confluence_engine::ipc::{default_pipe_name, pipe_path, PipeServer, Service};
     use confluence_engine::journal::Journal;
     use confluence_engine::midi::{MidiEvent, MidiHub, WinmmProvider};
@@ -43,11 +43,14 @@ mod app {
     use confluence_engine::publish::{published_state, Publisher};
     use confluence_engine::rt::disable_power_throttling;
     use confluence_engine::{Engine, EngineConfig, PluginControl, PluginParts};
+    use confluence_net::discovery::{Discovery, DnsSd, FakeDiscovery};
+    use confluence_net::host::NetHost;
     use confluence_plugin_host::{PluginLink, PluginThread, Source};
     use confluence_provider_asio::AsioDevice;
 
     #[derive(clap::Parser)]
-    #[command(version, about = "Confluence audio engine")]
+    // A later flag wins (tests add their own --net-port after the defaults).
+    #[command(version, about = "Confluence audio engine", args_override_self = true)]
     pub struct Args {
         /// Pipe name (default: confluence-<USERNAME>).
         #[arg(long)]
@@ -80,6 +83,64 @@ mod app {
         /// Do not open MIDI devices (tests; MIDI can still be injected over the pipe).
         #[arg(long)]
         no_midi: bool,
+        /// Address network audio listens on (default: every interface).
+        #[arg(long, default_value = "0.0.0.0")]
+        net_bind: std::net::IpAddr,
+        /// UDP port for network audio (0: any free port).
+        #[arg(long, default_value_t = confluence_net::DEFAULT_PORT)]
+        net_port: u16,
+        /// This engine's name on the network (default: the computer's name).
+        #[arg(long)]
+        net_name: Option<String>,
+        /// Do not advertise this engine or look for others (tests; streams by address still work).
+        #[arg(long)]
+        no_net_discovery: bool,
+    }
+
+    /// This engine's network identity: a random number kept in `path`.
+    fn engine_id(path: &std::path::Path) -> u64 {
+        if let Some(id) = std::fs::read_to_string(path).ok().and_then(|s| u64::from_str_radix(s.trim(), 16).ok()) {
+            return id;
+        }
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        h.write_u32(std::process::id());
+        let id = h.finish();
+        if let Err(e) = std::fs::write(path, format!("{id:x}")) {
+            eprintln!("confluence-engine: warning: {} could not be written: {e}", path.display());
+        }
+        id
+    }
+
+    /// Starts network audio; on failure (e.g. the port is taken) the engine runs without it.
+    fn start_net(args: &Args, devices_file: &std::path::Path) -> Option<NetCtx> {
+        let id = engine_id(&devices_file.with_file_name("engine-id"));
+        let host = match NetHost::start(std::net::SocketAddr::new(args.net_bind, args.net_port), id) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!(
+                    "confluence-engine: warning: network audio is off: UDP port {} could not be opened: {e}",
+                    args.net_port
+                );
+                return None;
+            }
+        };
+        let name =
+            args.net_name.clone().or_else(|| std::env::var("COMPUTERNAME").ok()).unwrap_or_else(|| "Confluence".into());
+        let discovery: Box<dyn Discovery> = if args.no_net_discovery {
+            Box::new(FakeDiscovery::default())
+        } else {
+            match DnsSd::start(&name, host.port(), id) {
+                Ok(d) => Box::new(d),
+                Err(e) => {
+                    eprintln!("confluence-engine: warning: other engines will not be found: {e}");
+                    Box::new(FakeDiscovery::default())
+                }
+            }
+        };
+        eprintln!("confluence-engine: network audio on UDP port {} as {name}", host.port());
+        Some(NetCtx::new(host, discovery))
     }
 
     /// `--scan`: runs in a throwaway process, so a plugin that crashes takes
@@ -364,7 +425,8 @@ mod app {
     fn publish(s: &mut State) -> u64 {
         let health = health(s);
         let status = status(s, &health);
-        let list = s.device_list.lock().map(|l| l.clone()).unwrap_or_default();
+        let mut list = s.device_list.lock().map(|l| l.clone()).unwrap_or_default();
+        list.extend(s.devices.net_devices());
         let now = published_state(&mut s.engine, &s.devices, &list, status);
         let now = with_plugins(now, &mut s.engine, &s.scanner);
         s.publisher.publish(now)
@@ -404,10 +466,12 @@ mod app {
                 Command::LoadPlugin { bus, path, plugin_id } => return load_plugin(state, bus, path, plugin_id),
                 Command::ListDevices => {
                     return match DeviceManager::list_devices() {
-                        Ok(d) => {
-                            if let Ok(mut l) = lock(state).device_list.lock() {
+                        Ok(mut d) => {
+                            let s = lock(state);
+                            if let Ok(mut l) = s.device_list.lock() {
                                 l.clone_from(&d);
                             }
+                            d.extend(s.devices.net_devices());
                             Response::Devices(d)
                         }
                         Err(e) => Response::Error(e),
@@ -547,11 +611,12 @@ mod app {
         if let Err(e) = disable_power_throttling() {
             eprintln!("confluence-engine: warning: could not disable power throttling: {e}");
         }
-        let pipe = args.pipe.unwrap_or_else(default_pipe_name);
+        let pipe = args.pipe.clone().unwrap_or_else(default_pipe_name);
         // Claim the pipe name before touching any state: a second engine must
         // fail here, not after it has replayed and compacted the journal.
         let listener = PipeServer::bind(&pipe)?;
-        let (mut journal, replay) = Journal::open(&args.journal.unwrap_or_else(|| data_dir().join("journal.bin")))?;
+        let (mut journal, replay) =
+            Journal::open(&args.journal.clone().unwrap_or_else(|| data_dir().join("journal.bin")))?;
 
         // An ASIO master fixes the engine's rate and block: open it first.
         let asio_master = match args.master.strip_prefix("asio:") {
@@ -588,8 +653,11 @@ mod app {
         let scanner = Scanner::start(exe.clone(), plugin_dirs);
         journal.compact(&state_commands(&mut engine))?;
 
-        let (mut devices, mut warnings) =
-            DeviceManager::open_file(args.devices.unwrap_or_else(|| data_dir().join("devices.json")));
+        let devices_file = args.devices.clone().unwrap_or_else(|| data_dir().join("devices.json"));
+        let (mut devices, mut warnings) = DeviceManager::open_file(devices_file.clone());
+        if let Some(net) = start_net(&args, &devices_file) {
+            devices = devices.with_net(net);
+        }
         let master = match asio_master {
             Some((name, mut dev)) => {
                 devices.claim_master(&name);
@@ -673,6 +741,9 @@ mod app {
             midi_tick(&mut s);
             ticks += 1;
             if ticks.is_multiple_of(PUBLISH_TICKS) {
+                // Network streams whose engine was not found come back once it is.
+                let State { devices, engine, .. } = &mut *s;
+                devices.retry_offline_net(engine);
                 // Catches changes no command made: devices lost or back, a DAW attaching.
                 publish(&mut s);
                 // Values changed in plugin editors are saved like any other change.

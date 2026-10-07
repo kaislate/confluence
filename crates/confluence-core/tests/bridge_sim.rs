@@ -23,6 +23,7 @@ fn config(device_rate: f64, device_block: usize, master_block: usize) -> BridgeC
         master_block,
         quality: AsrcQuality::Sinc64,
         margin_frames: 24,
+        max_growth_frames: None,
     }
 }
 

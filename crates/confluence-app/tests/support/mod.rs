@@ -43,6 +43,12 @@ impl EngineDir {
             self.clap_dir().display().to_string(),
             // Never this PC's MIDI devices (tests inject MIDI over the pipe).
             "--no-midi".into(),
+            // Loopback only, any free port, never advertised on the network.
+            "--no-net-discovery".into(),
+            "--net-bind".into(),
+            "127.0.0.1".into(),
+            "--net-port".into(),
+            "0".into(),
         ]
     }
 
@@ -66,7 +72,12 @@ pub struct Engine(Option<Child>);
 
 impl Engine {
     pub fn spawn(d: &EngineDir) -> Engine {
-        let child = Process::new(engine_exe()).args(d.args()).stderr(Stdio::null()).spawn().unwrap();
+        Self::spawn_with(d, &[])
+    }
+
+    /// With more arguments (later ones override `d.args()`).
+    pub fn spawn_with(d: &EngineDir, extra: &[&str]) -> Engine {
+        let child = Process::new(engine_exe()).args(d.args()).args(extra).stderr(Stdio::null()).spawn().unwrap();
         Engine(Some(child))
     }
 

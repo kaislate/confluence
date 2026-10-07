@@ -389,6 +389,7 @@ mod tests {
             midi_bindings: Vec::new(),
             midi_learning: None,
             scripts: Vec::new(),
+            peers: Vec::new(),
         }
     }
 
@@ -406,6 +407,7 @@ mod tests {
             driver_requests: 0,
             attached: None,
             idle_note: None,
+            net: None,
         }
     }
 

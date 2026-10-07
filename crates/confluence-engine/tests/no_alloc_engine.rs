@@ -25,6 +25,8 @@ fn process_block_does_not_allocate() {
         quality: AsrcQuality::Sinc64,
         device: String::new(),
         first_channel: None,
+        margin_frames: None,
+        max_growth_frames: None,
     };
     let (_, mut dev_in) = engine.add_soft_input(&spec("in")).unwrap();
     let (_, mut dev_out) = engine.add_soft_output(&spec("out")).unwrap();

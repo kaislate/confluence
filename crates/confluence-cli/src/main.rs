@@ -74,6 +74,8 @@ enum Cmd {
     Midi,
     /// List the Luau scripts and their status.
     Scripts,
+    /// List the other Confluence engines found on the network.
+    Peers,
     /// Store the Luau script in FILE as NAME (and start it, unless --disabled).
     SetScript {
         name: String,
@@ -112,6 +114,8 @@ enum Kind {
     App,
     Vasio,
     Vaio,
+    NetOut,
+    NetIn,
 }
 
 impl From<Kind> for DeviceKind {
@@ -123,6 +127,8 @@ impl From<Kind> for DeviceKind {
             Kind::App => DeviceKind::AppCapture,
             Kind::Vasio => DeviceKind::Vasio,
             Kind::Vaio => DeviceKind::Vaio,
+            Kind::NetOut => DeviceKind::NetSend,
+            Kind::NetIn => DeviceKind::NetReceive,
         }
     }
 }
@@ -156,7 +162,7 @@ impl Cmd {
             }
             Cmd::RecallScene { ref name } => Command::RecallScene { name: name.clone() },
             Cmd::DeleteScene { ref name } => Command::DeleteScene { name: name.clone() },
-            Cmd::Midi | Cmd::Scripts => Command::Subscribe,
+            Cmd::Midi | Cmd::Scripts | Cmd::Peers => Command::Subscribe,
             // Reads a file: see `script_command`.
             Cmd::SetScript { ref name, .. } => {
                 Command::SetScript { name: name.clone(), source: String::new(), enabled: false }
@@ -183,6 +189,14 @@ fn script_command(cmd: &Cmd) -> Result<Command, String> {
         }
         other => Ok(other.to_command()),
     }
+}
+
+/// The engines found on the network.
+fn render_peers(peers: &[confluence_api::Peer]) -> String {
+    if peers.is_empty() {
+        return "no other engines found".into();
+    }
+    peers.iter().map(|p| format!("{}  {}:{}", p.name, p.address, p.port)).collect::<Vec<_>>().join("\n")
 }
 
 /// Scripts and their status, from a state snapshot.
@@ -298,6 +312,12 @@ fn render(resp: &Response) -> String {
                 if h.driver_requests > 0 {
                     line.push_str(&format!("  {} driver requests (re-add the device)", h.driver_requests));
                 }
+                if let Some(n) = h.net {
+                    line.push_str(&format!(
+                        "  net {} packets, {} lost, {} late, {} reordered",
+                        n.packets, n.lost, n.late, n.reordered
+                    ));
+                }
                 line
             }));
             lines.join("\n")
@@ -358,6 +378,10 @@ fn main() -> ExitCode {
             println!("{}", render_scripts(&s));
             ExitCode::SUCCESS
         }
+        Ok(Response::Snapshot(s)) if matches!(cli.command, Cmd::Peers) => {
+            println!("{}", render_peers(&s.peers));
+            ExitCode::SUCCESS
+        }
         Ok(resp) => {
             println!("{}", render(&resp));
             if matches!(resp, Response::Error(_)) {
@@ -414,6 +438,7 @@ fn render_change(c: &Change) -> String {
             learning.map(|(i, o)| format!(", learning {i} -> {o}")).unwrap_or_default()
         ),
         Change::ScriptsChanged(s) => format!("{} scripts", s.len()),
+        Change::PeersChanged(p) => format!("{} engines on the network", p.len()),
         Change::ScenesChanged(s, current, morphing) => format!(
             "{} scenes, current: {}{}",
             s.len(),
@@ -529,6 +554,23 @@ v7  slot #3 removed"
     }
 
     #[test]
+    fn network_streams_parse_and_peers_are_shown() {
+        let cli = Cli::try_parse_from(["confluence-cli", "add-device", "net-out", "Lilith/Main:2"]).unwrap();
+        assert_eq!(
+            cli.command.to_command(),
+            Command::AddDevice { kind: DeviceKind::NetSend, name: "Lilith/Main:2".into() }
+        );
+        let cli = Cli::try_parse_from(["confluence-cli", "add-device", "net-in", "Lilith/Main"]).unwrap();
+        assert_eq!(
+            cli.command.to_command(),
+            Command::AddDevice { kind: DeviceKind::NetReceive, name: "Lilith/Main".into() }
+        );
+        assert_eq!(render_peers(&[]), "no other engines found");
+        let lilith = confluence_api::Peer { name: "Lilith".into(), address: "192.168.50.12".into(), port: 6990 };
+        assert_eq!(render_peers(&[lilith]), "Lilith  192.168.50.12:6990");
+    }
+
+    #[test]
     fn add_device_vaio_parses() {
         let cli = Cli::try_parse_from(["confluence-cli", "add-device", "vaio", "1"]).unwrap();
         assert_eq!(cli.command.to_command(), Command::AddDevice { kind: DeviceKind::Vaio, name: "1".into() });
@@ -566,6 +608,7 @@ v7  slot #3 removed"
             }],
             midi_learning: None,
             scripts: Vec::new(),
+            peers: Vec::new(),
         };
         let text = render_midi(&st);
         assert!(text.contains("nanoKONTROL2"), "{text}");
@@ -671,6 +714,7 @@ v7  slot #3 removed"
             driver_requests,
             attached: None,
             idle_note: None,
+            net: None,
         };
         let text = render(&Response::Health {
             blocks: 9,
@@ -687,6 +731,18 @@ v7  slot #3 removed"
         let text = render(&Response::Health { blocks: 9, slots: vec![waiting], notices: vec!["x is odd".into()] });
         assert!(text.contains("no app playing") && !text.contains("DAW"), "the slot's own note: {text}");
         assert!(text.contains("note: x is odd"), "{text}");
+        let mut stream = h(6, false, 0, 0);
+        stream.net = Some(confluence_api::NetStats {
+            packets: 900,
+            lost: 2,
+            late: 1,
+            reordered: 5,
+            malformed: 0,
+            silent_ms: 3,
+            mismatched: 0,
+        });
+        let text = render(&Response::Health { blocks: 9, slots: vec![stream], notices: Vec::new() });
+        assert!(text.contains("net 900 packets, 2 lost, 1 late, 5 reordered"), "{text}");
         let mut unexplained = h(5, false, 0, 0);
         unexplained.attached = Some(false);
         let text = render(&Response::Health { blocks: 9, slots: vec![unexplained], notices: Vec::new() });
