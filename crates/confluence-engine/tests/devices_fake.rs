@@ -718,3 +718,36 @@ fn an_offline_slot_coming_back_shows_in_the_published_diff() {
     let added = changes.iter().filter(|c| matches!(c, confluence_api::Change::SlotAdded(s) if s.online)).count();
     assert_eq!(added, 2, "{changes:?}");
 }
+
+#[test]
+fn meters_read_the_fake_drivers_quarter_scale_input_and_its_routed_output() {
+    let _budget = driver_budget();
+    confluence_provider_vasio::isolate_for_tests();
+    let probe = Arc::new(FakeProbe::default());
+    let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_asio_opener(opener(vec![("fake:loop", probe.clone())]));
+    devices.add(&mut engine, DeviceKind::Asio, "fake:loop").unwrap();
+    let slots = engine.slots();
+    let (inp, out) = (slots[0].first_input, slots[1].first_output);
+    route(&mut engine, inp, out);
+    let clock = InternalClock::start(audio, 48_000.0).unwrap();
+    for _ in 0..150 {
+        std::thread::sleep(Duration::from_millis(10));
+        engine.tick();
+    }
+    // Peaks are held until read: the first read takes the start-up transient
+    // (the resampler's overshoot on the step to 0.25).
+    engine.meter_frame();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(10));
+        engine.tick();
+    }
+    let f = engine.meter_frame();
+    let db = |b: u8| confluence_api::byte_db(b);
+    let i = (inp - f.first_input) as usize;
+    let o = (out - f.first_output) as usize;
+    assert!((db(f.inputs[i][0]) - -12.04).abs() < 0.5, "input peak {}", db(f.inputs[i][0]));
+    assert!((db(f.outputs[o][1]) - -12.04).abs() < 0.8, "routed output rms {}", db(f.outputs[o][1]));
+    assert!(f.clipped_in.is_empty());
+    clock.stop();
+}

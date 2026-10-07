@@ -7,6 +7,8 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use confluence_core::meter::MeterBank;
+
 use confluence_core::bridge::{InputEngineSide, OutputEngineSide};
 use confluence_core::buffer::PlanarBuffer;
 use confluence_core::clock::{RateEstimator, DEFAULT_RATE_BANDWIDTH_HZ};
@@ -104,6 +106,8 @@ pub(crate) enum AudioMsg {
         silent: bool,
     },
     Remove(u32),
+    /// The channels to meter from now on; the previous ranges are returned.
+    SetMeterRanges(Box<MeterRanges>),
 }
 
 /// Slot state handed back to the control side (never dropped on the audio thread).
@@ -113,6 +117,41 @@ pub(crate) enum Returned {
     Strict(Box<StrictEntry>),
     Bus(Box<BusEntry>),
     Processor(Box<dyn Processor>),
+    MeterRanges(Box<MeterRanges>),
+}
+
+/// The slot channels the audio thread meters, as (first, count) ranges.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MeterRanges {
+    pub inputs: Vec<(usize, usize)>,
+    pub outputs: Vec<(usize, usize)>,
+}
+
+/// Level meters of the engine's channels, measured on the audio thread.
+pub(crate) struct Metering {
+    pub inputs: Arc<MeterBank>,
+    pub outputs: Arc<MeterBank>,
+    /// Running mean squares per channel (allocated once).
+    pub ms_in: Box<[f32]>,
+    pub ms_out: Box<[f32]>,
+    pub coeff: f32,
+    pub ranges: Option<Box<MeterRanges>>,
+}
+
+impl Metering {
+    fn measure(&mut self, inputs: &PlanarBuffer, outputs: &PlanarBuffer) {
+        let Some(r) = self.ranges.as_deref() else { return };
+        for &(first, n) in &r.inputs {
+            for c in first..(first + n).min(inputs.channels()).min(self.ms_in.len()) {
+                self.inputs.measure(c, inputs.channel(c), &mut self.ms_in[c], self.coeff);
+            }
+        }
+        for &(first, n) in &r.outputs {
+            for c in first..(first + n).min(outputs.channels()).min(self.ms_out.len()) {
+                self.outputs.measure(c, outputs.channel(c), &mut self.ms_out[c], self.coeff);
+            }
+        }
+    }
 }
 
 pub struct AudioEngine {
@@ -139,6 +178,7 @@ pub struct AudioEngine {
     pub(crate) master_est: Option<RateEstimator>,
     pub(crate) master_ppm: Arc<AtomicU64>,
     pub(crate) load: LoadMeter,
+    pub(crate) meters: Metering,
 }
 
 /// Smoothing time constant of the DSP load, in seconds.
@@ -230,6 +270,7 @@ impl AudioEngine {
         for e in self.strict.iter_mut() {
             e.side.send(&self.outputs);
         }
+        self.meters.measure(&self.inputs, &self.outputs);
         self.blocks.fetch_add(1, Ordering::Relaxed);
         let period = self.outputs.frames() as f64 / self.sample_rate;
         self.load.record(start.elapsed().as_secs_f64(), period);
@@ -286,6 +327,11 @@ impl AudioEngine {
                 AudioMsg::SetSilent { bus, silent } => {
                     if let Some(b) = self.buses.iter_mut().find(|b| b.id == bus) {
                         b.silent = silent;
+                    }
+                }
+                AudioMsg::SetMeterRanges(r) => {
+                    if let Some(old) = self.meters.ranges.replace(r) {
+                        self.give_back(Returned::MeterRanges(old));
                     }
                 }
                 AudioMsg::Remove(id) => {

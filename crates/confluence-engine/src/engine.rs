@@ -26,9 +26,14 @@ mod midi_map;
 mod scenes;
 mod scripts;
 use crate::audio::{
-    AudioEngine, AudioMsg, BusEntry, InputEntry, LoadMeter, OutputEntry, Returned, StrictEntry, StrictSide, MAX_BUSES,
-    MAX_SLOTS,
+    AudioEngine, AudioMsg, BusEntry, InputEntry, LoadMeter, MeterRanges, Metering, OutputEntry, Returned, StrictEntry,
+    StrictSide, MAX_BUSES, MAX_SLOTS,
 };
+use confluence_api::{meter_byte, MeterFrame};
+use confluence_core::meter::{rms_coeff, MeterBank};
+
+/// Time constant of the RMS meters, in seconds.
+const RMS_TIME_CONSTANT_S: f64 = 0.3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
@@ -329,6 +334,10 @@ pub struct Engine {
     blocks: Arc<AtomicU64>,
     master_ppm: Arc<AtomicU64>,
     dsp_load: Arc<AtomicU32>,
+    meters_in: Arc<MeterBank>,
+    meters_out: Arc<MeterBank>,
+    /// The ranges the audio thread was last told to meter.
+    meter_ranges: MeterRanges,
 }
 
 impl Engine {
@@ -345,6 +354,8 @@ impl Engine {
         let mut outputs = PlanarBuffer::new(cfg.max_outputs, cfg.block);
         inputs.set_frames(cfg.block);
         outputs.set_frames(cfg.block);
+        let meters_in = MeterBank::new(cfg.max_inputs);
+        let meters_out = MeterBank::new(cfg.max_outputs);
         let audio = AudioEngine {
             router,
             inputs,
@@ -361,6 +372,14 @@ impl Engine {
             master_est: None,
             master_ppm: master_ppm.clone(),
             load: LoadMeter::new(dsp_load.clone()),
+            meters: Metering {
+                inputs: meters_in.clone(),
+                outputs: meters_out.clone(),
+                ms_in: vec![0.0; cfg.max_inputs].into_boxed_slice(),
+                ms_out: vec![0.0; cfg.max_outputs].into_boxed_slice(),
+                coeff: rms_coeff(cfg.block, cfg.sample_rate, RMS_TIME_CONSTANT_S),
+                ranges: None,
+            },
         };
         let engine = Engine {
             cfg,
@@ -389,6 +408,9 @@ impl Engine {
             blocks,
             master_ppm,
             dsp_load,
+            meters_in,
+            meters_out,
+            meter_ranges: MeterRanges::default(),
         };
         (engine, audio)
     }
@@ -1126,6 +1148,7 @@ impl Engine {
         self.plan.tick();
         self.advance_morph(std::time::Instant::now());
         self.matrix.tick();
+        self.send_meter_ranges();
         while let Some(r) = self.returns.try_recv() {
             match r {
                 Returned::Input(entry) => drop(entry),
@@ -1137,8 +1160,48 @@ impl Engine {
                     }
                 }
                 Returned::Processor(p) => self.returned_processors.push(p),
+                Returned::MeterRanges(r) => drop(r),
             }
         }
+    }
+
+    /// Tells the audio thread which channels to meter, when the slots changed.
+    fn send_meter_ranges(&mut self) {
+        let mut r = MeterRanges::default();
+        for s in &self.slots {
+            if s.state.inputs > 0 {
+                r.inputs.push((s.state.first_input as usize, s.state.inputs as usize));
+            }
+            if s.state.outputs > 0 {
+                r.outputs.push((s.state.first_output as usize, s.state.outputs as usize));
+            }
+        }
+        if r != self.meter_ranges && self.to_audio.try_send(AudioMsg::SetMeterRanges(Box::new(r.clone()))).is_ok() {
+            self.meter_ranges = r;
+        }
+    }
+
+    /// Every slot channel's level since the last call (peak) and now (RMS),
+    /// with the clipped channels (spec: slot model §4).
+    pub fn meter_frame(&self) -> MeterFrame {
+        let span = |dir: fn(&SlotState) -> (u32, u32)| {
+            let ranges: Vec<(u32, u32)> = self.slots.iter().map(|s| dir(&s.state)).filter(|r| r.1 > 0).collect();
+            let first = ranges.iter().map(|r| r.0).min().unwrap_or(0);
+            let end = ranges.iter().map(|r| r.0 + r.1).max().unwrap_or(0);
+            (first, end, ranges)
+        };
+        let read = |bank: &MeterBank, (first, end, ranges): (u32, u32, Vec<(u32, u32)>)| {
+            let live = |c: u32| ranges.iter().any(|&(f, n)| c >= f && c < f + n);
+            let db = |x: f32| meter_byte(20.0 * x.max(1e-9).log10());
+            let levels = (first..end)
+                .map(|c| if live(c) { [db(bank.take_peak(c as usize)), db(bank.rms(c as usize))] } else { [0, 0] })
+                .collect();
+            let clipped = (first..end).filter(|&c| live(c) && bank.clipped(c as usize)).collect();
+            (first, levels, clipped)
+        };
+        let (first_input, inputs, clipped_in) = read(&self.meters_in, span(|s| (s.first_input, s.inputs)));
+        let (first_output, outputs, clipped_out) = read(&self.meters_out, span(|s| (s.first_output, s.outputs)));
+        MeterFrame { inputs, outputs, first_input, first_output, clipped_in, clipped_out }
     }
 
     /// Current slot list (same data as `Command::ListSlots`).
@@ -1238,7 +1301,11 @@ impl Engine {
             | Command::SetVirtual { .. }
             | Command::SetMaster { .. } => Response::Error("positions are handled by the engine process".into()),
             Command::SubscribeMeters => Response::Error("subscriptions are served by the engine process".into()),
-            Command::ClearClip => Response::Ok,
+            Command::ClearClip => {
+                self.meters_in.clear_clips();
+                self.meters_out.clear_clips();
+                Response::Ok
+            }
             Command::SetSlotColor { id, color } => match self.color_key(id) {
                 Some(key) => self.colours.set(&key, color).map_or_else(Response::Error, |()| Response::Ok),
                 None => Response::Error(format!("there is no slot {id}")),
