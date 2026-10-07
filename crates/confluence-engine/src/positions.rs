@@ -98,7 +98,7 @@ mod tests {
         let t = PositionTable::new_default();
         assert_eq!(t.virtual_state(p("vasio:A")), Some(VirtualState { on: true, shape: (8, 8) }));
         for l in ["B", "C", "D", "E", "F", "G", "H"] {
-            assert_eq!(t.virtual_state(p(&format!("vasio:{l}"))).unwrap().on, false);
+            assert!(!t.virtual_state(p(&format!("vasio:{l}"))).unwrap().on);
         }
         assert_eq!(t.virtual_state(p("vaio:A")), Some(VirtualState { on: false, shape: (2, 0) }));
         assert_eq!(t.virtual_state(p("asio:1")), None);
