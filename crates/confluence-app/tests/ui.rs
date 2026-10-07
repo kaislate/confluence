@@ -669,3 +669,17 @@ fn a_devices_colour_is_picked_in_the_inspector() {
     });
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn the_skin_is_chosen_in_settings() {
+    let d = EngineDir::new("skin");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Settings…").click();
+    pump_until(&mut h, "the Settings window", LONG, |h| h.query_by_label("Silver").is_some());
+    h.get_by_label("Silver").click();
+    settle(&mut h);
+    assert_eq!(h.state().finish(), confluence_app::gear::skins::Finish::Silver);
+    client(&d).call(Command::Shutdown).unwrap();
+}

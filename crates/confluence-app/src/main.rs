@@ -28,6 +28,10 @@ fn main() -> eframe::Result {
             if let Some(v) = cc.storage.and_then(|s| s.get_string(INSPECTOR_KEY)) {
                 app.inspector_open = v != "false";
             }
+            let saved = cc.storage.and_then(|s| s.get_string(confluence_app::settings::FINISH_KEY));
+            if let Some(f) = saved.as_deref().and_then(confluence_app::gear::skins::Finish::from_name) {
+                app.set_finish(f);
+            }
             Ok(Box::new(app))
         }),
     );

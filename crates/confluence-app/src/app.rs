@@ -183,6 +183,9 @@ pub struct ConfluenceApp {
     scene_bar: crate::scenes::SceneBar,
     scripts_open: bool,
     scripts: crate::scripts::ScriptsUi,
+    /// The gear finish (Settings).
+    finish: crate::gear::skins::Finish,
+    settings_open: bool,
 }
 
 /// The engine owns plugin editor windows; Windows lets a background process
@@ -250,6 +253,8 @@ impl ConfluenceApp {
             scene_bar: crate::scenes::SceneBar::default(),
             scripts_open: false,
             scripts: crate::scripts::ScriptsUi::default(),
+            finish: crate::gear::skins::Finish::default(),
+            settings_open: false,
         }
     }
 
@@ -358,6 +363,7 @@ impl ConfluenceApp {
                     }
                 }
                 self.look.apply(&ctx);
+                crate::gear::install_fonts(&ctx);
                 ctx.options_mut(|o| o.input_options.max_click_dist = CLICK_DIST);
                 *r = Some(ctx.clone());
             }
@@ -491,6 +497,17 @@ impl ConfluenceApp {
         ui.toggle_value(&mut self.inspector_open, "Inspector");
         ui.toggle_value(&mut self.devices_open, "Devices…");
         ui.toggle_value(&mut self.scripts_open, "Scripts…");
+        ui.toggle_value(&mut self.settings_open, "Settings…");
+    }
+
+    /// The gear finish chosen in Settings.
+    pub fn finish(&self) -> crate::gear::skins::Finish {
+        self.finish
+    }
+
+    /// Restores the finish saved last time (see [`crate::settings::FINISH_KEY`]).
+    pub fn set_finish(&mut self, finish: crate::gear::skins::Finish) {
+        self.finish = finish;
     }
 
     fn side_panels(&mut self, ui: &mut egui::Ui, view: &StoreView, _now: Instant) {
@@ -563,6 +580,9 @@ impl ConfluenceApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
+        if self.settings_open {
+            crate::settings::show(ctx, &mut self.settings_open, &mut self.finish);
+        }
         if let (true, Some(state)) = (self.scripts_open, view.state.as_ref()) {
             let editable = self.live();
             let scripts = &mut self.scripts;
@@ -738,6 +758,7 @@ impl eframe::App for ConfluenceApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(INSPECTOR_KEY, self.inspector_open.to_string());
+        storage.set_string(crate::settings::FINISH_KEY, self.finish.name().to_string());
     }
 }
 
