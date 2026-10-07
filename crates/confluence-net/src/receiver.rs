@@ -110,7 +110,8 @@ pub struct Receiver {
     /// `take_discontinuity`).
     discontinuity: bool,
     /// When the current run of late packets (with nothing on time since) began.
-    late_since: Option<f64>,
+    /// (its arrival, its timestamp) for the first packet of that run.
+    late_since: Option<(f64, u32)>,
     /// The longest wait the current run of late packets would teach: learned
     /// when a packet on time ends the run (it was a stall), not if the run
     /// turns out to be a shifted timeline.
@@ -275,10 +276,21 @@ impl Receiver {
 
     /// Whether late packets have kept coming long enough (counting this one at
     /// `arrival`) that the sender's timeline must have shifted.
-    fn late_streak(&mut self, arrival: f64, frames: usize) -> bool {
-        let since = *self.late_since.get_or_insert(arrival);
+    fn late_streak(&mut self, ts: u32, arrival: f64, frames: usize) -> bool {
+        let (since, first) = *self.late_since.get_or_insert((arrival, ts));
         let packet = frames as f64 / self.rate as f64;
-        arrival - since >= (LATE_STREAK_PACKETS * packet).max(self.hold)
+        let (elapsed, advanced) = (arrival - since, diff(ts, first) as f64 / self.rate as f64);
+        // A stall's backlog comes in faster than real time (it catches up);
+        // a sender that paused goes on at its own pace.
+        let own_pace = advanced <= 1.5 * elapsed + packet;
+        if elapsed < (LATE_STREAK_PACKETS * packet).max(self.hold) {
+            return false;
+        }
+        if !own_pace {
+            // A backlog: judge what comes after it afresh.
+            self.late_since = Some((arrival, ts));
+        }
+        own_pace
     }
 
     /// Seconds from the anchor to `ts` on the sender's timeline.
@@ -327,7 +339,7 @@ impl Receiver {
                 let d = diff(ts, e);
                 let far =
                     d < -(BEHIND_RESYNC_S * self.rate as f64) as i64 || d > (AHEAD_RESYNC_S * self.rate as f64) as i64;
-                if far || (d < 0 && self.late_streak(arrival, frames)) {
+                if far || (d < 0 && self.late_streak(ts, arrival, frames)) {
                     self.resync(ts);
                 } else if d < 0 {
                     self.stats.late += 1;
@@ -873,6 +885,27 @@ mod tests {
         let steps: Vec<f64> = out.times[1500..].windows(2).map(|w| w[1] - w[0]).collect();
         let worst = steps.iter().map(|d| (d - PT).abs()).fold(0.0, f64::max);
         assert!(worst < 0.0005, "stamps step by up to {worst} s off one packet time");
+    }
+
+    #[test]
+    fn a_long_stall_flushed_late_is_not_taken_for_a_paused_sender() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        let (ts, t0) = steady(&mut r, &mut out, 2.0, 0.0);
+        // The link stalls for 60 ms (concealed meanwhile), then the backlog
+        // comes in faster than real time, a packet every 0.25 ms.
+        for k in 1..=60 {
+            r.poll(t0 + k as f64 * PT, &mut out.sink(1));
+        }
+        let mut t = t0 + 60.0 * PT;
+        for i in 0..120u32 {
+            t = t.max(t0 + (i as f64 + 0.5) * PT) + 0.25 * PT;
+            r.push(&header(ts + i * 48, 0, 1, 1), &block(0.1, 1), t, &mut out.sink(1));
+            r.poll(t, &mut out.sink(1));
+        }
+        assert_eq!(r.stats().resyncs, 0, "{:?}", r.stats());
+        let played = out.frames.len() as f64 / 48_000.0;
+        assert!((played - t).abs() < 0.006, "nothing played twice: {played} s in {t} s");
     }
 
     #[test]
