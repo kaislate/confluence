@@ -215,23 +215,17 @@ fn a_selection_removed_elsewhere_is_cleared() {
 }
 
 #[test]
-fn a_device_can_be_added_from_the_devices_panel() {
+fn a_vasio_is_turned_on_from_the_devices_screen() {
     let d = EngineDir::new("devices");
     let _engine = Engine::spawn(&d);
-    let mut h = harness(app_for(&d));
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
-    h.get_by_label("Devices…").click();
-    pump_until(&mut h, "the VASIO entries", LONG, |h| h.query_by_label("Add VASIO 3").is_some());
-    // The list also holds this PC's real devices, so VASIO 3 may be scrolled out of
-    // view: bring it into view and make sure the click lands on it, never elsewhere.
-    h.get_by_label("Add VASIO 3").scroll_to_me();
-    settle(&mut h);
-    let r = h.get_by_label("Add VASIO 3").rect();
-    assert!(r.min.y >= 0.0 && r.max.y <= 800.0, "the button is on screen: {r:?}");
-    h.get_by_label("Add VASIO 3").click();
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO C's card", LONG, |h| h.query_by_label("Turn on VASIO C").is_some());
+    h.get_by_label("Turn on VASIO C").click();
     pump_until(&mut h, "the new slot", LONG, |_| slots(&mut client(&d)).iter().any(|s| s.name == "VASIO 3"));
-    pump_until(&mut h, "the notification", LONG, |h| h.query_by_label_contains("Added VASIO 3").is_some());
-    pump_until(&mut h, "in use", LONG, |h| h.query_by_label("Add VASIO 3").is_none());
+    pump_until(&mut h, "the notification", LONG, |h| h.query_by_label_contains("Turned on VASIO C").is_some());
+    pump_until(&mut h, "its Turn off", LONG, |h| h.query_by_label("Turn off VASIO C").is_some());
     client(&d).call(Command::Shutdown).unwrap();
 }
 
@@ -411,7 +405,7 @@ fn an_insert_bus_is_added_routed_and_cannot_loop() {
     let (i, _) = add_vasio(&mut c, 1);
     let mut h = harness(app_for(&d));
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
-    h.get_by_label("Devices…").click();
+    h.get_by_label("Devices").click();
     pump_until(&mut h, "the bus row", LONG, |h| h.query_by_label("Add insert bus").is_some());
     // The list also holds this PC's real devices: bring the row into view first.
     h.get_by_label("Add insert bus").scroll_to_me();
@@ -426,6 +420,7 @@ fn an_insert_bus_is_added_routed_and_cannot_loop() {
     pump_until(&mut h, "the bus slot", LONG, |_| slots(&mut client(&d)).iter().any(|s| s.is_bus() && s.name == "Verb"));
     pump_until(&mut h, "the notification", LONG, |h| h.query_by_label_contains("Added insert bus Verb").is_some());
     let bus = slots(&mut c).into_iter().find(|s| s.is_bus()).unwrap();
+    h.get_by_label("Matrix").click();
 
     let send = "VASIO 1 in 1 → Verb send 1";
     pump_until(&mut h, "the send cell", LONG, |h| h.query_by_role_and_label(Role::Button, send).is_some());
@@ -612,7 +607,7 @@ fn a_script_is_written_in_the_window_and_runs_in_the_engine() {
 }
 
 #[test]
-fn a_stream_from_another_engine_is_added_from_the_devices_panel() {
+fn a_stream_from_another_engine_is_received_from_its_net_in_picker() {
     use confluence_net::host::{NetHost, SendSpec};
     let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let d = EngineDir::new("net");
@@ -634,10 +629,13 @@ fn a_stream_from_another_engine_is_added_from_the_devices_panel() {
         })
     };
     let mut h = harness(app_for(&d));
-    pump_until(&mut h, "the Devices button", LONG, |h| h.query_by_label("Devices…").is_some());
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "NET IN 1", LONG, |h| h.query_by_label_contains("NET IN 1 · click").is_some());
+    h.get_by_label_contains("NET IN 1 · click").scroll_to_me();
     settle(&mut h);
-    h.get_by_label("Devices…").click();
-    let add = "Add Network receive 127.0.0.1/Guest";
+    h.get_by_label_contains("NET IN 1 · click").click();
+    let add = "Receive 127.0.0.1/Guest";
     pump_until(&mut h, "the heard stream", LONG, |h| h.query_by_label(add).is_some());
     settle(&mut h);
     h.get_by_label(add).click();
@@ -682,4 +680,74 @@ fn the_skin_is_chosen_in_settings() {
     settle(&mut h);
     assert_eq!(h.state().finish(), confluence_app::gear::skins::Finish::Silver);
     client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn the_devices_screen_shows_positions_and_vasio_a_is_on() {
+    let d = EngineDir::new("screen");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    // The card's own label (its pills say "Turn off VASIO A" and so on).
+    pump_until(&mut h, "the VASIO A card", LONG, |h| h.query_by_label_contains("VASIO A · ").is_some());
+    assert!(h.query_by_label_contains("ASIO 1 · click to choose a device").is_some());
+    assert!(h.query_by_label_contains("NO DAW").is_some());
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn turning_a_vasio_on_from_its_card_reaches_the_engine() {
+    let d = EngineDir::new("vasio-on");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO B's Turn on", LONG, |h| h.query_by_label("Turn on VASIO B").is_some());
+    h.get_by_label("Turn on VASIO B").click();
+    pump_until(&mut h, "VASIO B in the engine", LONG, |_| slots(&mut c).iter().any(|s| s.name == "VASIO 2"));
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn an_empty_network_slot_is_filled_from_its_picker() {
+    let d = EngineDir::new("fill");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "NET OUT 1", LONG, |h| h.query_by_label_contains("NET OUT 1 · click").is_some());
+    // The network rows are at the bottom of the screen: bring the card into view.
+    h.get_by_label_contains("NET OUT 1 · click").scroll_to_me();
+    settle(&mut h);
+    h.get_by_label_contains("NET OUT 1 · click").click();
+    pump_until(&mut h, "the send picker", LONG, |h| h.query_by(|n| n.placeholder() == Some("Address (ip:port)")).is_some());
+    h.get_by(|n| n.placeholder() == Some("Address (ip:port)")).click();
+    h.get_by(|n| n.placeholder() == Some("Address (ip:port)")).type_text("127.0.0.1:9");
+    h.get_by_label("Send here").click();
+    pump_until(&mut h, "a send slot", LONG, |_| slots(&mut c).iter().any(|s| s.device.starts_with("net-out:")));
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_filled_position_is_cleared_after_confirming() {
+    let d = EngineDir::new("clear");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let pos: confluence_api::PosId = "net-out:1".parse().unwrap();
+    let fill = Command::FillPosition { pos, kind: DeviceKind::NetSend, name: "127.0.0.1:9/Main:2".into() };
+    assert!(matches!(c.call(fill).unwrap(), Response::Added { .. }));
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "the Clear pill", LONG, |h| h.query_by_label("Clear NET OUT 1").is_some());
+    h.get_by_label("Clear NET OUT 1").scroll_to_me();
+    settle(&mut h);
+    h.get_by_label("Clear NET OUT 1").click();
+    pump_until(&mut h, "the question", LONG, |h| h.query_by_label_contains("Its routes are removed").is_some());
+    h.get_by_label("Clear").click();
+    pump_until(&mut h, "the slot gone", LONG, |_| !slots(&mut c).iter().any(|s| s.device.starts_with("net-out:")));
+    c.call(Command::Shutdown).unwrap();
 }

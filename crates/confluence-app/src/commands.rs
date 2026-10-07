@@ -42,6 +42,11 @@ pub enum Edit {
     SetScript { name: String, source: String, enabled: bool },
     DeleteScript { name: String },
     SetSlotColor { id: u32, color: Option<confluence_api::Rgb> },
+    FillPosition { pos: confluence_api::PosId, kind: DeviceKind, name: String },
+    ClearPosition { pos: confluence_api::PosId },
+    SetVirtual { pos: confluence_api::PosId, on: bool, shape: Option<(u32, u32)> },
+    SetMaster { pos: Option<confluence_api::PosId> },
+    ClearClip,
 }
 
 /// What a merged, rate-limited edit is about.
@@ -89,6 +94,13 @@ impl Edit {
             Edit::AddBus { name, channels } => {
                 Command::AddBus { name: name.clone(), channels: *channels, first_input: None, first_output: None }
             }
+            Edit::FillPosition { pos, kind, name } => {
+                Command::FillPosition { pos: *pos, kind: *kind, name: name.clone() }
+            }
+            Edit::ClearPosition { pos } => Command::ClearPosition { pos: *pos },
+            Edit::SetVirtual { pos, on, shape } => Command::SetVirtual { pos: *pos, on: *on, shape: *shape },
+            Edit::SetMaster { pos } => Command::SetMaster { pos: *pos },
+            Edit::ClearClip => Command::ClearClip,
         }
     }
 
@@ -103,7 +115,7 @@ impl Edit {
     /// Opening a device or loading a plugin can take seconds: it gets its own
     /// connection and thread.
     fn is_slow(&self) -> bool {
-        matches!(self, Edit::AddDevice { .. } | Edit::LoadPlugin { .. })
+        matches!(self, Edit::AddDevice { .. } | Edit::FillPosition { .. } | Edit::LoadPlugin { .. })
     }
 
     /// Gains and parameter values: merged while queued and rate limited.

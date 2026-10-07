@@ -150,6 +150,13 @@ pub fn flag(args: &[String], name: &str) -> Option<String> {
     None
 }
 
+/// The two screens the central panel switches between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Screen {
+    Matrix,
+    Devices,
+}
+
 pub struct ConfluenceApp {
     store: StateStore,
     worker: Worker,
@@ -171,9 +178,11 @@ pub struct ConfluenceApp {
     skin_dir: Option<PathBuf>,
     /// A slot waiting for "Remove ‹name›?" to be confirmed.
     confirm_remove: Option<u32>,
-    /// A clicked route waiting out the double-click window before it is removed.
-    devices_open: bool,
-    devices: crate::devices::DevicesState,
+    /// Which screen the central panel shows.
+    screen: Screen,
+    screen_state: crate::devices_screen::ScreenState,
+    /// A position waiting for "Clear ‹position›?" to be confirmed.
+    confirm_clear: Option<confluence_api::PosId>,
     /// The plugin picker, while open.
     picker: Option<crate::plugins::Picker>,
     /// Parameter values sent and not yet confirmed: (bus, param) → value.
@@ -213,7 +222,8 @@ impl ConfluenceApp {
             })
         };
         let graphs_live = Arc::new(AtomicBool::new(false));
-        let store = StateStore::spawn(config.pipe.clone(), {
+        // Always with meters: the Devices screen shows them.
+        let store = StateStore::spawn_with_meters(config.pipe.clone(), {
             let (repaint, graphs_live) = (repaint.clone(), graphs_live.clone());
             Box::new(move |what| {
                 if let Ok(ctx) = repaint.lock() {
@@ -245,8 +255,9 @@ impl ConfluenceApp {
             look: Look::builtin(),
             skin_dir: config.skin,
             confirm_remove: None,
-            devices_open: false,
-            devices: crate::devices::DevicesState::default(),
+            screen: Screen::Matrix,
+            screen_state: crate::devices_screen::ScreenState::default(),
+            confirm_clear: None,
             picker: None,
             param_pending: HashMap::new(),
             plugin_loading: None,
@@ -317,8 +328,8 @@ impl ConfluenceApp {
     fn on_done(&mut self, edit: &Edit, ids: &[u32], now: Instant) {
         self.param_answered(edit);
         if let Edit::AddBus { name, .. } = edit {
-            self.devices.adding_bus = false;
-            self.devices.bus_name.clear();
+            self.screen_state.adding_bus = false;
+            self.screen_state.bus_name.clear();
             self.notes.info(format!("Added insert bus {name}"), now);
             if let Some(id) = ids.first() {
                 self.selection = Selection::Slot(*id);
@@ -326,21 +337,35 @@ impl ConfluenceApp {
         }
         if let Edit::AddDevice { kind, name } = edit {
             let base = crate::devices::base_name(*kind, name);
-            self.devices.adding.remove(&(*kind, base.clone()));
             self.notes.info(format!("Added {} {}", crate::devices::kind_title(*kind), base), now);
             if let Some(id) = ids.first() {
                 self.selection = Selection::Slot(*id);
             }
+        }
+        if let Edit::FillPosition { pos, name, .. } = edit {
+            self.screen_state.filling.remove(pos);
+            self.notes.info(format!("{} now holds {name}", pos.label()), now);
+        }
+        if let Edit::SetVirtual { pos, on, .. } = edit {
+            let what = if *on { "Turned on" } else { "Turned off" };
+            self.notes.info(format!("{what} {}", pos.label()), now);
+        }
+        if let Edit::ClearPosition { pos } = edit {
+            self.notes.info(format!("Cleared {}", pos.label()), now);
+        }
+        if let Edit::SetMaster { pos } = edit {
+            let what = pos.map_or("the internal clock".to_string(), |p| p.label());
+            self.notes.info(format!("The master clock will be {what} from the next start"), now);
         }
     }
 
     fn on_failed(&mut self, edit: &Edit, _now: Instant) {
         self.param_answered(edit);
         if let Edit::AddBus { .. } = edit {
-            self.devices.adding_bus = false;
+            self.screen_state.adding_bus = false;
         }
-        if let Edit::AddDevice { kind, name } = edit {
-            self.devices.adding.remove(&(*kind, crate::devices::base_name(*kind, name)));
+        if let Edit::FillPosition { pos, .. } = edit {
+            self.screen_state.filling.remove(pos);
         }
     }
 
@@ -394,8 +419,17 @@ impl ConfluenceApp {
         self.top_bar(ui, &view, now);
         self.scene_bar(ui, &view);
         self.side_panels(ui, &view, now);
-        self.matrix(ui, &view);
-        self.keyboard(ui, &view);
+        match self.screen {
+            Screen::Matrix => {
+                self.matrix(ui, &view);
+                self.keyboard(ui, &view);
+            }
+            Screen::Devices => {
+                self.devices_screen(ui, &view);
+                // Meters move: up to 30 frames a second while they are on screen.
+                ctx.request_repaint_after(Duration::from_millis(33));
+            }
+        }
         self.notifications(&ctx, &view);
         self.dialogs(&ctx, &view);
 
@@ -452,6 +486,9 @@ impl ConfluenceApp {
                     let xr = RichText::new(format!("Xruns {}", s.xruns));
                     ui.label(if flashing { xr.color(error).strong() } else { xr });
                 }
+                ui.separator();
+                ui.selectable_value(&mut self.screen, Screen::Matrix, "Matrix");
+                ui.selectable_value(&mut self.screen, Screen::Devices, "Devices");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     self.top_bar_buttons(ui);
                 });
@@ -495,7 +532,6 @@ impl ConfluenceApp {
 
     fn top_bar_buttons(&mut self, ui: &mut egui::Ui) {
         ui.toggle_value(&mut self.inspector_open, "Inspector");
-        ui.toggle_value(&mut self.devices_open, "Devices…");
         ui.toggle_value(&mut self.scripts_open, "Scripts…");
         ui.toggle_value(&mut self.settings_open, "Settings…");
     }
@@ -510,26 +546,29 @@ impl ConfluenceApp {
         self.finish = finish;
     }
 
-    fn side_panels(&mut self, ui: &mut egui::Ui, view: &StoreView, _now: Instant) {
-        if self.devices_open {
-            let editable = self.live();
-            let (list, slots) = match &view.state {
-                Some(s) => (s.devices.clone(), s.slots.clone()),
-                None => (Vec::new(), Vec::new()),
-            };
-            let devices = &mut self.devices;
-            let look = &self.look;
-            let edits = egui::Panel::left("devices")
-                .resizable(true)
-                .show(ui, |ui| {
-                    look.paint_surface(ui.painter(), ui.max_rect(), "panel", look.skin.colors.panel);
-                    crate::devices::show(ui, &list, &slots, devices, editable)
-                })
-                .inner;
-            for e in edits {
-                self.send(e);
+    /// The Devices screen in the central panel.
+    fn devices_screen(&mut self, ui: &mut egui::Ui, view: &StoreView) {
+        let editable = self.live();
+        let skin = crate::gear::skins::GearSkin::preset(self.finish);
+        let palette = self.look.skin.slot_colors.clone();
+        let list = view.state.as_ref().map(|s| s.devices.clone()).unwrap_or_default();
+        let screen_state = &mut self.screen_state;
+        let actions = egui::CentralPanel::default()
+            .show(ui, |ui| {
+                ui.painter().rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, skin.p3);
+                crate::devices_screen::show(ui, view, &list, &skin, &palette, screen_state, editable)
+            })
+            .inner;
+        for a in actions {
+            match a {
+                crate::devices_screen::ScreenAction::Edit(e) => self.send(e),
+                crate::devices_screen::ScreenAction::Select(id) => self.selection = Selection::Slot(id),
+                crate::devices_screen::ScreenAction::AskClear(pos) => self.confirm_clear = Some(pos),
             }
         }
+    }
+
+    fn side_panels(&mut self, ui: &mut egui::Ui, view: &StoreView, _now: Instant) {
         if !self.inspector_open {
             return;
         }
@@ -580,6 +619,28 @@ impl ConfluenceApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
+        if let Some(pos) = self.confirm_clear {
+            let mut answer = None;
+            egui::Window::new("Clear position").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label(format!("Clear {}? Its routes are removed.", pos.label()));
+                ui.horizontal(|ui| {
+                    if ui.button("Clear").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+            match answer {
+                Some(true) => {
+                    self.confirm_clear = None;
+                    self.send(Edit::ClearPosition { pos });
+                }
+                Some(false) => self.confirm_clear = None,
+                None => {}
+            }
+        }
         if self.settings_open {
             crate::settings::show(ctx, &mut self.settings_open, &mut self.finish);
         }
@@ -647,7 +708,7 @@ impl ConfluenceApp {
                 return;
             };
             if state.slots.is_empty() {
-                ui.label("No slots yet: add a device with Devices…");
+                ui.label("No slots yet: add a device on the Devices screen");
                 return;
             }
             let layout = GridLayout::new(&state.slots, self.cell);

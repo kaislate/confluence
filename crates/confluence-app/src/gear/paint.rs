@@ -175,6 +175,12 @@ pub fn oled(p: &Painter, r: Rect, s: &GearSkin, line1: &str, line2: &str, color:
 
 /// A glass pill button.
 pub fn pill(ui: &mut Ui, label: &str, s: &GearSkin) -> Response {
+    pill_labeled(ui, label, label, s)
+}
+
+/// A glass pill showing `label`, announced to screen readers (and tests) as
+/// `accessible` (e.g. "Turn on" on the VASIO B card: "Turn on VASIO B").
+pub fn pill_labeled(ui: &mut Ui, label: &str, accessible: &str, s: &GearSkin) -> Response {
     let f = font(ui.ctx(), "label", 13.0);
     let galley = ui.painter().layout_no_wrap(label.to_string(), f.clone(), s.ink);
     let size = Vec2::new(galley.size().x + 28.0, 26.0);
@@ -204,6 +210,8 @@ pub fn pill(ui: &mut Ui, label: &str, s: &GearSkin) -> Response {
     );
     let ink = if resp.hovered() { s.ink } else { alpha(s.ink, 0.85) };
     p.text(r.center(), Align2::CENTER_CENTER, label, f, ink);
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, accessible));
     resp
 }
 

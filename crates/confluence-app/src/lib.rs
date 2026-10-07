@@ -5,6 +5,7 @@
 pub mod app;
 pub mod commands;
 pub mod devices;
+pub mod devices_screen;
 pub mod engine_launch;
 pub mod gear;
 pub mod graph;

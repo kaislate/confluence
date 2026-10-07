@@ -688,12 +688,7 @@ impl DeviceManager {
                 out.push(DeviceInfo { kind, name: ep.name, inputs, outputs });
             }
         }
-        for n in 1..=confluence_provider_vasio::INSTANCES {
-            out.push(DeviceInfo { kind: DeviceKind::Vasio, name: n.to_string(), inputs: 0, outputs: 0 });
-        }
-        if confluence_provider_vaio::installed() {
-            out.push(DeviceInfo { kind: DeviceKind::Vaio, name: "1".into(), inputs: 2, outputs: 0 });
-        }
+        // VASIO and VAIO are positions switched on and off, not devices to pick.
         Ok(out)
     }
 
