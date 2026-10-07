@@ -216,6 +216,19 @@ impl MatrixController {
         Ok(())
     }
 
+    /// Removes a point at once, without the fade (its slot is being moved and is
+    /// silent anyway): gone from the next published snapshot.
+    pub fn remove_point_now(&mut self, input: u32, output: u32) -> Result<(), OutOfRange> {
+        self.check(input, output)?;
+        let key = (output, input);
+        self.fading_out.retain(|(k, _)| *k != key);
+        if self.points.remove(&key).is_some() {
+            self.params.set(self.params.cell(input, output), 0.0);
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
     /// Current parameters of a point, if it exists and is not being removed.
     pub fn point(&self, input: u32, output: u32) -> Option<PointParams> {
         let key = (output, input);
@@ -339,6 +352,22 @@ mod tests {
         assert_eq!(o.channel(3), &[7.0; 8], "out of range: untouched even though routed");
         router.mix(&i, &mut o, 2..99); // clamped to the buffer
         assert_eq!(o.channel(3), &[1.0; 8]);
+    }
+
+    #[test]
+    fn remove_point_now_takes_effect_on_the_next_block() {
+        let (mut ctl, mut router) = matrix(1, 1, RAMP, 48_000.0);
+        ctl.set_point(0, 0, PointParams { gain_db: 0.0, mute: false, invert: false }).unwrap();
+        ctl.tick();
+        let (mut i, mut o) = buffers(1, 1, 64);
+        i.channel_mut(0).fill(1.0);
+        run_blocks(&mut router, &i, &mut o, 20);
+        assert!(o.channel(0).iter().all(|&s| (s - 1.0).abs() < 1e-4), "routed");
+        ctl.remove_point_now(0, 0).unwrap();
+        assert!(ctl.points().is_empty() && ctl.point(0, 0).is_none(), "gone at once");
+        ctl.tick();
+        run_blocks(&mut router, &i, &mut o, 1);
+        assert!(o.channel(0).iter().all(|&s| s == 0.0), "silent on the next block, no fade");
     }
 
     #[test]

@@ -52,6 +52,24 @@ impl Scenes {
         self.morph.as_ref()?.params.iter().find(|g| (g.bus, g.param) == (bus, param)).map(|g| g.to)
     }
 
+    /// A slot moved to other channels: its scene points, glides and bus
+    /// parameters follow it.
+    pub(super) fn remap(&mut self, mv: &super::ChannelMove) {
+        for s in &mut self.list {
+            for p in &mut s.points {
+                (p.input, p.output) = (mv.input(p.input), mv.output(p.output));
+            }
+            for q in &mut s.params {
+                q.bus_at = mv.output(q.bus_at);
+            }
+        }
+        if let Some(m) = &mut self.morph {
+            for r in &mut m.routes {
+                (r.input, r.output) = (mv.input(r.input), mv.output(r.output));
+            }
+        }
+    }
+
     /// The user changed a route: its glide stops, and the mix no longer
     /// matches the current scene.
     pub(super) fn route_changed(&mut self, input: u32, output: u32) {

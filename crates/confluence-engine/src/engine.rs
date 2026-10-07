@@ -223,6 +223,32 @@ pub struct OfflineSlotSpec {
     pub outputs: u32,
 }
 
+/// A slot moving to other channels: (old first, new first, count) per direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelMove {
+    pub inputs: Option<(u32, u32, u32)>,
+    pub outputs: Option<(u32, u32, u32)>,
+}
+
+impl ChannelMove {
+    fn map(range: Option<(u32, u32, u32)>, c: u32) -> u32 {
+        match range {
+            Some((old, new, len)) if c >= old && c < old + len => new + (c - old),
+            _ => c,
+        }
+    }
+
+    /// Where input channel `c` goes (unchanged if it does not move).
+    pub fn input(&self, c: u32) -> u32 {
+        Self::map(self.inputs, c)
+    }
+
+    /// Where output channel `c` goes (unchanged if it does not move).
+    pub fn output(&self, c: u32) -> u32 {
+        Self::map(self.outputs, c)
+    }
+}
+
 /// Counters a strict slot's device exposes to the control side.
 pub trait StrictStats: Send + Sync {
     /// (blocks the device delivered late, blocks it did not take).
@@ -932,6 +958,40 @@ impl Engine {
             self.plan_dirty = true;
         }
         Ok(())
+    }
+
+    /// Moves every route, scene point and MIDI binding on a slot's old channels
+    /// to its new ones (a swap or reshape that needed a new place).
+    pub fn remap_channels(&mut self, mv: &ChannelMove) {
+        let moved: Vec<(u32, u32, PointParams)> =
+            self.matrix.points().into_iter().filter(|&(i, o, _)| mv.input(i) != i || mv.output(o) != o).collect();
+        for &(i, o, _) in &moved {
+            let _ = self.matrix.remove_point_now(i, o);
+        }
+        for &(i, o, p) in &moved {
+            let _ = self.matrix.set_point(mv.input(i), mv.output(o), p);
+        }
+        self.scenes.remap(mv);
+        self.midi.remap(mv);
+        self.plan_dirty |= self.buses > 0;
+    }
+
+    /// Routes with an input or output in the given (first, count) ranges.
+    pub fn points_in(&self, inputs: Option<(u32, u32)>, outputs: Option<(u32, u32)>) -> Vec<PointState> {
+        let within = |r: Option<(u32, u32)>, c: u32| r.is_some_and(|(f, n)| c >= f && c < f + n);
+        self.settled_points().into_iter().filter(|p| within(inputs, p.input) || within(outputs, p.output)).collect()
+    }
+
+    /// Removes the routes on channels `first + keep .. first + len` of each
+    /// (first, len, keep) range: what a slot loses when it shrinks.
+    pub fn drop_points_outside(&mut self, inputs: Option<(u32, u32, u32)>, outputs: Option<(u32, u32, u32)>) {
+        let lost = |r: Option<(u32, u32, u32)>, c: u32| r.is_some_and(|(f, n, keep)| c >= f + keep && c < f + n);
+        for p in self.settled_points() {
+            if lost(inputs, p.input) || lost(outputs, p.output) {
+                let _ = self.matrix.remove_point(p.input, p.output);
+                self.scenes.route_changed(p.input, p.output);
+            }
+        }
     }
 
     /// Compiles the plan for the current buses and routes.
@@ -2851,5 +2911,46 @@ mod tests {
         assert_eq!(colour_of(&e, bus.id), Some([5, 5, 5]));
         let key = format!("bus:{}", bus.first_output);
         assert_eq!(e.color_commands(), vec![Command::SetColor { key, color: Some([5, 5, 5]) }]);
+    }
+    #[test]
+    fn remapping_moves_routes_scenes_and_midi_with_a_slot() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let set = |e: &mut Engine, i, o, g| {
+            assert_eq!(
+                e.handle(&Command::SetPoint { input: i, output: o, gain_db: g, mute: false, invert: true }),
+                Response::Ok
+            )
+        };
+        set(&mut e, 4, 10, -6.0); // in the moved input range (4..6)
+        set(&mut e, 0, 20, -3.0); // output in the moved output range (20..22)
+        set(&mut e, 1, 1, 0.0); // untouched
+        assert_eq!(e.handle(&Command::SaveScene { name: "Verse".into(), morph_ms: 0 }), Response::Ok);
+        let bind = confluence_api::MidiBinding { device: "Pad".into(), channel: 1, cc: 7, input: 5, output: 21 };
+        assert_eq!(e.handle(&Command::SetMidiBinding { binding: bind }), Response::Ok);
+
+        e.remap_channels(&ChannelMove { inputs: Some((4, 40, 2)), outputs: Some((20, 60, 2)) });
+
+        let mut pts: Vec<_> = e.settled_points().iter().map(|p| (p.input, p.output, p.gain_db, p.invert)).collect();
+        pts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(pts, vec![(0, 60, -3.0, true), (1, 1, 0.0, true), (40, 10, -6.0, true)]);
+        let scene = e.scene("Verse").unwrap();
+        let mut sp: Vec<_> = scene.points.iter().map(|p| (p.input, p.output)).collect();
+        sp.sort();
+        assert_eq!(sp, vec![(0, 60), (1, 1), (40, 10)], "scene points move too");
+        let Command::SetMidiBinding { binding } = e.midi_commands().into_iter().next().unwrap() else { panic!() };
+        assert_eq!((binding.input, binding.output), (41, 61), "MIDI bindings move too");
+    }
+
+    #[test]
+    fn a_shrunk_slot_loses_only_the_routes_on_its_lost_channels() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        for o in [8u32, 9, 10, 11] {
+            e.handle(&Command::SetPoint { input: 0, output: o, gain_db: 0.0, mute: false, invert: false });
+        }
+        assert_eq!(e.points_in(None, Some((8, 4))).len(), 4);
+        e.drop_points_outside(None, Some((8, 4, 2)));
+        let mut outs: Vec<u32> = e.settled_points().iter().map(|p| p.output).collect();
+        outs.sort();
+        assert_eq!(outs, vec![8, 9]);
     }
 }
