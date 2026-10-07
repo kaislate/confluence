@@ -176,6 +176,7 @@ mod tests {
             inputs: 2,
             first_output: id * 2,
             outputs: 2,
+            color: None,
         }
     }
 

@@ -262,6 +262,11 @@ mod app {
             Command::LoadPlugin { bus, path, plugin_id } => {
                 Command::LoadPlugin { bus: at(bus), path: path.clone(), plugin_id: plugin_id.clone() }
             }
+            // Slot ids change between runs: a colour is kept under its device.
+            Command::SetSlotColor { id, color } => match engine.color_key(*id) {
+                Some(key) => Command::SetColor { key, color: *color },
+                None => cmd.clone(),
+            },
             // The journal keeps what was captured, not the request to capture.
             Command::SaveScene { name, morph_ms } => match engine.scene(name.trim()) {
                 Some(scene) => Command::PutScene { scene: scene.clone() },
@@ -596,6 +601,7 @@ mod app {
         out.extend(engine.scene_commands());
         out.extend(engine.midi_commands());
         out.extend(engine.script_commands());
+        out.extend(engine.color_commands());
         // Mid-morph, the routes are saved where the morph is taking them.
         out.extend(engine.settled_points().into_iter().map(|p| Command::SetPoint {
             input: p.input,

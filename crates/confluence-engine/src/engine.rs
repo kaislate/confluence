@@ -21,6 +21,7 @@ use confluence_core::processor::Processor;
 
 use crate::alloc::ChannelAllocator;
 
+mod colours;
 mod midi_map;
 mod scenes;
 mod scripts;
@@ -291,6 +292,8 @@ pub struct Engine {
     midi: midi_map::Midi,
     /// Luau scripts.
     scripts: confluence_script::ScriptHost,
+    /// Colours chosen for devices and buses.
+    colours: colours::Colours,
     /// Editor changes not saved yet, by (send column, param).
     edits_held: std::collections::BTreeMap<(u32, u32), f64>,
     /// When each (send column, param) was last saved.
@@ -353,6 +356,7 @@ impl Engine {
             scenes: scenes::Scenes::default(),
             midi: midi_map::Midi::default(),
             scripts: confluence_script::ScriptHost::new(),
+            colours: colours::Colours::default(),
             edits_saved: std::collections::HashMap::new(),
             blocks,
             master_ppm,
@@ -1059,7 +1063,17 @@ impl Engine {
 
     /// Current slot list (same data as `Command::ListSlots`).
     pub fn slots(&self) -> Vec<SlotState> {
-        self.slots.iter().map(|s| s.state.clone()).collect()
+        self.slots.iter().map(|s| SlotState { color: self.colours.of(&s.state), ..s.state.clone() }).collect()
+    }
+
+    /// The key slot `id`'s colour is kept under (see [`Command::SetColor`]).
+    pub fn color_key(&self, id: u32) -> Option<String> {
+        self.slots.iter().find(|s| s.state.id == id).map(|s| colours::key(&s.state))
+    }
+
+    /// The commands that recreate every colour chosen (for the journal).
+    pub fn color_commands(&self) -> Vec<Command> {
+        self.colours.commands()
     }
 
     /// Executes one Control API command. Device commands (`ListDevices`,
@@ -1118,6 +1132,13 @@ impl Engine {
             }
             Command::Shutdown => Response::Ok,
             Command::SetScript { .. } | Command::DeleteScript { .. } => self.script_command(cmd),
+            Command::SetSlotColor { id, color } => match self.color_key(id) {
+                Some(key) => self.colours.set(&key, color).map_or_else(Response::Error, |()| Response::Ok),
+                None => Response::Error(format!("there is no slot {id}")),
+            },
+            Command::SetColor { ref key, color } => {
+                self.colours.set(key, color).map_or_else(Response::Error, |()| Response::Ok)
+            }
             Command::LearnMidi { .. }
             | Command::CancelMidiLearn
             | Command::SetMidiBinding { .. }
@@ -1242,6 +1263,7 @@ impl Engine {
             inputs,
             first_output,
             outputs,
+            color: None,
         }
     }
 
@@ -2762,5 +2784,66 @@ mod tests {
         assert_eq!(e.remove_slot(m), Err(EngineError::MasterInUse));
         let slot = e.slots().into_iter().find(|s| s.id == m).unwrap();
         assert_eq!(slot.role, ClockRole::Master);
+    }
+
+    /// An offline slot of `device` (channels from `first_input`/`first_output`).
+    fn offline(e: &mut Engine, name: &str, device: &str, ins: (u32, u32), outs: (u32, u32)) -> u32 {
+        let spec = OfflineSlotSpec {
+            name: name.into(),
+            device: device.into(),
+            role: ClockRole::Soft,
+            first_input: ins.0,
+            inputs: ins.1,
+            first_output: outs.0,
+            outputs: outs.1,
+        };
+        e.add_offline_slot(&spec).unwrap()
+    }
+
+    fn colour_of(e: &Engine, id: u32) -> Option<confluence_api::Rgb> {
+        e.slots().into_iter().find(|s| s.id == id).unwrap().color
+    }
+
+    #[test]
+    fn a_colour_is_kept_per_device_and_shown_on_all_its_slots() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let a_in = offline(&mut e, "VASIO 1 in", "vasio:1", (0, 2), (0, 0));
+        let a_out = offline(&mut e, "VASIO 1 out", "vasio:1", (0, 0), (0, 2));
+        let b = offline(&mut e, "Game", "wasapi-out:Game", (0, 0), (2, 2));
+        assert_eq!(e.handle(&Command::SetSlotColor { id: a_out, color: Some([1, 2, 3]) }), Response::Ok);
+        assert_eq!((colour_of(&e, a_in), colour_of(&e, a_out)), (Some([1, 2, 3]), Some([1, 2, 3])));
+        assert_eq!(colour_of(&e, b), None, "another device keeps the default");
+        assert_eq!(e.color_key(a_in).as_deref(), Some("vasio:1"));
+        assert_eq!(e.color_commands(), vec![Command::SetColor { key: "vasio:1".into(), color: Some([1, 2, 3]) }]);
+        // Back to the default.
+        assert_eq!(e.handle(&Command::SetSlotColor { id: a_in, color: None }), Response::Ok);
+        assert_eq!((colour_of(&e, a_in), colour_of(&e, a_out)), (None, None));
+        assert!(e.color_commands().is_empty());
+        assert!(matches!(e.handle(&Command::SetSlotColor { id: 99, color: None }), Response::Error(_)));
+    }
+
+    #[test]
+    fn a_saved_colour_comes_back_with_its_device() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        // Replayed from the journal before the device is restored.
+        let saved = Command::SetColor { key: "vasio:1".into(), color: Some([9, 8, 7]) };
+        assert_eq!(e.handle(&saved), Response::Ok);
+        let a = offline(&mut e, "VASIO 1 in", "vasio:1", (0, 2), (0, 0));
+        assert_eq!(colour_of(&e, a), Some([9, 8, 7]));
+        // A removed device keeps its colour for when it is added again.
+        assert_eq!(e.handle(&Command::RemoveSlot { id: a }), Response::Ok);
+        assert_eq!(e.color_commands(), vec![saved]);
+    }
+
+    #[test]
+    fn an_insert_bus_is_coloured_by_its_first_send_column() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let cmd = Command::AddBus { name: "Verb".into(), channels: 2, first_input: None, first_output: None };
+        let Response::SlotsAdded(ids) = e.handle(&cmd) else { panic!() };
+        let bus = e.slots().into_iter().find(|s| s.id == ids[0]).unwrap();
+        assert_eq!(e.handle(&Command::SetSlotColor { id: bus.id, color: Some([5, 5, 5]) }), Response::Ok);
+        assert_eq!(colour_of(&e, bus.id), Some([5, 5, 5]));
+        let key = format!("bus:{}", bus.first_output);
+        assert_eq!(e.color_commands(), vec![Command::SetColor { key, color: Some([5, 5, 5]) }]);
     }
 }
