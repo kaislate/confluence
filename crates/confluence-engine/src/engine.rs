@@ -962,6 +962,24 @@ impl Engine {
         Ok(())
     }
 
+    /// The first free block of `count` input (or output) channels.
+    pub fn free_block(&self, inputs: bool, count: u32) -> Option<u32> {
+        if inputs {
+            self.inputs.first_fit(count)
+        } else {
+            self.outputs.first_fit(count)
+        }
+    }
+
+    /// Whether input (or output) channels `first .. first + count` are free.
+    pub fn channels_free(&self, inputs: bool, first: u32, count: u32) -> bool {
+        if inputs {
+            self.inputs.is_free(first, count)
+        } else {
+            self.outputs.is_free(first, count)
+        }
+    }
+
     /// Moves every route, scene point and MIDI binding on a slot's old channels
     /// to its new ones (a swap or reshape that needed a new place).
     pub fn remap_channels(&mut self, mv: &ChannelMove) {

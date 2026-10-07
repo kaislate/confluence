@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::audio::AudioEngine;
 use crate::audio::StrictSide;
 use crate::engine::{
-    Engine, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec, StrictSlotSpec, StrictStats,
+    ChannelMove, Engine, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec, StrictSlotSpec, StrictStats,
 };
 use crate::positions::{is_own_vasio_driver, next_free, vasio_device_name, PositionTable, VirtualState};
 use confluence_core::buffer::PlanarBuffer;
@@ -134,6 +134,23 @@ enum Loaded {
     /// A network stream (the slot opens it), and its peer's address if the
     /// name had to be looked up (discovery is asked again when it is attached).
     Net(NetName, Option<std::net::SocketAddr>),
+}
+
+/// One direction of a placement: its first channel, and the move its routes make.
+type DirectionPlace = (Option<u32>, Option<(u32, u32, u32)>);
+
+/// A loaded device's (inputs, outputs), where known before it is attached.
+fn loaded_shape(name: &str, loaded: &Loaded) -> Option<(u32, u32)> {
+    match loaded {
+        Loaded::Asio(dev) => Some((dev.info().inputs() as u32, dev.info().outputs() as u32)),
+        Loaded::Wasapi(stream, _) => {
+            let f = stream.format();
+            let ch = f.channels as u32;
+            Some(if f.direction == Direction::Render { (0, ch) } else { (ch, 0) })
+        }
+        Loaded::Vasio => parse_vasio(name).ok().map(|(_, daw_in, daw_out)| (daw_out as u32, daw_in as u32)),
+        Loaded::Vaio | Loaded::Net(..) => None,
+    }
 }
 
 /// VASIO instance `n` (1..=8) as its position (A..=H).
@@ -721,13 +738,17 @@ impl DeviceManager {
                 if p.group != group {
                     return Err(format!("{} cannot hold a {} device", p.label(), kind.prefix()));
                 }
-                if Some(p) != own && taken.contains(&p) {
-                    let what = self
-                        .bound
-                        .iter()
-                        .find(|b| b.pos == Some(p))
-                        .map_or("a device".to_string(), |b| b.binding.name.clone());
-                    return Err(format!("{} already holds {what}", p.label()));
+                if Some(p) != own {
+                    // A filled position is swapped (see `swap`); anything else in use is refused.
+                    if let Some(q) = own {
+                        return Err(format!("{}:{name} is in {}: clear it first", kind.prefix(), q.label()));
+                    }
+                    if self.reserved.iter().any(|(_, _, r)| *r == p) {
+                        return Err(format!("{} is being filled", p.label()));
+                    }
+                    if taken.contains(&p) && !self.bound.iter().any(|b| b.pos == Some(p)) {
+                        return Err(format!("{} holds the master clock device", p.label()));
+                    }
                 }
                 p
             }
@@ -796,6 +817,14 @@ impl DeviceManager {
         let existing = self.bound.iter().position(|b| same_device(&b.binding, kind, name));
         // A device that failed to load: an offline slot keeps holding its channels.
         let loaded = loaded?;
+        // Into a filled position: the device there is swapped out.
+        let held =
+            pos.and_then(|p| self.bound.iter().position(|b| b.pos == Some(p) && !same_device(&b.binding, kind, name)));
+        if let Some(i) = held {
+            let bound = self.swap(engine, i, kind, name, loaded)?;
+            self.attaching.extend(bound.slots.iter().copied());
+            return Ok(AttachedAdd { kind, name: name.to_string(), pos, offline: None, bound, start: None });
+        }
         let offline = match existing {
             Some(i) => {
                 // Offline: hand its channels back to the device, routes and all.
@@ -850,6 +879,95 @@ impl DeviceManager {
         self.unplaced.retain(|u| !same_device(u, kind, &name));
         self.save()?;
         Ok(ids)
+    }
+
+    /// Replaces the device in `self.bound[i]` with `loaded` (already loaded),
+    /// started at once. Routes stay on the channels that remain, and follow
+    /// the device if it needs a new place (spec: slot model §4). On failure
+    /// the old device is reopened where it was, or parked offline there.
+    fn swap(
+        &mut self,
+        engine: &mut Engine,
+        i: usize,
+        kind: DeviceKind,
+        name: &str,
+        loaded: Loaded,
+    ) -> Result<Bound, String> {
+        let shape = loaded_shape(name, &loaded);
+        let Bound { binding: old, slots, handles, pos } = self.bound.remove(i);
+        drop(handles); // stop callbacks before the slots are detached
+        for id in &slots {
+            engine.detach_slot(*id).map_err(|e| e.to_string())?;
+        }
+        let placed = match shape {
+            Some((ins, outs)) => self.place_like(engine, &old, ins, outs),
+            None => Ok((Some(old.first_input), Some(old.first_output), ChannelMove::default())),
+        };
+        let attempt = placed.and_then(|(fi, fo, mv)| {
+            let at = Binding { first_input: fi.unwrap_or(0), first_output: fo.unwrap_or(0), ..old.clone() };
+            let (bound, start) = self.attach(engine, kind, name, Some(&at), loaded)?;
+            Ok((start_now(engine, bound, start)?, mv))
+        });
+        match attempt {
+            Ok((mut bound, mv)) => {
+                // Routes on channels the new device does not have go first, then
+                // the rest follow it if it moved.
+                let lost = |first: u32, was: u32, now: u32| (was > now).then_some((first, was, now));
+                engine.drop_points_outside(
+                    lost(old.first_input, old.inputs, bound.binding.inputs),
+                    lost(old.first_output, old.outputs, bound.binding.outputs),
+                );
+                if mv != ChannelMove::default() {
+                    engine.remap_channels(&mv);
+                }
+                bound.pos = pos;
+                Self::key_colours(engine, &bound);
+                Ok(bound)
+            }
+            Err(e) => {
+                let net = self.net.as_ref().map(NetCtx::snapshot);
+                let back = load(&self.asio_open, old.kind, &old.name, old.endpoint_id.as_deref(), net.as_ref())
+                    .and_then(|l| self.attach(engine, old.kind, &old.name, Some(&old), l))
+                    .and_then(|(b, start)| start_now(engine, b, start));
+                let mut b = match back {
+                    Ok(b) => b,
+                    Err(_) => Self::park_offline(engine, old).map_err(|pe| format!("{e}; {pe}"))?,
+                };
+                b.pos = pos;
+                Self::key_colours(engine, &b);
+                self.bound.push(b);
+                Err(e)
+            }
+        }
+    }
+
+    /// Where a device of `inputs` x `outputs` replacing `old` goes, per
+    /// direction: on `old`'s first channel if it fits there (the old device's
+    /// channels are free by now), else the first free block, with the move
+    /// its routes make. `None` for a direction it has no channels in.
+    pub fn place_like(
+        &self,
+        engine: &Engine,
+        old: &Binding,
+        inputs: u32,
+        outputs: u32,
+    ) -> Result<(Option<u32>, Option<u32>, ChannelMove), String> {
+        let one = |is_in: bool, first: u32, was: u32, now: u32| -> Result<DirectionPlace, String> {
+            let what = if is_in { "inputs" } else { "outputs" };
+            if now == 0 {
+                return Ok((None, None));
+            }
+            if was > 0 && engine.channels_free(is_in, first, now) {
+                return Ok((Some(first), None));
+            }
+            let at = engine
+                .free_block(is_in, now)
+                .ok_or_else(|| format!("no room for {now} {what}: remove something first"))?;
+            Ok((Some(at), (was > 0 && at != first).then_some((first, at, was.min(now)))))
+        };
+        let (fi, mi) = one(true, old.first_input, old.inputs, inputs)?;
+        let (fo, mo) = one(false, old.first_output, old.outputs, outputs)?;
+        Ok((fi, fo, ChannelMove { inputs: mi, outputs: mo }))
     }
 
     /// Refuses a device that is the master or already open (an offline one may be re-added).
@@ -997,6 +1115,27 @@ impl DeviceManager {
             if on && same && !b.handles.is_empty() {
                 self.save()?;
                 return Ok(b.slots.clone());
+            }
+            if on && !b.handles.is_empty() {
+                // A reshape: the routes on the channels that remain are kept.
+                let name = vasio_device_name(pos, v.shape);
+                let swapped = load(&self.asio_open, DeviceKind::Vasio, &name, None, None)
+                    .and_then(|l| self.swap(engine, i, DeviceKind::Vasio, &name, l));
+                return match swapped {
+                    Ok(bound) => {
+                        let ids = bound.slots.clone();
+                        self.virtual_at.insert(pos, bound.binding.clone());
+                        self.bound.push(bound);
+                        self.save()?;
+                        Ok(ids)
+                    }
+                    Err(e) => {
+                        if let Some(b) = before {
+                            let _ = self.table.set_virtual(pos, b.on, Some(b.shape));
+                        }
+                        Err(e)
+                    }
+                };
             }
             let b = self.bound.remove(i);
             drop(b.handles);

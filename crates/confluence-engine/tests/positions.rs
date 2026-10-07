@@ -139,3 +139,132 @@ fn a_colour_belongs_to_the_position() {
     let id = d.positions(&e).into_iter().find(|x| x.pos == p("vasio:A")).unwrap().slots[0];
     assert_eq!(e.color_key(id).as_deref(), Some("pos:vasio:A"));
 }
+
+fn fake_sized(spec: &'static [(&'static str, usize, usize)]) -> AsioOpener {
+    Box::new(move |name: &str| {
+        let (_, i, o) = spec.iter().find(|(n, _, _)| *n == name).ok_or(AsioHostError::NotInstalled(name.into()))?;
+        let mut cfg = FakeConfig::new(name);
+        cfg.inputs = *i;
+        cfg.outputs = *o;
+        AsioDevice::open(DriverSource::Fake(cfg))
+    })
+}
+fn route(e: &mut Engine, i: u32, o: u32) {
+    assert_eq!(
+        e.handle(&Command::SetPoint { input: i, output: o, gain_db: -3.0, mute: false, invert: false }),
+        Response::Ok
+    );
+}
+fn slot_of(d: &DeviceManager, e: &Engine, pos: &str, inputs: bool) -> confluence_api::SlotState {
+    let ids = d.positions(e).into_iter().find(|s| s.pos == p(pos)).unwrap().slots;
+    e.slots().into_iter().find(|s| ids.contains(&s.id) && if inputs { s.inputs > 0 } else { s.outputs > 0 }).unwrap()
+}
+
+#[test]
+fn swapping_to_a_same_size_device_keeps_routes_exactly() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None).with_asio_opener(fake_sized(&[("fake:a", 2, 2), ("fake:b", 2, 2)]));
+    d.add(&mut e, DeviceKind::Asio, "fake:a").unwrap();
+    let inp = slot_of(&d, &e, "asio:1", true).first_input;
+    route(&mut e, inp, 0);
+    let r =
+        d.handle(&mut e, &Command::FillPosition { pos: p("asio:1"), kind: DeviceKind::Asio, name: "fake:b".into() });
+    assert!(matches!(r, Some(Response::Ok)), "{r:?}");
+    assert_eq!(slot_of(&d, &e, "asio:1", true).first_input, inp, "not moved");
+    assert_eq!(
+        e.points_in(Some((0, 4096)), Some((0, 4096))).iter().map(|p| (p.input, p.output)).collect::<Vec<_>>(),
+        vec![(inp, 0)]
+    );
+    assert_eq!(d.positions(&e).into_iter().find(|s| s.pos == p("asio:1")).unwrap().device.unwrap().name, "fake:b");
+}
+
+#[test]
+fn a_bigger_device_with_no_room_after_it_moves_and_takes_its_routes() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None).with_asio_opener(fake_sized(&[
+        ("fake:a", 2, 2),
+        ("fake:next", 2, 2),
+        ("fake:big", 8, 2),
+    ]));
+    d.add(&mut e, DeviceKind::Asio, "fake:a").unwrap();
+    d.add(&mut e, DeviceKind::Asio, "fake:next").unwrap(); // takes the inputs right after fake:a
+    let old = slot_of(&d, &e, "asio:1", true).first_input;
+    route(&mut e, old + 1, 0);
+    let r =
+        d.handle(&mut e, &Command::FillPosition { pos: p("asio:1"), kind: DeviceKind::Asio, name: "fake:big".into() });
+    assert!(matches!(r, Some(Response::Ok)), "{r:?}");
+    let new = slot_of(&d, &e, "asio:1", true);
+    assert_eq!(new.inputs, 8);
+    assert_ne!(new.first_input, old, "moved to a free block");
+    let pts: Vec<_> = e.points_in(Some((0, 4096)), Some((0, 4096))).iter().map(|p| (p.input, p.output)).collect();
+    assert_eq!(pts, vec![(new.first_input + 1, 0)], "the route followed its channel");
+}
+
+#[test]
+fn a_smaller_device_drops_only_routes_on_the_lost_channels() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None).with_asio_opener(fake_sized(&[("fake:wide", 4, 2), ("fake:narrow", 2, 2)]));
+    d.add(&mut e, DeviceKind::Asio, "fake:wide").unwrap();
+    let f = slot_of(&d, &e, "asio:1", true).first_input;
+    for k in 0..4 {
+        route(&mut e, f + k, 0);
+    }
+    d.handle(&mut e, &Command::FillPosition { pos: p("asio:1"), kind: DeviceKind::Asio, name: "fake:narrow".into() });
+    let mut ins: Vec<u32> = e.points_in(Some((0, 4096)), Some((0, 4096))).iter().map(|p| p.input).collect();
+    ins.sort();
+    assert_eq!(ins, vec![f, f + 1]);
+}
+
+#[test]
+fn a_failed_swap_leaves_the_old_device_in_place() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None).with_asio_opener(fake_sized(&[("fake:a", 2, 2)]));
+    d.add(&mut e, DeviceKind::Asio, "fake:a").unwrap();
+    let before = slot_of(&d, &e, "asio:1", true);
+    let r = d.handle(
+        &mut e,
+        &Command::FillPosition { pos: p("asio:1"), kind: DeviceKind::Asio, name: "fake:missing".into() },
+    );
+    assert!(matches!(r, Some(Response::Error(_))));
+    assert_eq!(slot_of(&d, &e, "asio:1", true).first_input, before.first_input);
+    assert_eq!(status(&d, &e, "asio:1"), PositionStatus::Filled { online: true });
+}
+
+#[test]
+fn reshaping_a_vasio_keeps_routes_on_the_channels_that_remain() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None);
+    d.handle(&mut e, &Command::SetVirtual { pos: p("vasio:A"), on: true, shape: Some((8, 8)) });
+    let s = slot_of(&d, &e, "vasio:A", false);
+    route(&mut e, 0, s.first_output + 1);
+    route(&mut e, 0, s.first_output + 6);
+    assert!(matches!(
+        d.handle(&mut e, &Command::SetVirtual { pos: p("vasio:A"), on: true, shape: Some((2, 2)) }),
+        Some(Response::Ok)
+    ));
+    let s2 = slot_of(&d, &e, "vasio:A", false);
+    assert_eq!((s2.outputs, s2.first_output), (2, s.first_output));
+    let outs: Vec<u32> = e.points_in(Some((0, 4096)), Some((0, 4096))).iter().map(|p| p.output).collect();
+    assert_eq!(outs, vec![s.first_output + 1], "channel 7 went away with its route");
+}
+
+#[test]
+fn a_device_with_no_room_anywhere_is_refused_and_the_old_one_stays() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None).with_asio_opener(fake_sized(&[("fake:a", 2, 2), ("fake:huge", 100_000, 2)]));
+    d.add(&mut e, DeviceKind::Asio, "fake:a").unwrap();
+    let inp = slot_of(&d, &e, "asio:1", true).first_input;
+    route(&mut e, inp, 0);
+    let r =
+        d.handle(&mut e, &Command::FillPosition { pos: p("asio:1"), kind: DeviceKind::Asio, name: "fake:huge".into() });
+    assert_eq!(r, Some(Response::Error("no room for 100000 inputs: remove something first".into())));
+    assert_eq!(d.positions(&e).into_iter().find(|s| s.pos == p("asio:1")).unwrap().device.unwrap().name, "fake:a");
+    assert_eq!(status(&d, &e, "asio:1"), PositionStatus::Filled { online: true });
+    assert_eq!(e.points_in(Some((0, 4096)), None).len(), 1, "its route is kept");
+}
