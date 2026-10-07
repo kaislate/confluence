@@ -437,6 +437,7 @@ fn render_status(s: &EngineStatus) -> String {
 
 fn render_change(c: &Change) -> String {
     match c {
+        Change::PositionsChanged(p) => format!("positions changed ({} positions)", p.len()),
         Change::PointSet(p) => format!(
             "route {} -> {} {:+.1} dB{}{}",
             p.input,
@@ -478,6 +479,7 @@ fn render_change(c: &Change) -> String {
 /// One line per change; telemetry is shown separately (once a second).
 fn render_event(e: &Event) -> Option<String> {
     match e {
+        Event::Meters(_) => None,
         Event::Changed { version, changes } => {
             Some(changes.iter().map(|c| format!("v{version}  {}", render_change(c))).collect::<Vec<_>>().join("\n"))
         }
@@ -635,6 +637,7 @@ v7  slot #3 removed"
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         };
         let text = render_midi(&st);
         assert!(text.contains("nanoKONTROL2"), "{text}");

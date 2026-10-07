@@ -49,6 +49,9 @@ pub fn diff(old: &State, new: &State) -> Vec<Change> {
     if old.peers != new.peers {
         out.push(Change::PeersChanged(new.peers.clone()));
     }
+    if old.positions != new.positions {
+        out.push(Change::PositionsChanged(new.positions.clone()));
+    }
     if old.scripts != new.scripts {
         out.push(Change::ScriptsChanged(new.scripts.clone()));
     }
@@ -126,6 +129,7 @@ impl State {
                 }
                 Change::ScriptsChanged(scripts) => self.scripts = scripts.clone(),
                 Change::PeersChanged(peers) => self.peers = peers.clone(),
+                Change::PositionsChanged(p) => self.positions = p.clone(),
                 Change::PluginsChanged(found, bad) => {
                     self.plugins = found.clone();
                     self.bad_plugins = bad.clone();
@@ -151,7 +155,9 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClockRole, DeviceInfo, DeviceKind, EngineStatus, PointState, SlotState, State};
+    use crate::{
+        ClockRole, DeviceInfo, DeviceKind, EngineStatus, PointState, PositionState, PositionStatus, SlotState, State,
+    };
     use proptest::prelude::*;
 
     fn status() -> EngineStatus {
@@ -203,6 +209,7 @@ mod tests {
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         }
     }
 
@@ -381,5 +388,25 @@ mod tests {
             prop_assert_eq!(c.points, b.points);
             prop_assert_eq!(c.notices, b.notices);
         }
+    }
+    #[test]
+    fn position_changes_are_diffed_and_applied() {
+        let mut a = state(vec![], vec![]);
+        let mut b = a.clone();
+        b.positions = vec![PositionState {
+            pos: "vasio:A".parse().unwrap(),
+            status: PositionStatus::On { online: false },
+            device: None,
+            shape: Some((8, 8)),
+            daw: None,
+            master: false,
+            color: None,
+            slots: vec![3],
+        }];
+        let changes = diff(&a, &b);
+        assert_eq!(changes, vec![Change::PositionsChanged(b.positions.clone())]);
+        a.apply(&changes);
+        assert_eq!(a.positions, b.positions);
+        assert!(diff(&b, &b).is_empty());
     }
 }

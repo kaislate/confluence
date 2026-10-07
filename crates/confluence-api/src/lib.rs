@@ -5,12 +5,14 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+pub mod positions;
 mod state;
 pub mod taper;
+pub use positions::*;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 9;
+pub const API_VERSION: u16 = 10;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -161,6 +163,31 @@ pub enum Command {
         key: String,
         color: Option<Rgb>,
     },
+    /// Fills a hardware position with a device of its kind (a filled one is swapped).
+    FillPosition {
+        pos: PosId,
+        kind: DeviceKind,
+        name: String,
+    },
+    /// Empties a position: its device is closed and its routes removed.
+    ClearPosition {
+        pos: PosId,
+    },
+    /// Turns a virtual position (VASIO, VAIO) on or off, or reshapes it.
+    /// `shape` is (engine inputs, engine outputs) = (DAW outputs, DAW inputs).
+    SetVirtual {
+        pos: PosId,
+        on: bool,
+        shape: Option<(u32, u32)>,
+    },
+    /// The ASIO position to use as master from the next start (`None`: internal clock).
+    SetMaster {
+        pos: Option<PosId>,
+    },
+    /// As `Subscribe`, plus meter frames about 20 times a second.
+    SubscribeMeters,
+    /// Clears every latched clip indicator.
+    ClearClip,
 }
 
 /// A colour: red, green, blue.
@@ -613,11 +640,16 @@ pub struct State {
     /// Other Confluence engines found on the network, sorted by name.
     #[serde(default)]
     pub peers: Vec<Peer>,
+    /// Every fixed slot position (spec: slot model).
+    #[serde(default)]
+    pub positions: Vec<PositionState>,
 }
 
 /// One difference between two published states.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Change {
+    /// The position table changed (sent whole: it is small).
+    PositionsChanged(Vec<PositionState>),
     /// Added or modified.
     PointSet(PointState),
     PointRemoved {
@@ -654,8 +686,41 @@ pub enum Change {
     },
 }
 
+/// Peak and RMS of every slot channel, one byte each (see [`meter_byte`]).
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct MeterFrame {
+    /// `[peak, rms]` per input channel, from `first_input`.
+    pub inputs: Vec<[u8; 2]>,
+    /// `[peak, rms]` per output channel, from `first_output`.
+    pub outputs: Vec<[u8; 2]>,
+    pub first_input: u32,
+    pub first_output: u32,
+    /// Channels whose clip indicator is latched.
+    pub clipped_in: Vec<u32>,
+    pub clipped_out: Vec<u32>,
+}
+
+/// A meter value as one byte: -96..0 dBFS in 0.375 dB steps; 0 is silence (or below -96).
+pub fn meter_byte(db: f32) -> u8 {
+    if db.is_nan() || db <= -96.0 {
+        return 0;
+    }
+    ((db.min(0.0) + 96.0) / 0.375).round().clamp(1.0, 255.0) as u8
+}
+
+/// The dBFS a meter byte stands for (`-inf` for 0).
+pub fn byte_db(b: u8) -> f32 {
+    if b == 0 {
+        f32::NEG_INFINITY
+    } else {
+        -96.0 + b as f32 * 0.375
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
+    /// Levels, about 20 times a second, to `SubscribeMeters` clients only.
+    Meters(MeterFrame),
     /// Versioned: `version` is the previous version + 1.
     Changed { version: u64, changes: Vec<Change> },
     /// Unversioned, about 10 Hz.
@@ -807,6 +872,37 @@ mod tests {
         // them, so old journals and clients decode unchanged.
         assert_eq!(postcard::to_allocvec(&Command::Status).unwrap(), vec![10]);
         assert_eq!(bytes[0], 11);
+    }
+
+    #[test]
+    fn position_and_meter_commands_come_after_older_variants_and_round_trip() {
+        let colour = postcard::to_allocvec(&Command::SetColor { key: String::new(), color: None }).unwrap()[0];
+        let cmds = [
+            Command::FillPosition { pos: "asio:2".parse().unwrap(), kind: DeviceKind::Asio, name: "MOTU".into() },
+            Command::ClearPosition { pos: "win-out:1".parse().unwrap() },
+            Command::SetVirtual { pos: "vasio:B".parse().unwrap(), on: true, shape: Some((8, 8)) },
+            Command::SetMaster { pos: None },
+            Command::SubscribeMeters,
+            Command::ClearClip,
+        ];
+        for (i, c) in cmds.iter().enumerate() {
+            let b = postcard::to_allocvec(c).unwrap();
+            assert_eq!(b[0], colour + 1 + i as u8, "{c:?} keeps its index");
+            assert_eq!(&postcard::from_bytes::<Command>(&b).unwrap(), c);
+        }
+        // Positions persist in devices.json (like AddDevice), not the journal.
+        assert!(cmds.iter().all(|c| !c.is_mutation()));
+        assert_eq!(API_VERSION, 10);
+    }
+
+    #[test]
+    fn meter_bytes_cover_minus_96_to_0_db() {
+        assert_eq!(meter_byte(f32::NEG_INFINITY), 0);
+        assert_eq!(meter_byte(-200.0), 0);
+        assert_eq!(meter_byte(0.0), 255);
+        assert_eq!(meter_byte(6.0), 255, "clamped");
+        assert!((byte_db(meter_byte(-12.0)) - -12.0).abs() <= 0.375);
+        assert_eq!(byte_db(0), f32::NEG_INFINITY);
     }
 
     #[test]

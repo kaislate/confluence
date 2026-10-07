@@ -120,6 +120,7 @@ mod tests {
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         }
     }
 

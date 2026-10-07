@@ -185,6 +185,7 @@ impl Store {
                     });
                 }
             }
+            Event::Meters(_) => {}
             Event::Telemetry { status, health } => {
                 let gap_pending = self.gap_pending;
                 self.with_history(|history| {
@@ -301,6 +302,7 @@ impl StateStore {
                         let what = match e {
                             Event::Telemetry { .. } => Update::Telemetry,
                             Event::Changed { .. } => Update::State,
+                            Event::Meters(_) => Update::Telemetry,
                         };
                         if store.event(e, Instant::now()).is_err() {
                             how = SessionEnd::Gap; // resubscribe for a fresh snapshot
@@ -391,6 +393,7 @@ mod tests {
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         }
     }
 

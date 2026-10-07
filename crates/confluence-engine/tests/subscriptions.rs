@@ -37,7 +37,7 @@ fn next_change(sub: &mut Subscription) -> (u64, Vec<Change>) {
     loop {
         match sub.recv().unwrap() {
             Event::Changed { version, changes } => return (version, changes),
-            Event::Telemetry { .. } => {}
+            Event::Telemetry { .. } | Event::Meters(_) => {}
         }
     }
 }

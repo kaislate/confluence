@@ -1132,6 +1132,12 @@ impl Engine {
             }
             Command::Shutdown => Response::Ok,
             Command::SetScript { .. } | Command::DeleteScript { .. } => self.script_command(cmd),
+            Command::FillPosition { .. }
+            | Command::ClearPosition { .. }
+            | Command::SetVirtual { .. }
+            | Command::SetMaster { .. } => Response::Error("positions are handled by the engine process".into()),
+            Command::SubscribeMeters => Response::Error("subscriptions are served by the engine process".into()),
+            Command::ClearClip => Response::Ok,
             Command::SetSlotColor { id, color } => match self.color_key(id) {
                 Some(key) => self.colours.set(&key, color).map_or_else(Response::Error, |()| Response::Ok),
                 None => Response::Error(format!("there is no slot {id}")),

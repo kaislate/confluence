@@ -97,6 +97,7 @@ pub fn published_state(
         midi_learning: None,
         scripts: Vec::new(),
         peers: devices.peers(),
+        positions: Vec::new(),
     }
 }
 
@@ -138,6 +139,7 @@ mod tests {
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         }
     }
 
@@ -152,7 +154,7 @@ mod tests {
             .try_iter()
             .filter_map(|e| match e {
                 Event::Changed { version, .. } => Some(version),
-                Event::Telemetry { .. } => None,
+                Event::Telemetry { .. } | Event::Meters(_) => None,
             })
             .collect();
         assert_eq!(versions, vec![1, 2]);
