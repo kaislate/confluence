@@ -41,22 +41,30 @@ fn the_engine_can_be_started_from_the_window() {
 }
 
 #[test]
-fn clicking_cells_routes_and_unroutes() {
+fn a_click_selects_a_cell_and_space_or_a_double_click_toggles_its_route() {
     let d = EngineDir::new("click");
     let _engine = Engine::spawn(&d);
     let mut c = client(&d);
     let (i, o) = add_vasio(&mut c, 1);
-    let mut h = harness(app_for(&d));
+    let mut h = harness_fast(app_for(&d));
     let cell = "VASIO 1 in 1 → VASIO 1 out 2";
     pump_until(&mut h, "the grid", LONG, |h| h.query_by_role_and_label(Role::Button, cell).is_some());
+    // A click selects, and routes nothing.
     h.get_by_role_and_label(Role::Button, cell).click();
-    // The cell shows the pending route at once; wait for the engine to have it.
+    settle(&mut h);
+    assert_eq!(h.state().selection(), confluence_app::matrix::Selection::Cell { input: i, output: o + 1 });
+    std::thread::sleep(Duration::from_millis(600));
+    settle(&mut h);
+    assert!(h.state().point(i, o + 1).is_none() && !engine_points(&mut c).contains(&(i, o + 1)), "a click routed");
+    // Space routes the selected cell.
+    h.key_press(eframe::egui::Key::Space);
     pump_until(&mut h, "the route in the engine", LONG, |h| {
         h.state().point(i, o + 1).is_some() && engine_points(&mut c).contains(&(i, o + 1))
     });
-    std::thread::sleep(Duration::from_millis(600)); // not a double-click
-    settle(&mut h);
-    h.get_by_role_and_label(Role::Button, cell).click();
+    // A double-click removes it again.
+    let node = h.get_by_role_and_label(Role::Button, cell);
+    node.click();
+    node.click();
     pump_until(&mut h, "the route gone from the engine", LONG, |h| {
         h.state().point(i, o + 1).is_none() && !engine_points(&mut c).contains(&(i, o + 1))
     });
@@ -152,8 +160,9 @@ fn the_inspector_edits_the_selected_route() {
     pump_until(&mut h, "the routed cell", LONG, |h| {
         h.state().point(i, o).is_some() && h.query_by_role_and_label(Role::Button, cell).is_some()
     });
-    // A click removes the route and selects the cell: the inspector shows its point panel.
+    // A click selects the cell and Space removes its route: the inspector shows its point panel.
     h.get_by_role_and_label(Role::Button, cell).click();
+    h.key_press(eframe::egui::Key::Space);
     pump_until(&mut h, "unrouted in the engine", LONG, |_| !engine_points(&mut c).contains(&(i, o)));
     pump_until(&mut h, "the point panel", LONG, |h| h.query_by_label("Route at 0 dB").is_some());
     settle(&mut h); // let the panel's layout settle before clicking in it
@@ -319,7 +328,8 @@ fn the_first_edit_after_an_engine_restart_works() {
     let second = "VASIO 1 in 2 → VASIO 1 out 2";
     pump_until(&mut h, "the grid", LONG, |h| h.query_by_role_and_label(Role::Button, first).is_some());
     settle(&mut h);
-    h.get_by_role_and_label(Role::Button, first).click(); // the worker now holds a connection
+    h.get_by_role_and_label(Role::Button, first).click();
+    h.key_press(eframe::egui::Key::Space); // the worker now holds a connection
     pump_until(&mut h, "the first route", LONG, |_| engine_points(&mut client(&d)).contains(&(i, o)));
     engine.kill();
     pump_until(&mut h, "Reconnecting", LONG, |h| h.query_all_by_label_contains("Reconnecting").next().is_some());
@@ -327,6 +337,7 @@ fn the_first_edit_after_an_engine_restart_works() {
     pump_until(&mut h, "Live again", LONG, |h| h.query_by_label("Live").is_some());
     settle(&mut h);
     h.get_by_role_and_label(Role::Button, second).click();
+    h.key_press(eframe::egui::Key::Space);
     pump_until(&mut h, "the edit's outcome", LONG, |h| {
         h.query_by_label_contains("lost the engine").is_some()
             || engine_points(&mut client(&d)).contains(&(i + 1, o + 1))
@@ -419,11 +430,12 @@ fn an_insert_bus_is_added_routed_and_cannot_loop() {
     let send = "VASIO 1 in 1 → Verb send 1";
     pump_until(&mut h, "the send cell", LONG, |h| h.query_by_role_and_label(Role::Button, send).is_some());
     h.get_by_role_and_label(Role::Button, send).click();
+    h.key_press(eframe::egui::Key::Space);
     pump_until(&mut h, "the send route", LONG, |_| engine_points(&mut c).contains(&(i, bus.first_output)));
-    std::thread::sleep(Duration::from_millis(600)); // not a double-click
     settle(&mut h);
     let looped = "Verb return 1 → Verb send 1";
     h.get_by_role_and_label(Role::Button, looped).click();
+    h.key_press(eframe::egui::Key::Space);
     pump_until(&mut h, "the loop error", LONG, |h| h.query_by_label_contains("back into itself").is_some());
     pump_until(&mut h, "no loop route", LONG, |h| h.state().point(bus.first_input, bus.first_output).is_none());
     assert!(!engine_points(&mut c).contains(&(bus.first_input, bus.first_output)));
@@ -547,8 +559,9 @@ fn a_route_learns_a_midi_control_from_the_window() {
     let mut h = harness(app_for(&d));
     let cell = "VASIO 1 in 1 → VASIO 1 out 1";
     pump_until(&mut h, "the cell", LONG, |h| h.query_by_role_and_label(Role::Button, cell).is_some());
-    // A click on an empty cell routes it and selects it.
+    // A click selects the empty cell and Space routes it.
     h.get_by_role_and_label(Role::Button, cell).click();
+    h.key_press(eframe::egui::Key::Space);
     pump_until(&mut h, "the route in the engine", LONG, |_| engine_points(&mut c).contains(&(i, o)));
     pump_until(&mut h, "the MIDI Learn button", LONG, |h| h.query_by_label("MIDI Learn").is_some());
     settle(&mut h);

@@ -6,7 +6,7 @@ use confluence_api::PointState;
 use eframe::egui::{self, Align2, Color32, FontId, Id, Pos2, Rect, ScrollArea, Sense, Vec2, WidgetInfo, WidgetType};
 
 use crate::commands::Edit;
-use crate::matrix::{cell_edit, CellInput, DeferredUnroute, GridLayout, Selection};
+use crate::matrix::{cell_edit, CellInput, GridLayout, Selection};
 use crate::skin::Look;
 
 /// Width of the row headers and height of the column headers.
@@ -67,9 +67,7 @@ pub fn show(
     lookup: &dyn Fn((u32, u32)) -> (Option<PointState>, bool),
     selected: Option<(u32, u32)>,
     editable: bool,
-    unroute: &mut DeferredUnroute,
 ) -> GridActions {
-    let now = ui.input(|i| i.time);
     let mut actions = GridActions::default();
     let (ctrl, fine) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
     if ctrl && ui.ui_contains_pointer() {
@@ -137,15 +135,7 @@ pub fn show(
                     wheel_notches: wheel,
                     fine,
                 };
-                if input.double_clicked {
-                    unroute.double(p); // the first click's unroute must not happen
-                    actions.edits.extend(cell_edit(p, cur.as_ref(), &input));
-                } else if input.clicked && cur.is_some() {
-                    // Unrouted once the double-click window passes (DeferredUnroute).
-                    if let Some(q) = unroute.click(p, now) {
-                        actions.edits.push(Edit::RemovePoint { input: q.0, output: q.1 });
-                    }
-                } else if let Some(e) = cell_edit(p, cur.as_ref(), &input) {
+                if let Some(e) = cell_edit(p, cur.as_ref(), &input) {
                     actions.edits.push(e);
                 }
                 if resp.clicked() || resp.drag_started() {
