@@ -1,0 +1,93 @@
+{
+  "master": null,
+  "devices": [
+    {
+      "kind": "WasapiRender",
+      "name": "Out 1",
+      "first_input": 0,
+      "inputs": 0,
+      "first_output": 0,
+      "outputs": 2
+    },
+    {
+      "kind": "WasapiRender",
+      "name": "Out 2",
+      "first_input": 0,
+      "inputs": 0,
+      "first_output": 2,
+      "outputs": 2
+    },
+    {
+      "kind": "WasapiRender",
+      "name": "Out 3",
+      "first_input": 0,
+      "inputs": 0,
+      "first_output": 4,
+      "outputs": 2
+    },
+    {
+      "kind": "WasapiRender",
+      "name": "Out 4",
+      "first_input": 0,
+      "inputs": 0,
+      "first_output": 6,
+      "outputs": 2
+    },
+    {
+      "kind": "WasapiRender",
+      "name": "Out 5",
+      "first_input": 0,
+      "inputs": 0,
+      "first_output": 8,
+      "outputs": 2
+    },
+    {
+      "kind": "WasapiRender",
+      "name": "Out 6",
+      "first_input": 0,
+      "inputs": 0,
+      "first_output": 10,
+      "outputs": 2
+    },
+    {
+      "kind": "WasapiRender",
+      "name": "Out 7",
+      "first_input": 0,
+      "inputs": 0,
+      "first_output": 12,
+      "outputs": 2
+    },
+    {
+      "kind": "WasapiRender",
+      "name": "Out 8",
+      "first_input": 0,
+      "inputs": 0,
+      "first_output": 14,
+      "outputs": 2
+    },
+    {
+      "kind": "WasapiRender",
+      "name": "Out 9",
+      "first_input": 0,
+      "inputs": 0,
+      "first_output": 16,
+      "outputs": 2
+    },
+    {
+      "kind": "Vasio",
+      "name": "3:8x2",
+      "first_input": 40,
+      "inputs": 2,
+      "first_output": 40,
+      "outputs": 8
+    },
+    {
+      "kind": "Vaio",
+      "name": "1",
+      "first_input": 50,
+      "inputs": 2,
+      "first_output": 0,
+      "outputs": 0
+    }
+  ]
+}

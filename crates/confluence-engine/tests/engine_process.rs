@@ -727,3 +727,49 @@ fn a_devices_colour_survives_a_killed_engine_and_a_restart() {
     assert_eq!(colour_now(&mut c), None, "back to the default for good");
     shutdown(child, &mut c);
 }
+
+#[test]
+fn a_version_1_setup_migrates_once_with_backups() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let devices = dir.path().join("devices.json");
+    // Nine Windows outputs (one too many) and a VASIO; no VAIO driver in tests.
+    let fixture =
+        std::fs::read_to_string(format!("{}/tests/fixtures/devices-v1-overflow.json", env!("CARGO_MANIFEST_DIR")))
+            .unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+    v["devices"].as_array_mut().unwrap().retain(|d| d["kind"] != "Vaio");
+    std::fs::write(&devices, serde_json::to_string(&v).unwrap()).unwrap();
+    {
+        let (mut j, _) = confluence_engine::journal::Journal::open(&journal).unwrap();
+        j.append(&Command::SetColor { key: "wasapi-out:Out 1".into(), color: Some([1, 2, 3]) }).unwrap();
+    }
+    let pipe = format!("confluence-migrate-{}", std::process::id());
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    // A served request means start-up (and the migration) has finished.
+    let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+    assert!(dir.path().join("devices.v1.json").exists(), "devices backed up");
+    assert!(dir.path().join("journal.v1.bin").exists(), "journal backed up");
+    assert!(std::fs::read_to_string(&devices).unwrap().contains("\"version\": 2"));
+    let state = scenes_now(&pipe);
+    assert!(state.notices.iter().any(|n| n.contains("Out 9")), "{:?}", state.notices);
+    let mut firsts: Vec<u32> =
+        slots.iter().filter(|s| s.device.starts_with("wasapi-out:")).map(|s| s.first_output).collect();
+    firsts.sort();
+    // The outputs are offline here (no such endpoints), but keep their channels.
+    assert_eq!(firsts, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+    let out1 = slots.iter().find(|s| s.device == "wasapi-out:Out 1").unwrap();
+    assert_eq!(out1.color, Some([1, 2, 3]), "the colour moved to its position");
+    let backup_len = std::fs::metadata(dir.path().join("devices.v1.json")).unwrap().len();
+    shutdown(child, &mut c);
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    c.call(Command::ListSlots).unwrap();
+    assert_eq!(std::fs::metadata(dir.path().join("devices.v1.json")).unwrap().len(), backup_len, "not migrated twice");
+    let state = scenes_now(&pipe);
+    assert!(!state.notices.iter().any(|n| n.contains("Out 9")), "the note was a one-time one");
+    shutdown(child, &mut c);
+}

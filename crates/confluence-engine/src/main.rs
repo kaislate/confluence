@@ -660,8 +660,8 @@ mod app {
         // Claim the pipe name before touching any state: a second engine must
         // fail here, not after it has replayed and compacted the journal.
         let listener = PipeServer::bind(&pipe)?;
-        let (mut journal, replay) =
-            Journal::open(&args.journal.clone().unwrap_or_else(|| data_dir().join("journal.bin")))?;
+        let journal_path = args.journal.clone().unwrap_or_else(|| data_dir().join("journal.bin"));
+        let (mut journal, replay) = Journal::open(&journal_path)?;
 
         // The saved devices name the master, if no --master does.
         let devices_file = args.devices.clone().unwrap_or_else(|| data_dir().join("devices.json"));
@@ -705,6 +705,13 @@ mod app {
         };
         let scanner = Scanner::start(exe.clone(), plugin_dirs);
         journal.compact(&state_commands(&mut engine))?;
+        // A version-1 device setup was migrated: colours move to positions.
+        let rekeys = devices.take_color_rekeys();
+        if !rekeys.is_empty() {
+            confluence_engine::migrate::backup(&journal_path)?;
+            engine.rekey_colors(&rekeys);
+            journal.compact(&state_commands(&mut engine))?;
+        }
 
         if let Some(net) = start_net(&args, &devices_file) {
             devices = devices.with_net(net);

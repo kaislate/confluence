@@ -1140,6 +1140,13 @@ impl Engine {
         self.slots.iter().find(|s| s.state.id == id).map(Self::key_of)
     }
 
+    /// Moves colours from old keys to new ones (a migration re-keying them).
+    pub fn rekey_colors(&mut self, map: &[(String, String)]) {
+        for (old, new) in map {
+            self.colours.rename(old, new);
+        }
+    }
+
     /// Keys slot `id`'s colour by `key` (its position) instead of its device.
     pub fn set_color_key(&mut self, id: u32, key: Option<String>) {
         if let Some(s) = self.slots.iter_mut().find(|s| s.state.id == id) {

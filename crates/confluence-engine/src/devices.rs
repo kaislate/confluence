@@ -384,6 +384,10 @@ pub struct DeviceManager {
     virtual_at: BTreeMap<PosId, Binding>,
     /// Positions held for devices being opened.
     reserved: Vec<(DeviceKind, String, PosId)>,
+    /// What a migration from a version-1 file moved (shown for this run).
+    migration_notes: Vec<String>,
+    /// Colour keys a migration changed (old, new), for the engine's colours.
+    color_rekeys: Vec<(String, String)>,
 }
 
 impl DeviceManager {
@@ -409,6 +413,8 @@ impl DeviceManager {
             restore_list: Vec::new(),
             virtual_at: BTreeMap::new(),
             reserved: Vec::new(),
+            migration_notes: Vec::new(),
+            color_rekeys: Vec::new(),
         }
     }
 
@@ -428,6 +434,7 @@ impl DeviceManager {
         let mut warnings = Vec::new();
         let mut save_blocked = None;
         let mut v2: Option<SavedV2> = None;
+        let mut v1_file = false;
         let saved = match std::fs::read_to_string(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
             Err(e) => {
@@ -459,7 +466,7 @@ impl DeviceManager {
                     }
                 }
             }
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            Ok(text) => serde_json::from_str(&text).inspect(|_| v1_file = true).unwrap_or_else(|e| {
                 let bad = path.with_extension("bad");
                 match std::fs::rename(&path, &bad) {
                     Ok(()) => warnings.push(format!(
@@ -504,7 +511,55 @@ impl DeviceManager {
             }
         }
         m.save_blocked = save_blocked;
+        if v1_file && m.save_blocked.is_none() {
+            m.migrate(&mut warnings);
+        }
         (m, warnings)
+    }
+
+    /// Moves a version-1 setup into positions (spec: slot model §3), after
+    /// backing the file up; a setup that cannot be backed up is not touched.
+    fn migrate(&mut self, warnings: &mut Vec<String>) {
+        let Some(path) = self.path.clone() else { return };
+        if let Err(e) = crate::migrate::backup(&path) {
+            warnings.push(format!("{} could not be backed up ({e}): it was not migrated", path.display()));
+            self.save_blocked = Some("could not be backed up, so it was not migrated");
+            return;
+        }
+        let master = self.saved.master.clone();
+        let devices = std::mem::take(&mut self.restore_list).into_iter().map(|(_, b)| b).collect();
+        let m = crate::migrate::migrate_v1(master, devices);
+        let _ = self.table.set_master(m.saved.master);
+        self.saved.master = m.saved.master_binding;
+        for (pos, virt, binding) in m.saved.positions {
+            match virt {
+                Some((on, shape)) => {
+                    let _ = self.table.set_virtual(pos, on, Some(shape));
+                    if let Some(b) = binding {
+                        self.virtual_at.insert(pos, b.clone());
+                        if on {
+                            self.restore_list.push((Some(pos), b));
+                        }
+                    }
+                }
+                None => {
+                    if let Some(b) = binding {
+                        self.restore_list.push((Some(pos), b));
+                    }
+                }
+            }
+        }
+        self.unplaced.extend(m.saved.unplaced);
+        self.migration_notes = m.notes;
+        self.color_rekeys = m.color_keys;
+        if let Err(e) = self.save() {
+            warnings.push(format!("the migrated setup could not be saved: {e}"));
+        }
+    }
+
+    /// Colour keys the migration changed (taken once, by the engine's start-up).
+    pub fn take_color_rekeys(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.color_rekeys)
     }
 
     /// Saved channel placement (first input, first output) of the master `name`, if any.
@@ -1131,7 +1186,7 @@ impl DeviceManager {
 
     /// Engine-wide conditions a user should know about (also in Health).
     pub fn notices(&self) -> Vec<String> {
-        let mut out = Vec::new();
+        let mut out = self.migration_notes.clone();
         if let Some(why) = self.save_blocked {
             out.push(match &self.path {
                 Some(p) => format!("device changes are not being saved: {} {why}", p.display()),
