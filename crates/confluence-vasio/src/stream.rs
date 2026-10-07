@@ -150,6 +150,7 @@ impl Chooser {
             return Verdict::Wait;
         }
         (self.watch, self.first_seen) = (None, None);
+        client.set_name(crate::host::host_name());
         Verdict::Claimed(id)
     }
 }
@@ -176,7 +177,10 @@ struct Claim {
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        let _ = self.client.header().client_active.compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire);
+        let h = self.client.header();
+        if h.client_active.compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            self.client.set_name("");
+        }
     }
 }
 

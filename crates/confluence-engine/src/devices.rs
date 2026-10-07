@@ -161,6 +161,14 @@ fn vasio_pos(n: u32) -> Result<PosId, String> {
     Ok(PosId { group: PosGroup::Vasio, index: (n - 1) as u8 })
 }
 
+/// The program on a VASIO instance, if its driver named it.
+fn handle_client(h: &Handle) -> Option<String> {
+    match h {
+        Handle::Vasio(s) => s.client_name(),
+        _ => None,
+    }
+}
+
 /// A virtual device's program is connected (a DAW on VASIO, an app on VAIO).
 fn handle_connected(h: &Handle) -> bool {
     match h {
@@ -1200,6 +1208,7 @@ impl DeviceManager {
                 let ids = b.map(|b| b.slots.clone()).unwrap_or_default();
                 let device = b.map(|b| PositionDevice { kind: b.binding.kind, name: b.binding.name.clone() });
                 let master = self.table.master() == Some(pos);
+                let daw = b.and_then(|b| b.handles.iter().find_map(handle_client));
                 let (status, shape, device, ids) = if pos.group.is_virtual() {
                     let v = self.table.virtual_state(pos);
                     let on = v.is_some_and(|v| v.on);
@@ -1216,7 +1225,7 @@ impl DeviceManager {
                 } else {
                     (PositionStatus::Empty, None, None, ids)
                 };
-                PositionState { pos, status, device, shape, daw: None, master, color: colour(&ids), slots: ids }
+                PositionState { pos, status, device, shape, daw, master, color: colour(&ids), slots: ids }
             })
             .collect()
     }

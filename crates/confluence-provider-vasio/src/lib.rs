@@ -16,7 +16,7 @@ use confluence_shm::{Layout, Server, ShmError};
 
 pub mod config;
 
-/// Driver instances the DLL registers ("Confluence VASIO 1" … "8").
+/// Driver instances the DLL registers ("Confluence VASIO A" … "H").
 pub const INSTANCES: u32 = 8;
 /// Channel limits per direction (spec §7.4).
 pub const MIN_CHANNELS: usize = 2;
@@ -56,6 +56,18 @@ pub struct VasioStats {
     pub overruns: AtomicU64,
     /// A DAW is currently running this instance.
     pub connected: AtomicBool,
+    /// The stream's header, for the DAW's name (read on the control side only).
+    header: std::sync::OnceLock<confluence_shm::HeaderView>,
+}
+
+impl VasioStats {
+    /// The program running this instance, if its driver named it.
+    pub fn client_name(&self) -> Option<String> {
+        if !self.connected.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        self.header.get().and_then(|h| h.client_name())
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -116,6 +128,10 @@ impl VasioSlot {
         // declared before it, so they are dropped first; taken once.
         let (to_daw, from_daw) = unsafe { server.ends() };
         let timeout_blocks = ((CLIENT_TIMEOUT_S * sample_rate / block as f64).ceil() as u32).max(2);
+        let stats = Arc::new(VasioStats::default());
+        if let Ok(view) = server.header_view() {
+            let _ = stats.header.set(view);
+        }
         Ok(VasioSlot {
             to_daw,
             from_daw,
@@ -127,12 +143,17 @@ impl VasioSlot {
             quiet_blocks: u32::MAX,
             timeout_blocks,
             stalled: false,
-            stats: Arc::default(),
+            stats,
         })
     }
 
     pub fn stats(&self) -> Arc<VasioStats> {
         self.stats.clone()
+    }
+
+    /// The program running this instance, if its driver named it (control side).
+    pub fn client_name(&self) -> Option<String> {
+        self.server.client_name()
     }
 
     pub fn daw_inputs(&self) -> usize {
