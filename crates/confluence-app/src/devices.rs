@@ -242,6 +242,7 @@ mod tests {
             inputs: 2,
             first_output: 0,
             outputs: 2,
+            color: None,
         }
     }
 

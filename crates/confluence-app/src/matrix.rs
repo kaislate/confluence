@@ -28,6 +28,11 @@ pub struct Band {
     pub channels: u32,
     /// The band's first row (or column) index.
     pub start: usize,
+    /// Picks the default colour: the lowest id among the slots of this
+    /// slot's device, so a device's input and output bands match.
+    pub palette: u32,
+    /// The colour chosen for its device, if any.
+    pub color: Option<confluence_api::Rgb>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -54,7 +59,11 @@ impl Axis {
             if channels == 0 {
                 continue;
             }
+            let key = s.color_key();
+            let palette = slots.iter().filter(|o| o.color_key() == key).map(|o| o.id).min().unwrap_or(s.id);
             axis.bands.push(Band {
+                palette,
+                color: s.color,
                 slot: s.id,
                 name: s.name.clone(),
                 online: s.online,
@@ -209,14 +218,15 @@ fn regain(p: (u32, u32), cur: &PointState, delta: f32) -> Option<Edit> {
 
 /// The edit for this frame's pointer input on a cell (`current`: its route, if any).
 pub fn cell_edit(p: (u32, u32), current: Option<&PointState>, input: &CellInput) -> Option<Edit> {
+    // A click only selects (the caller does that); a double-click toggles.
     if input.double_clicked {
-        return Some(set(p, 0.0, false, false));
-    }
-    if input.clicked {
         return Some(match current {
             Some(_) => Edit::RemovePoint { input: p.0, output: p.1 },
             None => set(p, 0.0, false, false),
         });
+    }
+    if input.clicked {
+        return None;
     }
     let cur = current?;
     let s = step(input.fine);
@@ -225,54 +235,6 @@ pub fn cell_edit(p: (u32, u32), current: Option<&PointState>, input: &CellInput)
         return None;
     }
     regain(p, cur, delta)
-}
-
-/// A single click on a routed cell unroutes it only once the double-click
-/// window has passed, so a double-click (reset to 0 dB) never drops the route,
-/// not even for a moment.
-#[derive(Default)]
-pub struct DeferredUnroute {
-    pending: Option<((u32, u32), f64)>,
-}
-
-impl DeferredUnroute {
-    /// egui's double-click window, in seconds.
-    pub const WINDOW: f64 = 0.3;
-
-    /// A single click on routed point `p` at `now` (seconds). Returns a point
-    /// clicked earlier that must be unrouted now (another cell was clicked).
-    pub fn click(&mut self, p: (u32, u32), now: f64) -> Option<(u32, u32)> {
-        let earlier = self.pending.take().map(|(q, _)| q).filter(|q| *q != p);
-        self.pending = Some((p, now));
-        earlier
-    }
-
-    /// The second click of a double-click on `p`: keep the route.
-    pub fn double(&mut self, p: (u32, u32)) {
-        if self.pending.is_some_and(|(q, _)| q == p) {
-            self.pending = None;
-        }
-    }
-
-    /// The point to unroute now, once its window has passed.
-    pub fn due(&mut self, now: f64) -> Option<(u32, u32)> {
-        match self.pending {
-            Some((p, at)) if now - at >= Self::WINDOW => {
-                self.pending = None;
-                Some(p)
-            }
-            _ => None,
-        }
-    }
-
-    /// Seconds until the pending unroute is due.
-    pub fn waiting(&self, now: f64) -> Option<f64> {
-        self.pending.map(|(_, at)| (Self::WINDOW - (now - at)).max(0.0))
-    }
-
-    pub fn is_pending(&self, p: (u32, u32)) -> bool {
-        self.pending.is_some_and(|(q, _)| q == p)
-    }
 }
 
 /// Keys that act on the selected cell.
@@ -324,6 +286,7 @@ mod tests {
             inputs,
             first_output,
             outputs,
+            color: None,
         }
     }
 
@@ -348,6 +311,22 @@ mod tests {
         assert_eq!(point_label(&slots, 1, 0), "Verb return 1 → Mic out 1");
         assert_eq!(point_label(&slots, 1, 1), "Verb return 1 → Verb send 1");
     }
+    #[test]
+    fn a_devices_bands_share_a_colour_and_carry_the_chosen_one() {
+        let dev = |s: SlotState, d: &str| SlotState { device: d.into(), ..s };
+        let slots = [
+            dev(slot(6, "VASIO 1 in", 0, 2, 0, 0), "vasio:1"),
+            dev(slot(7, "VASIO 1 out", 0, 0, 0, 2), "vasio:1"),
+            SlotState { color: Some([1, 2, 3]), ..dev(slot(8, "Game", 0, 0, 2, 2), "wasapi-out:Game") },
+        ];
+        let l = GridLayout::new(&slots, CELL_DEFAULT);
+        let (vin, vout) = (l.rows.band(6).unwrap(), l.cols.band(7).unwrap());
+        assert_eq!((vin.palette, vout.palette), (6, 6), "in and out of one device: one default colour");
+        assert_eq!(l.cols.band(8).unwrap().palette, 8);
+        assert_eq!(l.cols.band(8).unwrap().color, Some([1, 2, 3]));
+        assert_eq!(vin.color, None);
+    }
+
     #[test]
     fn bands_follow_slot_ids_and_skip_empty_directions() {
         let l = GridLayout::new(&slots(), CELL_DEFAULT);
@@ -403,23 +382,21 @@ mod tests {
     }
 
     #[test]
-    fn a_click_routes_an_empty_cell_and_unroutes_a_routed_one() {
+    fn a_click_only_selects() {
         let click = CellInput { clicked: true, ..Default::default() };
-        assert_eq!(
-            cell_edit((1, 2), None, &click),
-            Some(Edit::SetPoint { input: 1, output: 2, gain_db: 0.0, mute: false, invert: false })
-        );
-        assert_eq!(cell_edit((1, 2), Some(&pt(1, 2, -6.0)), &click), Some(Edit::RemovePoint { input: 1, output: 2 }));
+        assert_eq!(cell_edit((1, 2), None, &click), None, "an empty cell is not routed");
+        assert_eq!(cell_edit((1, 2), Some(&pt(1, 2, -6.0)), &click), None, "a routed cell is not unrouted");
     }
 
     #[test]
-    fn a_double_click_makes_a_plain_zero_db_route() {
+    fn a_double_click_toggles_the_route() {
         let dbl = CellInput { clicked: true, double_clicked: true, ..Default::default() };
-        let muted = PointState { mute: true, ..pt(1, 2, -12.0) };
         assert_eq!(
-            cell_edit((1, 2), Some(&muted), &dbl),
+            cell_edit((1, 2), None, &dbl),
             Some(Edit::SetPoint { input: 1, output: 2, gain_db: 0.0, mute: false, invert: false })
         );
+        let muted = PointState { mute: true, ..pt(1, 2, -12.0) };
+        assert_eq!(cell_edit((1, 2), Some(&muted), &dbl), Some(Edit::RemovePoint { input: 1, output: 2 }));
     }
 
     #[test]
@@ -484,32 +461,6 @@ mod tests {
         assert_eq!(move_selection(&l, (0, 0), -1, -1), Some((0, 0)), "clamped at the top left");
         assert_eq!(move_selection(&l, (2, 3), 5, 5), Some((2, 3)), "clamped at the bottom right");
         assert_eq!(move_selection(&GridLayout::new(&[], CELL_DEFAULT), (0, 0), 1, 0), None);
-    }
-
-    #[test]
-    fn a_single_click_unroutes_once_the_double_click_window_has_passed() {
-        let mut u = DeferredUnroute::default();
-        assert_eq!(u.click((1, 2), 10.0), None);
-        assert!(u.is_pending((1, 2)));
-        assert_eq!(u.due(10.1), None, "a second click may still come");
-        assert_eq!(u.due(10.0 + DeferredUnroute::WINDOW), Some((1, 2)));
-        assert_eq!(u.due(11.0), None, "only once");
-    }
-
-    #[test]
-    fn a_double_click_never_drops_the_route() {
-        let mut u = DeferredUnroute::default();
-        u.click((1, 2), 10.0);
-        u.double((1, 2));
-        assert_eq!(u.due(20.0), None);
-    }
-
-    #[test]
-    fn clicking_another_routed_cell_unroutes_the_first_at_once() {
-        let mut u = DeferredUnroute::default();
-        u.click((1, 2), 10.0);
-        assert_eq!(u.click((3, 4), 10.1), Some((1, 2)));
-        assert_eq!(u.waiting(10.1).map(|w| (w * 100.0).round() / 100.0), Some(DeferredUnroute::WINDOW));
     }
 
     #[test]

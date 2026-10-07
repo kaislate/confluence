@@ -85,6 +85,12 @@ enum Cmd {
     },
     /// Delete script NAME.
     DeleteScript { name: String },
+    /// Colour slot SLOT's device: #rrggbb, or `default`.
+    SetColor {
+        slot: u32,
+        #[arg(value_parser = parse_color)]
+        color: ColorArg,
+    },
     /// The next CC that arrives binds to the gain of route IN → OUT.
     LearnMidi { input: u32, output: u32 },
     /// Handle a MIDI message as if DEVICE sent it (bytes in decimal or 0x hex).
@@ -168,6 +174,7 @@ impl Cmd {
                 Command::SetScript { name: name.clone(), source: String::new(), enabled: false }
             }
             Cmd::DeleteScript { ref name } => Command::DeleteScript { name: name.clone() },
+            Cmd::SetColor { slot, color } => Command::SetSlotColor { id: slot, color: color.0 },
             Cmd::LearnMidi { input, output } => Command::LearnMidi { input, output },
             Cmd::InjectMidi { ref device, ref bytes } => {
                 Command::InjectMidi { device: device.clone(), bytes: bytes.clone() }
@@ -235,6 +242,25 @@ fn render_midi(s: &confluence_api::State) -> String {
         lines.push(format!("learning: in {i} -> out {o}"));
     }
     lines.join("\n")
+}
+
+/// A colour argument: `None` for the default.
+#[derive(Clone, Copy, Debug)]
+struct ColorArg(Option<confluence_api::Rgb>);
+
+/// `#rrggbb` (the `#` is optional), or `default`.
+fn parse_color(s: &str) -> Result<ColorArg, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("default") {
+        return Ok(ColorArg(None));
+    }
+    let hex = t.strip_prefix('#').unwrap_or(t);
+    let bad = || format!("{s}: give a colour as #rrggbb, or default");
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| bad());
+    Ok(ColorArg(Some([byte(0)?, byte(2)?, byte(4)?])))
 }
 
 /// A byte given as decimal or `0x` hex.
@@ -629,6 +655,26 @@ v7  slot #3 removed"
             script_command(&cli.command).unwrap(),
             Command::SetScript { name: "mute".into(), source: "function on_midi(m) end".into(), enabled: false }
         );
+    }
+
+    #[test]
+    fn set_color_takes_a_hex_colour_or_default() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["confluence-cli"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all).map(|c| c.command.to_command())
+        };
+        assert_eq!(
+            parse(&["set-color", "3", "#40a0FF"]).unwrap(),
+            Command::SetSlotColor { id: 3, color: Some([0x40, 0xa0, 0xff]) }
+        );
+        assert_eq!(
+            parse(&["set-color", "3", "40a0ff"]).unwrap(),
+            Command::SetSlotColor { id: 3, color: Some([0x40, 0xa0, 0xff]) }
+        );
+        assert_eq!(parse(&["set-color", "3", "default"]).unwrap(), Command::SetSlotColor { id: 3, color: None });
+        assert!(parse(&["set-color", "3", "#12345"]).is_err());
+        assert!(parse(&["set-color", "3", "blue"]).is_err());
     }
 
     #[test]

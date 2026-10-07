@@ -14,7 +14,7 @@ use eframe::egui::{self, Align, Align2, Button, Id, Key, Layout, RichText};
 use crate::commands::{Edit, Outcome, Worker};
 use crate::engine_launch::Launcher;
 use crate::grid_view;
-use crate::matrix::{key_edit, move_selection, selection_valid, CellKey, DeferredUnroute, GridLayout, Selection};
+use crate::matrix::{key_edit, move_selection, selection_valid, CellKey, GridLayout, Selection};
 use crate::notify::Notes;
 use crate::pending::Pending;
 use crate::skin::Look;
@@ -172,7 +172,6 @@ pub struct ConfluenceApp {
     /// A slot waiting for "Remove ‹name›?" to be confirmed.
     confirm_remove: Option<u32>,
     /// A clicked route waiting out the double-click window before it is removed.
-    unroute: DeferredUnroute,
     devices_open: bool,
     devices: crate::devices::DevicesState,
     /// The plugin picker, while open.
@@ -243,7 +242,6 @@ impl ConfluenceApp {
             look: Look::builtin(),
             skin_dir: config.skin,
             confirm_remove: None,
-            unroute: DeferredUnroute::default(),
             devices_open: false,
             devices: crate::devices::DevicesState::default(),
             picker: None,
@@ -384,13 +382,6 @@ impl ConfluenceApp {
             }
         }
         self.notes.prune(now);
-        let t = ctx.input(|i| i.time);
-        if let Some((input, output)) = self.unroute.due(t) {
-            self.send(Edit::RemovePoint { input, output });
-        }
-        if let Some(wait) = self.unroute.waiting(t) {
-            ctx.request_repaint_after(Duration::from_secs_f64(wait));
-        }
 
         let graphs = self.inspector_open && matches!(self.selection, Selection::Slot(_));
         self.graphs_live.store(graphs, Ordering::Relaxed);
@@ -642,13 +633,13 @@ impl ConfluenceApp {
             let layout = GridLayout::new(&state.slots, self.cell);
             let by_point: HashMap<(u32, u32), &PointState> =
                 state.points.iter().map(|p| ((p.input, p.output), p)).collect();
-            let (pending, unroute) = (&self.pending, &mut self.unroute);
+            let pending = &self.pending;
             let lookup = |p: (u32, u32)| (pending.effective(p, by_point.get(&p).copied()), pending.is_pending(p));
             let selected = match self.selection {
                 Selection::Cell { input, output } => Some((input, output)),
                 _ => None,
             };
-            let actions = grid_view::show(ui, &layout, &self.look, &lookup, selected, editable, unroute);
+            let actions = grid_view::show(ui, &layout, &self.look, &lookup, selected, editable);
             if let Some(z) = actions.zoom {
                 self.cell = z.clamp(crate::matrix::CELL_MIN, crate::matrix::CELL_MAX);
             }

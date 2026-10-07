@@ -6,7 +6,7 @@ use confluence_api::PointState;
 use eframe::egui::{self, Align2, Color32, FontId, Id, Pos2, Rect, ScrollArea, Sense, Vec2, WidgetInfo, WidgetType};
 
 use crate::commands::Edit;
-use crate::matrix::{cell_edit, CellInput, DeferredUnroute, GridLayout, Selection};
+use crate::matrix::{cell_edit, CellInput, GridLayout, Selection};
 use crate::skin::Look;
 
 /// Width of the row headers and height of the column headers.
@@ -67,9 +67,7 @@ pub fn show(
     lookup: &dyn Fn((u32, u32)) -> (Option<PointState>, bool),
     selected: Option<(u32, u32)>,
     editable: bool,
-    unroute: &mut DeferredUnroute,
 ) -> GridActions {
-    let now = ui.input(|i| i.time);
     let mut actions = GridActions::default();
     let (ctrl, fine) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
     if ctrl && ui.ui_contains_pointer() {
@@ -137,15 +135,7 @@ pub fn show(
                     wheel_notches: wheel,
                     fine,
                 };
-                if input.double_clicked {
-                    unroute.double(p); // the first click's unroute must not happen
-                    actions.edits.extend(cell_edit(p, cur.as_ref(), &input));
-                } else if input.clicked && cur.is_some() {
-                    // Unrouted once the double-click window passes (DeferredUnroute).
-                    if let Some(q) = unroute.click(p, now) {
-                        actions.edits.push(Edit::RemovePoint { input: q.0, output: q.1 });
-                    }
-                } else if let Some(e) = cell_edit(p, cur.as_ref(), &input) {
+                if let Some(e) = cell_edit(p, cur.as_ref(), &input) {
                     actions.edits.push(e);
                 }
                 if resp.clicked() || resp.drag_started() {
@@ -205,7 +195,7 @@ pub fn show(
             let x0 = origin.x + band.start as f32 * cell;
             let strip =
                 Rect::from_min_size(Pos2::new(x0, top.min.y), Vec2::new(band.channels as f32 * cell, BAND_STRIP));
-            let colour = if band.online { look.slot(band.slot) } else { look.skin.colors.offline };
+            let colour = if band.online { look.band(band) } else { look.skin.colors.offline };
             let painter = ui.painter_at(strip.intersect(top));
             look.paint_band(&painter, strip.shrink2(Vec2::new(1.0, 2.0)), colour);
             let name = if band.online { band.name.clone() } else { format!("{} OFFLINE", band.name) };
@@ -242,7 +232,7 @@ pub fn show(
             let y0 = origin.y + band.start as f32 * cell;
             let strip =
                 Rect::from_min_size(Pos2::new(left.min.x, y0), Vec2::new(HEADER_W, band.channels as f32 * cell));
-            let colour = if band.online { look.slot(band.slot) } else { look.skin.colors.offline };
+            let colour = if band.online { look.band(band) } else { look.skin.colors.offline };
             let painter = ui.painter_at(strip.intersect(left));
             look.paint_band(
                 &painter,

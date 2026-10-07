@@ -10,7 +10,7 @@ pub mod taper;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 8;
+pub const API_VERSION: u16 = 9;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -149,7 +149,22 @@ pub enum Command {
     DeleteScript {
         name: String,
     },
+    /// Colours slot `id`'s device (all its slots), or back to the default
+    /// with `None`. Saved as [`Command::SetColor`] for the device.
+    SetSlotColor {
+        id: u32,
+        color: Option<Rgb>,
+    },
+    /// Colours whatever has colour key `key` (see [`SlotState::color`]): what
+    /// the journal keeps, since slot ids change between runs.
+    SetColor {
+        key: String,
+        color: Option<Rgb>,
+    },
 }
+
+/// A colour: red, green, blue.
+pub type Rgb = [u8; 3];
 
 /// Largest script source accepted.
 pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
@@ -272,6 +287,8 @@ impl Command {
                 | Command::RemoveMidiBinding { .. }
                 | Command::SetScript { .. }
                 | Command::DeleteScript { .. }
+                | Command::SetSlotColor { .. }
+                | Command::SetColor { .. }
         )
     }
 }
@@ -307,6 +324,11 @@ pub struct SlotState {
     /// First global output channel and count (0 if the slot has no outputs).
     pub first_output: u32,
     pub outputs: u32,
+    /// The colour chosen for this slot's device (`None`: the default). A
+    /// device's slots share it; it is kept per device (an insert bus: per its
+    /// first send column).
+    #[serde(default)]
+    pub color: Option<Rgb>,
 }
 
 /// The `device` of an insert bus slot.
@@ -316,6 +338,18 @@ impl SlotState {
     /// True for an insert bus (its inputs are the bus returns, its outputs the sends).
     pub fn is_bus(&self) -> bool {
         self.device == BUS_DEVICE
+    }
+
+    /// The key this slot's colour is kept under: its device (which all its
+    /// slots share), an insert bus's first send column, or else its name.
+    pub fn color_key(&self) -> String {
+        if self.is_bus() {
+            format!("bus:{}", self.first_output)
+        } else if self.device.is_empty() {
+            format!("slot:{}", self.name)
+        } else {
+            self.device.clone()
+        }
     }
 }
 
@@ -776,6 +810,19 @@ mod tests {
     }
 
     #[test]
+    fn colour_commands_round_trip_are_saved_and_come_after_older_variants() {
+        let by_slot = Command::SetSlotColor { id: 3, color: Some([0x40, 0xa0, 0xff]) };
+        let by_key = Command::SetColor { key: "vasio:1".into(), color: None };
+        for cmd in [&by_slot, &by_key] {
+            let bytes = postcard::to_allocvec(cmd).unwrap();
+            assert_eq!(&postcard::from_bytes::<Command>(&bytes).unwrap(), cmd);
+            assert!(cmd.is_mutation(), "{cmd:?} is saved");
+        }
+        let script = postcard::to_allocvec(&Command::DeleteScript { name: String::new() }).unwrap()[0];
+        assert!(postcard::to_allocvec(&by_slot).unwrap()[0] > script, "old journals decode unchanged");
+    }
+
+    #[test]
     fn a_bus_slot_is_recognised_by_its_device() {
         let s = SlotState {
             id: 1,
@@ -787,6 +834,7 @@ mod tests {
             inputs: 2,
             first_output: 0,
             outputs: 2,
+            color: None,
         };
         assert!(s.is_bus());
         assert!(!SlotState { device: "vasio:1".into(), ..s }.is_bus());

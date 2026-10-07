@@ -284,6 +284,14 @@ impl Look {
         }
     }
 
+    /// A band's colour: its device's chosen colour, else the default for it.
+    pub fn band(&self, band: &crate::matrix::Band) -> Color32 {
+        match band.color {
+            Some([r, g, b]) => Color32::from_rgb(r, g, b),
+            None => self.slot(band.palette),
+        }
+    }
+
     /// Warn from 70 % DSP load, error from 90 %.
     pub fn dsp_color(&self, load: f32) -> Option<Color32> {
         if load >= 0.9 {

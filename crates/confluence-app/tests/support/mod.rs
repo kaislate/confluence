@@ -134,6 +134,15 @@ pub fn harness_sized(app: ConfluenceApp, w: f32, h: f32) -> Harness<'static, Con
     Harness::builder().with_size([w, h]).build_ui_state(|ui, app: &mut ConfluenceApp| app.draw(ui), app)
 }
 
+/// A harness whose frames are 1/60 s apart (the default is 1/4 s, so the
+/// clicks of a double-click, a frame per event, would be too far apart).
+pub fn harness_fast(app: ConfluenceApp) -> Harness<'static, ConfluenceApp> {
+    Harness::builder()
+        .with_size([1200.0, 800.0])
+        .with_step_dt(1.0 / 60.0)
+        .build_ui_state(|ui, app: &mut ConfluenceApp| app.draw(ui), app)
+}
+
 /// Runs frames until `cond` holds, failing after `timeout`.
 pub fn pump_until(
     h: &mut Harness<'static, ConfluenceApp>,

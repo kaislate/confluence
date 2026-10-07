@@ -268,9 +268,38 @@ fn slot_panel(
         }
     }
     ui.separator();
+    colour_row(ui, look, slot, actions);
+    ui.separator();
     if ui.add(Button::new("Remove slot…")).clicked() {
         actions.push(Action::RemoveSlot(id));
     }
+}
+
+/// The colour of `slot`'s device (all its slots): a palette swatch, any
+/// colour, or back to the default.
+fn colour_row(ui: &mut egui::Ui, look: &Look, slot: &SlotState, actions: &mut Vec<Action>) {
+    let id = slot.id;
+    ui.label(RichText::new("Colour").strong());
+    ui.horizontal_wrapped(|ui| {
+        for c in &look.skin.slot_colors {
+            let rgb = [c.r(), c.g(), c.b()];
+            let name = format!("Colour #{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+            let chosen = slot.color == Some(rgb);
+            let swatch = Button::new("").fill(*c).min_size(egui::vec2(18.0, 18.0)).selected(chosen);
+            let r = ui.add(swatch).on_hover_text(&name);
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
+            if r.clicked() {
+                actions.push(Action::Edit(Edit::SetSlotColor { id, color: Some(rgb) }));
+            }
+        }
+        let mut any = slot.color.unwrap_or([128, 128, 128]);
+        if egui::widgets::color_picker::color_edit_button_srgb(ui, &mut any).on_hover_text("Any colour").changed() {
+            actions.push(Action::Edit(Edit::SetSlotColor { id, color: Some(any) }));
+        }
+        if ui.add_enabled(slot.color.is_some(), Button::new("Default colour")).clicked() {
+            actions.push(Action::Edit(Edit::SetSlotColor { id, color: None }));
+        }
+    });
 }
 
 /// An insert bus: its channels, its plugin and the plugin's parameters.
@@ -379,6 +408,8 @@ fn bus_panel(
         }
     }
     ui.separator();
+    colour_row(ui, look, slot, actions);
+    ui.separator();
     if ui.add(Button::new("Remove slot…")).clicked() {
         actions.push(Action::RemoveSlot(bus));
     }
@@ -400,6 +431,7 @@ mod tests {
             inputs,
             first_output,
             outputs,
+            color: None,
         }
     }
 
@@ -458,6 +490,7 @@ mod display_tests {
             inputs: 2,
             first_output: 0,
             outputs: 2,
+            color: None,
         };
         StoreView {
             state: Some(State {
@@ -507,6 +540,7 @@ mod display_tests {
             inputs: 2,
             first_output: 2,
             outputs: 2,
+            color: None,
         });
         state.bus_plugins = plugin.into_iter().collect();
         view
@@ -596,6 +630,41 @@ mod display_tests {
         assert!(h.query_by_label("Packets 1200 · lost 3 · late 1 · reordered 7").is_some());
         assert!(h.query_by_label_contains("No packets for 2.5 s").is_some());
         assert!(h.query_by_label_contains("40 packets at another sample rate").is_some());
+    }
+
+    /// Runs the inspector with slot 1 of `view` selected, clicking `label`.
+    fn slot_panel_click(view: &StoreView, label: &str) -> Vec<Action> {
+        let look = Look::builtin();
+        let pending = std::collections::HashMap::new();
+        let sel = Selection::Slot(1);
+        let mut out = Vec::new();
+        {
+            let mut h = Harness::new_ui(|ui| {
+                let ui_state = PluginUi { pending: &pending, loading: None };
+                out.extend(show(ui, view, &look, &sel, None, None, true, &ui_state));
+            });
+            h.run();
+            h.get_by_label(label).click();
+            h.run();
+        }
+        out
+    }
+
+    #[test]
+    fn a_slots_device_is_coloured_from_the_palette_or_put_back_to_the_default() {
+        let view = view_with(PointState { input: 0, output: 0, gain_db: 0.0, mute: false, invert: false });
+        let first = Look::builtin().skin.slot_colors[0];
+        let label = format!("Colour #{:02x}{:02x}{:02x}", first.r(), first.g(), first.b());
+        let picked = slot_panel_click(&view, &label);
+        let want = Some([first.r(), first.g(), first.b()]);
+        assert!(picked
+            .iter()
+            .any(|a| matches!(a, Action::Edit(Edit::SetSlotColor { id: 1, color }) if *color == want)));
+
+        let mut coloured = view.clone();
+        coloured.state.as_mut().unwrap().slots[0].color = Some([1, 2, 3]);
+        let reset = slot_panel_click(&coloured, "Default colour");
+        assert!(reset.iter().any(|a| matches!(a, Action::Edit(Edit::SetSlotColor { id: 1, color: None }))));
     }
 
     #[test]

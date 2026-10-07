@@ -681,3 +681,44 @@ fn two_engines_stream_to_each_other_over_the_network() {
     shutdown(a, &mut ca);
     shutdown(b, &mut cb);
 }
+
+#[test]
+fn a_devices_colour_survives_a_killed_engine_and_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let binding = r#"{"master":null,"devices":[{"kind":"Asio","name":"no such driver (test)",
+        "first_input":0,"inputs":2,"first_output":0,"outputs":2}]}"#;
+    std::fs::write(dir.path().join("devices.json"), binding).unwrap();
+    let pipe = format!("confluence-colour-{}", std::process::id());
+    let colour_now = |c: &mut Client| -> Option<[u8; 3]> {
+        let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+        slots.iter().find(|s| s.device == "asio:no such driver (test)").expect("the device's slot").color
+    };
+
+    let mut child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+    let id = slots[0].id;
+    let set = Command::SetSlotColor { id, color: Some([0x40, 0xa0, 0xff]) };
+    assert!(matches!(c.call(set).unwrap(), Response::Applied { .. }));
+    assert_eq!(colour_now(&mut c), Some([0x40, 0xa0, 0xff]));
+    child.kill(); // no compaction: the appended record must do
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(colour_now(&mut c), Some([0x40, 0xa0, 0xff]), "kept after a kill");
+    shutdown(child, &mut c); // compacts the journal
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(colour_now(&mut c), Some([0x40, 0xa0, 0xff]), "kept by compaction");
+    let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+    let reset = Command::SetSlotColor { id: slots[0].id, color: None };
+    assert!(matches!(c.call(reset).unwrap(), Response::Applied { .. }));
+    shutdown(child, &mut c);
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(colour_now(&mut c), None, "back to the default for good");
+    shutdown(child, &mut c);
+}
