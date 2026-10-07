@@ -14,6 +14,7 @@ pub mod journal;
 pub mod midi;
 #[cfg(windows)]
 pub mod plugins;
+pub mod positions;
 #[cfg(windows)]
 pub mod publish;
 pub mod sim;
