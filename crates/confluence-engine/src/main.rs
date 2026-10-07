@@ -400,6 +400,8 @@ mod app {
 
     /// How often state is diffed and telemetry sent, in control-loop ticks of 10 ms.
     const PUBLISH_TICKS: u64 = 10;
+    /// Control ticks (10 ms) between meter frames.
+    const METER_TICKS: u64 = 5;
     /// The journal is rewritten as the current state once it grows past this.
     const JOURNAL_COMPACT_BYTES: u64 = 4 << 20;
     /// How often the device list is refreshed.
@@ -602,8 +604,8 @@ mod app {
             resp
         }
 
-        fn subscribe(&self) -> Option<(confluence_api::State, Receiver<Event>)> {
-            self.state.upgrade().map(|state| lock(&state).publisher.subscribe())
+        fn subscribe(&self, meters: bool) -> Option<(confluence_api::State, Receiver<Event>)> {
+            self.state.upgrade().map(|state| lock(&state).publisher.subscribe(meters))
         }
     }
 
@@ -798,6 +800,11 @@ mod app {
             }
             midi_tick(&mut s);
             ticks += 1;
+            // Meters about 20 times a second, measured out only for those who asked.
+            if ticks.is_multiple_of(METER_TICKS) && s.publisher.has_meter_subscribers() {
+                let frame = s.engine.meter_frame();
+                s.publisher.meters(frame);
+            }
             if ticks.is_multiple_of(PUBLISH_TICKS) {
                 // Network streams whose engine was not found come back once it is.
                 let State { devices, engine, .. } = &mut *s;

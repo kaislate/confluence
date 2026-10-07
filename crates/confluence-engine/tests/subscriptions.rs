@@ -303,3 +303,42 @@ fn a_store_says_what_kind_of_update_it_made() {
     });
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn meter_frames_arrive_about_twenty_times_a_second_only_when_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = format!("confluence-meters-{}", std::process::id());
+    let _engine = spawn(&pipe, dir.path());
+    let (_, mut plain) = Subscription::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let (state, mut metered) = Subscription::connect_with_meters(&pipe, Duration::from_secs(10)).unwrap();
+    assert!(state.positions.iter().any(|p| p.pos.to_string() == "vasio:A"), "positions are in the state");
+    let start = std::time::Instant::now();
+    let mut frames = 0;
+    while start.elapsed() < Duration::from_secs(1) {
+        if let Event::Meters(_) = metered.recv().unwrap() {
+            frames += 1;
+        }
+    }
+    assert!((12..=30).contains(&frames), "{frames} meter frames in a second");
+    // The plain subscriber got telemetry, never meters.
+    let t = std::time::Instant::now();
+    while t.elapsed() < Duration::from_millis(300) {
+        assert!(!matches!(plain.recv().unwrap(), Event::Meters(_)));
+    }
+    let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_meter_subscriber_that_never_reads_does_not_stall_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = format!("confluence-meters-slow-{}", std::process::id());
+    let _engine = spawn(&pipe, dir.path());
+    let (_s, _never_read) = Subscription::connect_with_meters(&pipe, Duration::from_secs(10)).unwrap();
+    std::thread::sleep(Duration::from_secs(3)); // its queue fills
+    let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    let t = std::time::Instant::now();
+    assert!(matches!(c.call(Command::Status).unwrap(), Response::Status(_)));
+    assert!(t.elapsed() < Duration::from_millis(500), "control stays responsive");
+    c.call(Command::Shutdown).unwrap();
+}

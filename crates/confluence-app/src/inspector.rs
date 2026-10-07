@@ -526,6 +526,7 @@ mod display_tests {
             health: Vec::new(),
             last_event: None,
             snapshots: 1,
+            meters: None,
         }
     }
 
