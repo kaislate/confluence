@@ -23,6 +23,7 @@ impl Drop for Engine {
 /// The engine with this test's own pipe, journal and devices file.
 fn spawn(pipe: &str, dir: &std::path::Path) -> Engine {
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
+    cmd.env(confluence_provider_vasio::NAMESPACE_VAR, format!("test-{}", std::process::id())).env(confluence_provider_vasio::config::ROOT_VAR, format!(r"Software\ConfluenceTest\VASIO.{}", std::process::id()));
     cmd.args(["--pipe", pipe, "--journal"]).arg(dir.join("journal.bin")).arg("--devices").arg(dir.join("devices.json"));
     // Never this PC's MIDI devices or plugins.
     let no_plugins = dir.join("no-plugins");
@@ -248,6 +249,7 @@ fn open_connections_do_not_hold_up_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let pipe = format!("confluence-sub-g-{}", std::process::id());
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
+    cmd.env(confluence_provider_vasio::NAMESPACE_VAR, format!("test-{}", std::process::id())).env(confluence_provider_vasio::config::ROOT_VAR, format!(r"Software\ConfluenceTest\VASIO.{}", std::process::id()));
     cmd.args(["--pipe", &pipe, "--journal"])
         .arg(dir.path().join("journal.bin"))
         .arg("--devices")

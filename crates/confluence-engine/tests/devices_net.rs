@@ -22,6 +22,7 @@ fn loopback(port: u16) -> SocketAddr {
 
 /// Names are never looked up on the real network in tests.
 fn net(host: NetHost, peers: &Arc<Mutex<Vec<Peer>>>) -> NetCtx {
+    confluence_provider_vasio::isolate_for_tests();
     NetCtx::new(host, Box::new(FakeDiscovery(peers.clone()))).with_lookup(Arc::new(|_: &str, _: u16| None))
 }
 

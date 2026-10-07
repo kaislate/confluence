@@ -32,6 +32,8 @@ impl Drop for Engine {
 /// (Never this PC's MIDI devices.)
 fn engine_command(pipe: &str, journal: &std::path::Path) -> Process {
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
+    // Never the real VASIO streams or saved shapes (a fresh setup opens VASIO A).
+    cmd.env(confluence_provider_vasio::NAMESPACE_VAR, format!("test-{}", std::process::id())).env(confluence_provider_vasio::config::ROOT_VAR, format!(r"Software\ConfluenceTest\VASIO.{}", std::process::id()));
     cmd.args(["--pipe", pipe, "--journal"]).arg(journal).arg("--devices").arg(journal.with_file_name("devices.json"));
     cmd.arg("--no-midi");
     // Loopback only, any free port, never advertised: no test touches the LAN.

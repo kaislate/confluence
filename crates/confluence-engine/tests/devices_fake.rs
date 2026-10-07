@@ -19,6 +19,7 @@ use confluence_provider_asio::{AsioDevice, AsioHostError, DriverSource, MAX_DRIV
 /// Opens `fake:<name>` as a fake driver (2 in / 2 out, input 0.25) whose probe
 /// is shared with the test; anything else is "not installed".
 fn opener(probes: Vec<(&'static str, Arc<FakeProbe>)>) -> AsioOpener {
+    confluence_provider_vasio::isolate_for_tests();
     Box::new(move |name: &str| {
         let (_, probe) = probes.iter().find(|(n, _)| *n == name).ok_or(AsioHostError::NotInstalled(name.into()))?;
         let mut cfg = FakeConfig::new(name);
@@ -44,6 +45,7 @@ impl Drop for DriverBudget {
 
 /// Waits until this test's drivers are sure to fit; hold it for the whole test.
 fn driver_budget() -> DriverBudget {
+    confluence_provider_vasio::isolate_for_tests();
     let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     while *running >= MAX_DRIVERS / 3 {
         running = FINISHED.wait(running).unwrap_or_else(|e| e.into_inner());
