@@ -35,6 +35,9 @@ pub trait FrameSink: Send {
     fn write(&mut self, data: &[f32], time: f64);
     /// The receiver may hold audio back this many frames (waiting for a late packet).
     fn set_latency_floor(&self, frames: f64);
+    /// The times written from now on are on another base (see
+    /// `InputDeviceSide::restart_clock`).
+    fn restart_clock(&mut self) {}
 }
 
 impl FrameSink for InputDeviceSide {
@@ -43,6 +46,9 @@ impl FrameSink for InputDeviceSide {
     }
     fn set_latency_floor(&self, frames: f64) {
         InputDeviceSide::set_latency_floor(self, frames);
+    }
+    fn restart_clock(&mut self) {
+        InputDeviceSide::restart_clock(self);
     }
 }
 
@@ -404,6 +410,9 @@ fn run(socket: UdpSocket, inner: Arc<Mutex<Inner>>, stop: Arc<AtomicBool>) {
         for r in &mut g.receivers {
             let sink = &mut r.sink;
             r.receiver.poll(now, &mut |d, t| sink.write(d, t));
+            if r.receiver.take_discontinuity() {
+                r.sink.restart_clock();
+            }
         }
         for s in &mut g.senders {
             send(&socket, s);
@@ -435,6 +444,9 @@ fn receive(g: &mut Inner, data: &[u8], from: IpAddr, now: f64, samples: &mut [f3
     let refused = r.receiver.stats().mismatched;
     r.receiver.push(h, &samples[..n], now, &mut |d, t| sink.write(d, t));
     r.sink.set_latency_floor(r.receiver.latency_floor());
+    if r.receiver.take_discontinuity() {
+        r.sink.restart_clock();
+    }
     let mut s = r.shared.lock().unwrap_or_else(|p| p.into_inner());
     s.stats = r.receiver.stats();
     // A packet this stream cannot play is no sign of life.

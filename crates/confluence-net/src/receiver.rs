@@ -106,6 +106,9 @@ pub struct Receiver {
     concealing_since: Option<f64>,
     /// Blocks `start..end` concealed on time (late packets of these teach the wait).
     timed: Option<(u32, u32)>,
+    /// The times handed on changed base since this was last taken (see
+    /// `take_discontinuity`).
+    discontinuity: bool,
     /// When the current run of late packets (with nothing on time since) began.
     late_since: Option<f64>,
     /// The longest wait the current run of late packets would teach: learned
@@ -215,12 +218,27 @@ impl Receiver {
             timed: None,
             late_since: None,
             late_lesson: 0.0,
+            discontinuity: false,
             stats: ReceiverStats::default(),
         }
     }
 
     pub fn stats(&self) -> ReceiverStats {
         self.stats
+    }
+
+    /// The times handed on are on another base from now on: they may step
+    /// back, once (the bridge is told to take the next as its new phase).
+    fn new_base(&mut self) {
+        self.discontinuity = true;
+        self.last_time = f64::NEG_INFINITY;
+    }
+
+    /// Whether the times handed on changed base (the sender's timeline was
+    /// picked up, or picked up afresh) since the last call: tell the bridge
+    /// (`FrameSink::restart_clock`) so it does not read the step as drift.
+    pub fn take_discontinuity(&mut self) -> bool {
+        std::mem::take(&mut self.discontinuity)
     }
 
     /// How long a gap is waited for now, in seconds.
@@ -251,6 +269,7 @@ impl Receiver {
         self.timed = None;
         self.late_since = None;
         self.late_lesson = 0.0;
+        self.new_base();
         self.stats.resyncs += 1;
     }
 
@@ -283,7 +302,12 @@ impl Receiver {
             self.due.anchor = ts;
         }
         let offset = arrival - self.since_anchor(ts);
+        let known = self.due.earliest().is_finite();
         self.due.observe(offset, arrival);
+        if !known && self.due.earliest().is_finite() {
+            // From arrival times to the sender's timeline.
+            self.new_base();
+        }
     }
 
     /// Takes a packet (`samples` interleaved, `h.channels` per frame) that
@@ -384,7 +408,7 @@ impl Receiver {
             if let Some(i) = self.pending.iter().position(|p| p.ts == e && p.got & p.need == p.need) {
                 let p = self.pending.swap_remove(i);
                 self.expected = Some(e.wrapping_add(p.frames as u32));
-                self.emit_real(p.data, p.last_arrival, out);
+                self.emit_real(p.data, p.ts, p.last_arrival, out);
                 continue;
             }
             let Some(i) = (0..self.pending.len()).min_by_key(|&i| diff(self.pending[i].ts, e)) else {
@@ -410,7 +434,7 @@ impl Receiver {
                 let p = self.pending.swap_remove(i);
                 self.stats.lost += 1;
                 self.expected = Some(e.wrapping_add(p.frames as u32));
-                self.emit_real(p.data, p.last_arrival, out);
+                self.emit_real(p.data, p.ts, p.last_arrival, out);
                 continue;
             }
             let (gap, frames, next) = (diff(p.ts, e) as usize, p.frames, p.first_arrival);
@@ -423,7 +447,8 @@ impl Receiver {
             let mut done = 0;
             for k in 1..=blocks {
                 let n = frames.min(gap - done);
-                self.emit_concealed(n, start + (next - start) * k as f64 / blocks as f64, out);
+                let at = e.wrapping_add(done as u32);
+                self.emit_concealed(n, self.stamp(at, n, start + (next - start) * k as f64 / blocks as f64), out);
                 done += n;
             }
             self.expected = Some(e.wrapping_add(gap as u32));
@@ -456,12 +481,30 @@ impl Receiver {
             Some((start, prev_end)) if prev_end == e => Some((start, end)),
             _ => Some((e, end)),
         };
-        self.emit_concealed(n, due.min(now), out);
+        self.emit_concealed(n, self.stamp(e, n, due.min(now)), out);
         self.expected = Some(end);
         true
     }
 
-    fn emit_real(&mut self, mut data: Vec<f32>, time: f64, out: &mut dyn FnMut(&[f32], f64)) {
+    /// The time block `ts` is handed on with: on the sender's timeline (the
+    /// earliest arrivals plus its timestamp), so the bridge sees the sender's
+    /// clock and not the network's clumps and stalls. `fallback` (when it
+    /// arrived) for the first block of a timeline.
+    fn stamp(&self, ts: u32, frames: usize, fallback: f64) -> f64 {
+        let earliest = self.due.earliest();
+        if earliest.is_finite() {
+            earliest + self.since_anchor(ts)
+        } else if self.last_time.is_finite() {
+            // Still learning the timeline: carry on from the first block at
+            // the nominal rate, so the bridge reads nothing into the clumps.
+            self.last_time + frames as f64 / self.rate as f64
+        } else {
+            fallback
+        }
+    }
+
+    fn emit_real(&mut self, mut data: Vec<f32>, ts: u32, arrival: f64, out: &mut dyn FnMut(&[f32], f64)) {
+        let time = self.stamp(ts, data.len() / self.channels, arrival);
         let c = self.channels;
         if self.lost_run > 0 {
             // Crossfade from what was played in its place.
@@ -803,6 +846,33 @@ mod tests {
         }
         let first_real = first_real.expect("the stream never came back");
         assert!(first_real < 0.010, "came back after {first_real} s: {:?}", r.stats());
+        // Nothing is played twice: as much audio as time went by (the pause
+        // concealed), give or take the wait.
+        let played = out.frames.len() as f64 / 48_000.0;
+        let elapsed = resume + 50.0 * PT;
+        assert!((played - elapsed).abs() < 0.006, "played {played} s in {elapsed} s");
+    }
+
+    #[test]
+    fn blocks_are_stamped_on_the_senders_timeline_not_as_they_arrive() {
+        let mut r = rx(1);
+        let mut out = Out::default();
+        // Sent in clumps of five every 5 ms, then up to 8 ms of extra delay.
+        let mut rng = 0x9876_5432u64;
+        let mut last = 0.0f64;
+        for i in 0..3000u32 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let jitter = (rng >> 33) as f64 / (1u64 << 31) as f64 * 0.008;
+            let sent = ((i / 5 + 1) * 5) as f64 * PT;
+            let t = (sent + jitter).max(last);
+            last = t;
+            r.push(&header(i * 48, 0, 1, 1), &block(0.1, 1), t, &mut out.sink(1));
+            r.poll(t, &mut out.sink(1));
+        }
+        // Once when blocks are due is known, stamps move one packet time per block.
+        let steps: Vec<f64> = out.times[1500..].windows(2).map(|w| w[1] - w[0]).collect();
+        let worst = steps.iter().map(|d| (d - PT).abs()).fold(0.0, f64::max);
+        assert!(worst < 0.0005, "stamps step by up to {worst} s off one packet time");
     }
 
     #[test]

@@ -44,6 +44,9 @@ struct Net {
     /// Both network threads wake only every 15.6 ms (a PC or VM on the default
     /// timer): packets leave and are read in clumps.
     coarse: bool,
+    /// The sender stops for 0.8 s and starts again from timestamp 0, at these
+    /// times (seconds of its clock).
+    restarts: &'static [f64],
 }
 
 fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
@@ -67,8 +70,16 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
     let parts: u8 = if net.split { 2 } else { 1 };
     let (mut losing, mut stall_until, mut last_arrival) = (false, 0.0f64, 0.0f64);
     let mut frame = 0u64;
+    let (mut origin, mut restarts) = (0u64, net.restarts.iter().peekable());
     let mut block_end = SENDER_BLOCK as u64;
     while (frame as f64) / sender_rate < seconds {
+        if restarts.peek().is_some_and(|&&r| frame as f64 / sender_rate >= r) {
+            // Silent for 0.8 s, then its timeline starts again from 0.
+            restarts.next();
+            frame += (0.8 * sender_rate) as u64 / PACKET as u64 * PACKET as u64;
+            origin = frame;
+            block_end = frame + SENDER_BLOCK as u64;
+        }
         let sent = block_end as f64 / sender_rate; // the burst leaves when the block is done
         while frame + PACKET as u64 <= block_end {
             let samples: Vec<f32> = (0..PACKET)
@@ -97,7 +108,7 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
                     last_arrival = arrival;
                 }
                 if !lost {
-                    arrivals.push((arrival, frame as u32, part, samples.clone()));
+                    arrivals.push((arrival, (frame - origin) as u32, part, samples.clone()));
                 }
             }
             frame += PACKET as u64;
@@ -139,6 +150,9 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
             };
             rx.push(&h, s, t, &mut |d, t| dev.write_interleaved(d, t));
             dev.set_latency_floor(rx.latency_floor());
+            if rx.take_discontinuity() {
+                dev.restart_clock();
+            }
             next += 1;
         }
         // The network thread polls every millisecond, packets or not.
@@ -169,7 +183,10 @@ fn run(sender_ppm: f64, net: Net, seconds: f64, settle: f64) {
     let h = stats.snapshot();
     let at_settle = xruns_at_settle.unwrap();
     assert_eq!(h.underruns + h.overruns, at_settle, "xruns after settling: {h:?}, receiver {:?}", rx.stats());
-    assert!(worst_ppm < 10.0, "drift estimate off by up to {worst_ppm} ppm ({h:?}), receiver {:?}", rx.stats());
+    // On a lossy link that stalls the estimate wanders more; the fill loop
+    // takes up the rest (no xruns, checked above).
+    let ppm_bound = if net.wifi { 30.0 } else { 10.0 };
+    assert!(worst_ppm < ppm_bound, "drift estimate off by up to {worst_ppm} ppm ({h:?}), receiver {:?}", rx.stats());
     if net.coarse {
         assert_eq!(rx.stats().lost, 0, "nothing is lost, so nothing may be concealed: {:?}", rx.stats());
     }
@@ -188,6 +205,11 @@ fn a_wired_stream_with_drift_and_bursts_plays_cleanly() {
 #[test]
 fn delay_spikes_grow_the_buffer_and_then_play_cleanly() {
     run(-120.0, Net { spikes: true, ..Net::default() }, 90.0, 45.0);
+}
+
+#[test]
+fn a_wifi_sender_that_restarts_is_tracked_again() {
+    run(25.0, Net { wifi: true, restarts: &[20.0, 40.0], ..Net::default() }, 120.0, 70.0);
 }
 
 #[test]

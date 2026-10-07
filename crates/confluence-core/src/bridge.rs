@@ -45,6 +45,8 @@ const START_EXCESS_DRAIN_PER_S: f64 = 2.0;
 
 /// (frames transferred since the previous callback, callback time in seconds).
 type Stamp = (u32, f64);
+/// A stamp with this frame count says the device's timestamps changed base.
+const REANCHOR: u32 = u32::MAX;
 /// Time constant of the low-pass filter on the measured fill, removing
 /// timestamp jitter before it reaches the controller.
 const FILL_FILTER_S: f64 = 0.5;
@@ -210,6 +212,10 @@ impl Tracker {
 
     fn drain_stamps(&mut self) {
         while let Ok((frames, time)) = self.stamps.pop() {
+            if frames == REANCHOR {
+                self.device_est.reanchor();
+                continue;
+            }
             self.first_stamp.get_or_insert(time);
             self.device_est.update(frames, time);
             self.last_stamp = Some(time);
@@ -393,6 +399,13 @@ impl InputDeviceSide {
     /// The device side can stall for up to `frames` (e.g. a network receiver
     /// waiting for a late packet): the target is kept at least that far above
     /// its base, within the growth limit.
+    /// The device's timestamps now come from another reference (a network
+    /// stream picked up afresh): the rate estimate keeps its rate and takes
+    /// the next timestamp as its new phase, instead of reading the step as drift.
+    pub fn restart_clock(&mut self) {
+        let _ = self.stamps.push((REANCHOR, 0.0));
+    }
+
     pub fn set_latency_floor(&self, frames: f64) {
         self.stats.floor_bits.store(frames.max(0.0).to_bits(), Ordering::Relaxed);
     }

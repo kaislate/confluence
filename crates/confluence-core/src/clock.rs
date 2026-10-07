@@ -60,6 +60,12 @@ impl RateEstimator {
         *self = Self::new(self.nominal_rate, self.bandwidth_hz);
     }
 
+    /// The timestamps' base changed (they now come from another reference):
+    /// the next one is taken as the new phase, the rate learned so far is kept.
+    pub fn reanchor(&mut self) {
+        self.started = false;
+    }
+
     pub fn update(&mut self, frames: u32, time: f64) {
         self.updates += 1;
         if !self.started || frames == 0 {
@@ -261,6 +267,32 @@ mod tests {
         }
         assert!(hi - lo < 5.0, "estimate wanders {:.1} ppm (from {lo:+.1} to {hi:+.1})", hi - lo);
         assert!((lo - true_ppm).abs() < 3.0 && (hi - true_ppm).abs() < 3.0, "[{lo:+.1}, {hi:+.1}] vs {true_ppm}");
+    }
+
+    #[test]
+    fn a_small_step_after_a_re_anchor_is_not_read_as_drift() {
+        let rate = 48_000.0 * (1.0 + 50e-6);
+        let run = |reanchor: bool| {
+            let mut est = RateEstimator::new(48_000.0, DEFAULT_RATE_BANDWIDTH_HZ);
+            let (mut frames, mut step) = (0u64, 0.0);
+            let mut worst = 0.0f64;
+            while (frames as f64) < rate * 90.0 {
+                frames += 48;
+                if frames as f64 > rate * 30.0 && step == 0.0 {
+                    step = -0.004; // the timestamps' base moves 4 ms
+                    if reanchor {
+                        est.reanchor();
+                    }
+                }
+                est.update(48, frames as f64 / rate + step);
+                if step != 0.0 {
+                    worst = worst.max((est.ppm() - 50.0).abs());
+                }
+            }
+            worst
+        };
+        assert!(run(false) > 50.0, "without a re-anchor the step is read as drift: {}", run(false));
+        assert!(run(true) < 2.0, "{}", run(true));
     }
 
     #[test]
