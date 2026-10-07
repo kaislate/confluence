@@ -54,6 +54,11 @@ fn driver_budget() -> DriverBudget {
     DriverBudget
 }
 
+/// Bindings other than the VASIO A a persisted setup opens by default.
+fn hardware(devices: &DeviceManager) -> usize {
+    devices.bindings().iter().filter(|b| b.kind != DeviceKind::Vasio).count()
+}
+
 fn points(engine: &mut Engine) -> Vec<(u32, u32)> {
     match engine.handle(&Command::ListPoints) {
         Response::Points(p) => {
@@ -150,7 +155,7 @@ fn bindings_persist_and_missing_devices_keep_their_channels() {
     assert_eq!(b_in.first_input, 2, "channels did not shift");
     // Removing the offline slot through the Control API frees its channels.
     assert_eq!(devices.handle(&mut engine, &Command::RemoveSlot { id: offline.id }), Some(Response::Ok));
-    assert_eq!(devices.bindings().len(), 1);
+    assert_eq!(hardware(&devices), 1);
 }
 
 #[test]
@@ -238,7 +243,7 @@ fn a_device_cannot_be_opened_twice_and_the_master_is_not_a_soft_slot() {
     devices.set_master("fake:m", MasterChannels { first_input: 2, inputs: 2, first_output: 2, outputs: 2 }).unwrap();
     let err = devices.add(&mut engine, DeviceKind::Asio, "fake:m").unwrap_err();
     assert!(err.contains("master"), "{err}");
-    assert_eq!(devices.bindings().len(), 1);
+    assert_eq!(hardware(&devices), 1);
 }
 
 #[test]
@@ -286,7 +291,7 @@ fn adding_an_offline_device_brings_it_back_on_its_saved_channels() {
     let a_out = slots.iter().find(|s| s.name == "fake:a out").unwrap();
     assert_eq!((a_in.first_input, a_out.first_output), (0, 0), "routes to it keep working");
     assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)], "coming back online keeps the routes");
-    assert_eq!(devices.bindings().len(), 2);
+    assert_eq!(hardware(&devices), 2);
 }
 
 #[test]
@@ -318,8 +323,8 @@ fn a_soft_device_that_becomes_the_master_is_not_opened_twice() {
     assert_eq!(opens.load(Ordering::SeqCst), 0, "the master's driver is not loaded again");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("master"), "{warnings:?}");
-    assert!(engine.slots().is_empty());
-    assert!(devices.bindings().is_empty(), "the stale soft binding is dropped");
+    assert!(engine.slots().iter().all(|s| s.name.starts_with("VASIO")), "only the default VASIO A");
+    assert_eq!(hardware(&devices), 0, "the stale soft binding is dropped");
 }
 
 #[test]
@@ -565,7 +570,7 @@ fn a_slow_driver_start_does_not_hold_up_the_manager() {
     assert!(matches!(&resp, Some(Response::Error(e)) if e.contains("starting")), "{resp:?}");
     let started = starting.join().unwrap();
     assert_eq!(devices.commit_add(&mut engine, started).unwrap(), slots);
-    assert_eq!(devices.bindings().len(), 2);
+    assert_eq!(hardware(&devices), 2);
 }
 
 /// Opens `fake:<name>` as a fake driver whose `start` takes `delay` and fails
@@ -595,7 +600,7 @@ fn a_device_that_is_still_starting_cannot_be_added_again() {
     devices.commit_add(&mut engine, started).unwrap();
     let err = devices.begin_add(DeviceKind::Asio, "fake:slow").err().expect("refused once open");
     assert!(err.contains("already open"), "{err}");
-    assert_eq!(devices.bindings().len(), 1);
+    assert_eq!(hardware(&devices), 1);
 }
 
 #[test]
@@ -645,7 +650,7 @@ fn an_offline_device_that_fails_to_start_keeps_its_channels_and_routes() {
     assert!(!a.online);
     assert_eq!((a.first_input, a.first_output), (0, 0));
     assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)], "a failed start keeps the routes");
-    assert_eq!(devices.bindings().len(), 2, "and the binding");
+    assert_eq!(hardware(&devices), 2, "and the binding");
     broken.store(false, Ordering::Release);
     devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap();
     assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)]);

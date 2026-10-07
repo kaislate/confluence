@@ -66,9 +66,10 @@ fn hardware_to_a_daw_and_back_through_vasio() {
     devices.add(&mut engine, DeviceKind::Asio, "fake:io").unwrap();
     let ids = devices.add(&mut engine, DeviceKind::Vasio, "1:2x2").unwrap();
     assert_eq!(ids.len(), 1, "one strict slot carries both directions");
-    for again in ["1", "1:8", " 1:2x2"] {
-        let err = devices.add(&mut engine, DeviceKind::Vasio, again).unwrap_err();
-        assert!(err.contains("already open"), "{again}: {err}");
+    // VASIO 1 is a position (VASIO A) that is on: adding it again with the
+    // same shape gives the same slot back (spec: slot model, AddDevice compatibility).
+    for again in ["1", " 1:2x2"] {
+        assert_eq!(devices.add(&mut engine, DeviceKind::Vasio, again).unwrap(), ids, "{again}");
     }
     let slots = engine.slots();
     let hw_in = slots.iter().find(|s| s.name == "fake:io in").unwrap().first_input;

@@ -39,9 +39,9 @@ impl Colours {
         Ok(())
     }
 
-    /// The colour chosen for slot `s`, if any.
-    pub fn of(&self, s: &SlotState) -> Option<Rgb> {
-        self.0.get(&key(s)).copied()
+    /// The colour kept under `key`, if any.
+    pub fn of_key(&self, key: &str) -> Option<Rgb> {
+        self.0.get(key).copied()
     }
 
     /// The commands that recreate every colour (for the journal).

@@ -62,8 +62,9 @@ mod app {
         #[arg(long)]
         devices: Option<PathBuf>,
         /// Master clock: `internal`, or `asio:<driver name>` (e.g. `asio:MOTU Gen 5`).
-        #[arg(long, default_value = "internal")]
-        master: String,
+        /// Default: the master saved with the devices, else the internal clock.
+        #[arg(long)]
+        master: Option<String>,
         /// Engine sample rate in Hz (internal clock; an ASIO master uses its own).
         #[arg(long, default_value_t = 48_000.0)]
         rate: f64,
@@ -487,8 +488,35 @@ mod app {
                     let h = health(&mut s);
                     return Response::Status(status(&s, &h));
                 }
-                Command::AddDevice { kind, name } => {
-                    let pending = match lock(state).devices.begin_add(*kind, name) {
+                Command::AddDevice {
+                    kind: kind @ (confluence_api::DeviceKind::Vasio | confluence_api::DeviceKind::Vaio),
+                    name,
+                } => {
+                    let mut s = lock(state);
+                    let State { engine, devices, .. } = &mut *s;
+                    return match devices.add(engine, *kind, name) {
+                        Ok(ids) => {
+                            let version = publish(&mut s);
+                            Response::Added { ids, version }
+                        }
+                        Err(e) => Response::Error(e),
+                    };
+                }
+                Command::AddDevice { .. } | Command::FillPosition { .. } => {
+                    let begun = {
+                        let mut s = lock(state);
+                        match cmd {
+                            Command::FillPosition { pos, kind, name } if !pos.group.is_virtual() => {
+                                s.devices.begin_fill(Some(*pos), *kind, name)
+                            }
+                            Command::FillPosition { pos, .. } => {
+                                Err(format!("{} is a virtual position: turn it on instead", pos.label()))
+                            }
+                            Command::AddDevice { kind, name } => s.devices.begin_add(*kind, name),
+                            _ => unreachable!("matched above"),
+                        }
+                    };
+                    let pending = match begun {
                         Ok(p) => p,
                         Err(e) => return Response::Error(e),
                     };
@@ -537,7 +565,10 @@ mod app {
                 // Removing a slot also removes its routes: rewrite the journal
                 // so they do not come back, on other devices, after a restart.
                 let saved = match cmd {
-                    Command::RemoveSlot { .. } => journal.compact(&state_commands(engine)),
+                    Command::RemoveSlot { .. }
+                    | Command::ClearPosition { .. }
+                    | Command::SetVirtual { .. }
+                    | Command::SetMaster { .. } => journal.compact(&state_commands(engine)),
                     _ if cmd.is_mutation() => journal.append(&journal_form(engine, cmd)),
                     _ => Ok(()),
                 };
@@ -545,7 +576,15 @@ mod app {
                     publish(&mut s);
                     return Response::Error(format!("applied but not saved: {e}"));
                 }
-                if cmd.is_mutation() || matches!(cmd, Command::RemoveSlot { .. }) {
+                if cmd.is_mutation()
+                    || matches!(
+                        cmd,
+                        Command::RemoveSlot { .. }
+                            | Command::ClearPosition { .. }
+                            | Command::SetVirtual { .. }
+                            | Command::SetMaster { .. }
+                    )
+                {
                     // Published before the reply, so its version includes this change.
                     return Response::Applied { version: publish(&mut s) };
                 }
@@ -624,11 +663,19 @@ mod app {
         let (mut journal, replay) =
             Journal::open(&args.journal.clone().unwrap_or_else(|| data_dir().join("journal.bin")))?;
 
+        // The saved devices name the master, if no --master does.
+        let devices_file = args.devices.clone().unwrap_or_else(|| data_dir().join("devices.json"));
+        let (mut devices, mut warnings) = DeviceManager::open_file(devices_file.clone());
+        let master_arg = args
+            .master
+            .clone()
+            .or_else(|| devices.saved_master_name().map(|n| format!("asio:{n}")))
+            .unwrap_or_else(|| "internal".into());
         // An ASIO master fixes the engine's rate and block: open it first.
-        let asio_master = match args.master.strip_prefix("asio:") {
+        let asio_master = match master_arg.strip_prefix("asio:") {
             Some(name) => Some((name.to_string(), AsioDevice::open_installed(name)?)),
-            None if args.master == "internal" => None,
-            None => return Err(format!("unknown master '{}': use internal or asio:<name>", args.master).into()),
+            None if master_arg == "internal" => None,
+            None => return Err(format!("unknown master '{master_arg}': use internal or asio:<name>").into()),
         };
         let (rate, block) = match &asio_master {
             Some((_, dev)) => (dev.info().sample_rate, dev.info().preferred_block.max(1) as usize),
@@ -659,8 +706,6 @@ mod app {
         let scanner = Scanner::start(exe.clone(), plugin_dirs);
         journal.compact(&state_commands(&mut engine))?;
 
-        let devices_file = args.devices.clone().unwrap_or_else(|| data_dir().join("devices.json"));
-        let (mut devices, mut warnings) = DeviceManager::open_file(devices_file.clone());
         if let Some(net) = start_net(&args, &devices_file) {
             devices = devices.with_net(net);
         }
@@ -694,7 +739,7 @@ mod app {
         // so a slow enumeration never delays the engine's start.
         let device_list = Arc::new(Mutex::new(Vec::new()));
         let first = EngineStatus {
-            master: args.master.clone(),
+            master: master_arg.clone(),
             sample_rate: rate,
             block: block as u32,
             blocks: 0,
@@ -709,7 +754,7 @@ mod app {
             devices,
             publisher,
             device_list: device_list.clone(),
-            master: args.master.clone(),
+            master: master_arg.clone(),
             plugin_thread,
             scanner,
             exe,

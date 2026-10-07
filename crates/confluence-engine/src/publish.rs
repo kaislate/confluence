@@ -97,7 +97,7 @@ pub fn published_state(
         midi_learning: None,
         scripts: Vec::new(),
         peers: devices.peers(),
-        positions: Vec::new(),
+        positions: devices.positions(engine),
     }
 }
 

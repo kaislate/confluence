@@ -288,6 +288,8 @@ enum SlotStats {
 struct SlotRecord {
     state: SlotState,
     stats: SlotStats,
+    /// Overrides the colour key (a device slot's position, `pos:asio:3`).
+    color_key: Option<String>,
 }
 
 pub struct Engine {
@@ -434,7 +436,7 @@ impl Engine {
         self.next_id += 1;
         self.soft_inputs += 1;
         let state = self.state(id, &spec.name, &spec.device, ClockRole::Soft, (first, spec.channels as u32), (0, 0));
-        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats) });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats), color_key: None });
         Ok((id, device))
     }
 
@@ -461,7 +463,7 @@ impl Engine {
         self.next_id += 1;
         self.soft_outputs += 1;
         let state = self.state(id, &spec.name, &spec.device, ClockRole::Soft, (0, 0), (first, spec.channels as u32));
-        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats) });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats), color_key: None });
         Ok((id, device))
     }
 
@@ -492,7 +494,7 @@ impl Engine {
             (first_input, spec.inputs as u32),
             (first_output, spec.outputs as u32),
         );
-        self.slots.push(SlotRecord { state, stats: SlotStats::Master });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Master, color_key: None });
         let ch = MasterChannels {
             first_input: first_input as usize,
             inputs: spec.inputs,
@@ -552,7 +554,7 @@ impl Engine {
             (first_input, spec.inputs as u32),
             (first_output, spec.outputs as u32),
         );
-        self.slots.push(SlotRecord { state, stats: SlotStats::Strict(stats) });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Strict(stats), color_key: None });
         Ok((id, ch))
     }
 
@@ -610,7 +612,7 @@ impl Engine {
         self.buses += 1;
         self.plan_dirty = true;
         let state = self.state(id, &spec.name, BUS_DEVICE, ClockRole::Strict, (first_input, ch), (first_output, ch));
-        self.slots.push(SlotRecord { state, stats: SlotStats::Bus(faults) });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Bus(faults), color_key: None });
         Ok(id)
     }
 
@@ -1022,7 +1024,7 @@ impl Engine {
             (spec.first_output, spec.outputs),
         );
         state.online = false;
-        self.slots.push(SlotRecord { state, stats: SlotStats::None });
+        self.slots.push(SlotRecord { state, stats: SlotStats::None, color_key: None });
         Ok(id)
     }
 
@@ -1123,12 +1125,26 @@ impl Engine {
 
     /// Current slot list (same data as `Command::ListSlots`).
     pub fn slots(&self) -> Vec<SlotState> {
-        self.slots.iter().map(|s| SlotState { color: self.colours.of(&s.state), ..s.state.clone() }).collect()
+        self.slots
+            .iter()
+            .map(|s| SlotState { color: self.colours.of_key(&Self::key_of(s)), ..s.state.clone() })
+            .collect()
+    }
+
+    fn key_of(s: &SlotRecord) -> String {
+        s.color_key.clone().unwrap_or_else(|| colours::key(&s.state))
     }
 
     /// The key slot `id`'s colour is kept under (see [`Command::SetColor`]).
     pub fn color_key(&self, id: u32) -> Option<String> {
-        self.slots.iter().find(|s| s.state.id == id).map(|s| colours::key(&s.state))
+        self.slots.iter().find(|s| s.state.id == id).map(Self::key_of)
+    }
+
+    /// Keys slot `id`'s colour by `key` (its position) instead of its device.
+    pub fn set_color_key(&mut self, id: u32, key: Option<String>) {
+        if let Some(s) = self.slots.iter_mut().find(|s| s.state.id == id) {
+            s.color_key = key;
+        }
     }
 
     /// The commands that recreate every colour chosen (for the journal).
