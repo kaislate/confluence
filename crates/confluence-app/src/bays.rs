@@ -32,6 +32,17 @@ impl Bay {
         }
     }
 
+    /// The bay's descriptive title (the default; one word with "Short bay titles").
+    pub fn description(self) -> &'static str {
+        match self {
+            Bay::Hardware => "Audio interfaces",
+            Bay::Windows => "Windows playback & recording",
+            Bay::Virtual => "Virtual devices for DAWs",
+            Bay::Network => "Network streams",
+            Bay::Apps => "Captured apps",
+        }
+    }
+
     /// The bay's colour: its strip, label and its devices' names on the bridge.
     pub fn color(self) -> Color32 {
         match self {

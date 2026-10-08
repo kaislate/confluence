@@ -22,6 +22,8 @@ pub struct ViewPrefs {
     /// "Enable advanced options" (Settings): power-user choices such as
     /// capturing an app by process name or PID.
     pub advanced: bool,
+    /// One-word bay titles ("HARDWARE") instead of descriptive ones.
+    pub short_bay_titles: bool,
 }
 
 impl Default for ViewPrefs {
@@ -31,6 +33,7 @@ impl Default for ViewPrefs {
             only_custom_names: false,
             bridge: BridgePrefs::default(),
             advanced: false,
+            short_bay_titles: false,
         }
     }
 }

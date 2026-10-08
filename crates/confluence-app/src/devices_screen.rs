@@ -644,26 +644,29 @@ fn bay(
 ) {
     let p = ui.painter_at(r.expand(4.0));
     paint::recess(&p, r, skin, 16);
-    let colour = bv.bay.color();
-    let strip = Rect::from_min_size(r.min + Vec2::new(BAY_PAD + 2.0, 15.0), Vec2::new(20.0, 3.0));
-    p.rect_filled(strip, egui::CornerRadius::same(2), colour);
-    p.rect_filled(strip.expand(2.0), egui::CornerRadius::same(3), paint::alpha(colour, 0.18));
-    let title = bv.bay.title().to_uppercase();
-    let text = paint::etched_text(
-        &p,
-        Pos2::new(strip.right() + 8.0, strip.center().y),
-        Align2::LEFT_CENTER,
-        &title,
-        skin,
-        skin.ground_ink,
-        10.5,
-        true,
-        0.16,
-        0.82,
-    );
+    // The title: descriptive, or one word with "Short bay titles"; it
+    // leaves room for the expander on the right.
+    let expander_w = if bv.hidden > 0 || st.expanded.contains(&bv.bay) { 84.0 } else { 0.0 };
+    let at = Pos2::new(r.left() + BAY_PAD + 2.0, r.top() + 16.0);
+    let title = if prefs.short_bay_titles {
+        let title = bv.bay.title().to_uppercase();
+        paint::etched_text(&p, at, Align2::LEFT_CENTER, &title, skin, skin.ground_ink, 10.5, true, 0.16, 0.82);
+        title
+    } else {
+        let title = bv.bay.description().to_string();
+        paint::truncated(
+            &p,
+            at,
+            Align2::LEFT_CENTER,
+            &title,
+            paint::font(ui.ctx(), "label-bold", 12.5),
+            paint::alpha(skin.ground_ink, 0.85),
+            r.width() - 2.0 * BAY_PAD - expander_w - 4.0,
+        );
+        title
+    };
     let (_, label) = ui.allocate_exact_size(Vec2::ZERO, Sense::hover());
     label.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &title));
-    let _ = text;
     // The expander: every position of the bay, or back to the devices.
     let expanded = st.expanded.contains(&bv.bay);
     if bv.hidden > 0 || expanded {
@@ -1703,7 +1706,7 @@ mod tests {
         let low = Rect::from_min_size(Pos2::new(800.0, 700.0), Vec2::new(240.0, 190.0));
         let (at, above) = popover_pos(low, screen);
         assert!(above, "no room below: its bottom sits over the tray");
-        assert_eq!(at, Pos2::new(700.0, 692.0), "pulled in from the right edge");
+        assert_eq!(at, Pos2::new(1000.0 - POPOVER_W, 692.0), "pulled in from the right edge");
         let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 500.0));
         assert_eq!(popover_pos(tray, short), (Pos2::new(100.0, 8.0), false), "neither fits: pinned to the top");
     }

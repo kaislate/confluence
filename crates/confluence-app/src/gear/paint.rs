@@ -499,11 +499,6 @@ fn pill_body(p: &Painter, r: Rect, s: &GearSkin, pressed: f32, lit: bool) {
         Stroke::new(1.0, Color32::from_black_alpha(if light { 60 } else { 120 })),
         StrokeKind::Inside,
     );
-    // The light below its bottom edge.
-    p.line_segment(
-        [Pos2::new(r.left() + 10.0, r.bottom() + 0.5), Pos2::new(r.right() - 10.0, r.bottom() + 0.5)],
-        Stroke::new(1.0, Color32::from_white_alpha((s.etch * 200.0 * (1.0 - pressed)) as u8)),
-    );
 }
 
 /// A glass pill button.

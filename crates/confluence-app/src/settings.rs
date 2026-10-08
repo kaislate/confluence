@@ -24,6 +24,8 @@ const NAV_W: f32 = 180.0;
 /// Panes sit side by side from this content width.
 const TWO_COLUMNS: f32 = 1100.0;
 const PANE_PAD: f32 = 16.0;
+/// The Names pane's height (two switches and a preview).
+const NAMES_H: f32 = 222.0;
 /// The chosen tile's outline.
 const GOLD: Color32 = Color32::from_rgb(0xf3, 0xc2, 0x4f);
 
@@ -96,15 +98,15 @@ pub fn screen(
         // Names and Motion: side by side on wide screens.
         let half = if two { (width - 16.0) / 2.0 } else { width };
         let (names, motion_r) = if two {
-            let (row, _) = ui.allocate_exact_size(Vec2::new(width, 170.0), Sense::hover());
-            let a = Rect::from_min_size(row.min, Vec2::new(half, 170.0));
-            let b = Rect::from_min_size(row.min + Vec2::new(half + 16.0, 0.0), Vec2::new(half, 170.0));
+            let (row, _) = ui.allocate_exact_size(Vec2::new(width, NAMES_H), Sense::hover());
+            let a = Rect::from_min_size(row.min, Vec2::new(half, NAMES_H));
+            let b = Rect::from_min_size(row.min + Vec2::new(half + 16.0, 0.0), Vec2::new(half, NAMES_H));
             pane_at(ui, a, "NAMES", "What cards and the bridge call a device.", skin);
             pane_at(ui, b, "MOTION", "Springs, fades and sliding panels.", skin);
             ui.add_space(16.0);
             (a, b)
         } else {
-            let a = pane(ui, width, 170.0, "NAMES", "What cards and the bridge call a device.", skin);
+            let a = pane(ui, width, NAMES_H, "NAMES", "What cards and the bridge call a device.", skin);
             let b = pane(ui, width, 170.0, "MOTION", "Springs, fades and sliding panels.", skin);
             (a, b)
         };
@@ -300,8 +302,17 @@ fn names_pane(ui: &mut egui::Ui, r: Rect, prefs: &mut ViewPrefs, skin: &GearSkin
         "Hide the device's own name where you've named it.",
         skin,
     );
+    let sw2 = sw.translate(Vec2::new(0.0, 48.0));
+    paint::switch(
+        ui,
+        sw2,
+        &mut prefs.short_bay_titles,
+        "Short bay titles",
+        "One word over each group of devices (Hardware, Windows, Virtual\u{2026}).",
+        skin,
+    );
     // A mini card: its device-name line goes when only custom names show.
-    let card = Rect::from_min_size(r.min + Vec2::new(PANE_PAD, 104.0), Vec2::new(190.0, 54.0));
+    let card = Rect::from_min_size(r.min + Vec2::new(PANE_PAD, 154.0), Vec2::new(190.0, 54.0));
     let p = ui.painter();
     paint::panel(p, card, skin, None);
     let ink = skin.ink;

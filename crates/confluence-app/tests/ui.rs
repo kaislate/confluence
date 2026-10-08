@@ -817,7 +817,17 @@ fn devices_sit_in_bays_by_type() {
     let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
     h.get_by_label("Devices").click();
-    pump_until(&mut h, "the bays", LONG, |h| h.query_by_label("HARDWARE").is_some());
+    // Descriptive titles by default…
+    pump_until(&mut h, "the bays", LONG, |h| h.query_by_label("Audio interfaces").is_some());
+    for bay in ["Windows playback & recording", "Virtual devices for DAWs", "Network streams", "Captured apps"] {
+        assert!(h.query_by_label(bay).is_some(), "{bay}");
+    }
+    assert!(h.query_by_label("HARDWARE").is_none());
+    // …and one word each with "Short bay titles".
+    let mut prefs = h.state().prefs().clone();
+    prefs.short_bay_titles = true;
+    h.state_mut().set_prefs(prefs);
+    pump_until(&mut h, "short titles", LONG, |h| h.query_by_label("HARDWARE").is_some());
     for bay in ["WINDOWS", "VIRTUAL", "NETWORK", "APPS"] {
         assert!(h.query_by_label(bay).is_some(), "{bay}");
     }
@@ -948,7 +958,18 @@ fn ctrl_3_opens_settings_and_advanced_options_start_off() {
     h.get_by_label("Enable advanced options").click();
     settle(&mut h);
     assert!(h.state().prefs().advanced);
-    for label in ["Graphite", "Candy", "Silver", "Segments", "Solid", "Single line", "White", "Red", "Reduce motion"] {
+    for label in [
+        "Graphite",
+        "Candy",
+        "Silver",
+        "Segments",
+        "Solid",
+        "Single line",
+        "White",
+        "Red",
+        "Reduce motion",
+        "Short bay titles",
+    ] {
         assert!(h.query_by_label(label).is_some(), "{label}");
     }
     client(&d).call(Command::Shutdown).unwrap();
