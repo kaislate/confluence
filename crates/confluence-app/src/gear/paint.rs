@@ -43,6 +43,16 @@ pub fn alpha(c: Color32, a: f32) -> Color32 {
     c.gamma_multiply(a.clamp(0.0, 1.0))
 }
 
+/// How far in from the side a corner of `radius` starts, `dy` from the top
+/// (or bottom) edge.
+pub fn corner_inset(radius: f32, dy: f32) -> f32 {
+    if dy >= radius {
+        return 0.0;
+    }
+    let k = radius - dy.max(0.0);
+    radius - (radius * radius - k * k).max(0.0).sqrt()
+}
+
 /// A strip fading from `from` at one edge to `to` at the other: `vertical`
 /// fades top to bottom, otherwise left to right.
 pub fn fade(p: &Painter, r: Rect, from: Color32, to: Color32, vertical: bool) {
@@ -87,39 +97,103 @@ fn rounded_outline(r: Rect, radius: f32) -> Vec<(Pos2, Vec2)> {
     out
 }
 
-/// A rounded rectangle filled with `colour_at` (sampled on rings from the
-/// centre to the edge, so smooth gradients need no texture), its edge
-/// antialiased by a one-pixel feather.
-fn rounded_fill(p: &Painter, r: Rect, radius: f32, colour_at: impl Fn(Pos2) -> Color32) {
-    const RINGS: usize = 6;
-    let outline = rounded_outline(r, radius);
-    let n = outline.len() as u32;
-    let c = r.center();
-    let mut m = Mesh::default();
-    m.colored_vertex(c, colour_at(c));
-    for k in 1..=RINGS {
-        let t = k as f32 / RINGS as f32;
-        for (pt, _) in &outline {
-            let q = c + (*pt - c) * t;
-            m.colored_vertex(q, colour_at(q));
+/// Inward offsets of the rings a rounded mesh is built from: dense at the
+/// edge, where insets, bevels and reflections change fastest.
+const RING_OFFSETS: [f32; 12] = [0.0, 1.0, 2.0, 3.0, 4.5, 6.0, 8.0, 10.0, 13.0, 17.0, 24.0, 36.0];
+
+/// A mesh covering a rounded rectangle exactly: concentric rounded rings
+/// (each `RING_OFFSETS` step further in, the corner radius shrinking with
+/// it), a fan to the centre, and a one-pixel feather outside the edge so
+/// the curve is antialiased. `vertex` gives each point's colour from its
+/// position, its distance in from the edge and its outward normal; `uv`
+/// maps positions to texture coordinates (for a textured mesh).
+fn ring_mesh(
+    p: &Painter,
+    r: Rect,
+    radius: f32,
+    texture: Option<egui::TextureId>,
+    uv: impl Fn(Pos2) -> Pos2,
+    vertex: impl Fn(Pos2, f32, Vec2) -> Color32,
+) -> Mesh {
+    let half = (r.width().min(r.height()) / 2.0).max(0.0);
+    let rings: Vec<f32> = RING_OFFSETS.iter().copied().filter(|d| *d < half - 0.25).collect();
+    let mut m = match texture {
+        Some(t) => Mesh::with_texture(t),
+        None => Mesh::default(),
+    };
+    let add = |m: &mut Mesh, pos: Pos2, colour: Color32| {
+        m.vertices.push(egui::epaint::Vertex { pos, uv: uv(pos), color: colour });
+    };
+    let mut n = 0u32;
+    for &d in &rings {
+        let outline = rounded_outline(r.shrink(d), (radius - d).max(0.0));
+        n = outline.len() as u32;
+        for (pt, normal) in outline {
+            add(&mut m, pt, vertex(pt, d, normal));
         }
     }
     let feather = p.ctx().pixels_per_point().recip();
-    for (pt, normal) in &outline {
-        m.colored_vertex(*pt + *normal * feather, Color32::TRANSPARENT);
+    for (pt, normal) in rounded_outline(r, radius.max(0.0)) {
+        let q = pt + normal * feather;
+        add(&mut m, q, Color32::TRANSPARENT);
     }
-    let ring = |k: u32, i: u32| 1 + (k - 1) * n + (i % n);
-    for i in 0..n {
-        m.add_triangle(0, ring(1, i), ring(1, i + 1));
-    }
-    for k in 1..=RINGS as u32 {
+    let c = r.center();
+    add(&mut m, c, vertex(c, half, Vec2::ZERO));
+    let k = rings.len() as u32;
+    let at = |ring: u32, i: u32| ring * n + (i % n);
+    let (feather_ring, centre) = (k, (k + 1) * n);
+    let quad = |m: &mut Mesh, a: u32, b: u32| {
         for i in 0..n {
-            let (a, b, cc, d) = (ring(k, i), ring(k, i + 1), ring(k + 1, i + 1), ring(k + 1, i));
-            m.add_triangle(a, b, cc);
-            m.add_triangle(a, cc, d);
+            let (p0, p1, p2, p3) = (at(a, i), at(a, i + 1), at(b, i + 1), at(b, i));
+            m.add_triangle(p0, p1, p2);
+            m.add_triangle(p0, p2, p3);
         }
+    };
+    quad(&mut m, feather_ring, 0);
+    for ring in 0..k.saturating_sub(1) {
+        quad(&mut m, ring, ring + 1);
     }
-    p.add(Shape::mesh(m));
+    for i in 0..n {
+        m.add_triangle(centre, at(k - 1, i), at(k - 1, i + 1));
+    }
+    m
+}
+
+/// A rounded rectangle filled with `colour_at` (smooth gradients need no
+/// texture), its edge antialiased.
+fn rounded_fill(p: &Painter, r: Rect, radius: f32, colour_at: impl Fn(Pos2) -> Color32) {
+    p.add(Shape::mesh(plain_mesh(p, r, radius, |q, _, _| colour_at(q))));
+}
+
+/// An untextured ring mesh. It draws with the font atlas, so every vertex
+/// takes the atlas's white texel (anything else picks up glyph pixels).
+fn plain_mesh(p: &Painter, r: Rect, radius: f32, vertex: impl Fn(Pos2, f32, Vec2) -> Color32) -> Mesh {
+    ring_mesh(p, r, radius, None, |_| egui::epaint::WHITE_UV, vertex)
+}
+
+/// A rounded rectangle shaded by `vertex` (position, distance in from the
+/// edge, outward normal).
+pub fn rounded_shade(p: &Painter, r: Rect, radius: f32, vertex: impl Fn(Pos2, f32, Vec2) -> Color32) {
+    p.add(Shape::mesh(plain_mesh(p, r, radius, vertex)));
+}
+
+/// White at `white` over black at `black` (both 0..1), premultiplied.
+fn light_dark(white: f32, black: f32) -> Color32 {
+    let w = (white.clamp(0.0, 1.0) * 255.0).round();
+    let b = (black.clamp(0.0, 1.0) * 255.0).round();
+    Color32::from_rgba_premultiplied(w as u8, w as u8, w as u8, (w + b).min(255.0) as u8)
+}
+
+/// A glass reflection over the top `reach` (0..1) of a rounded shape,
+/// `strength` at the top edge fading to nothing.
+fn reflection(p: &Painter, r: Rect, radius: f32, strength: f32, reach: f32, top_shade: f32) {
+    let h = r.height().max(1.0);
+    rounded_shade(p, r, radius, move |q, d, n| {
+        let y = (q.y - r.top()) / h;
+        let glass = strength * (1.0 - y / reach).max(0.0);
+        let shade = top_shade * (-n.y).max(0.0) * (1.0 - d / 4.0).max(0.0);
+        light_dark(glass, shade)
+    });
 }
 
 /// The panel's radial gradient at `q`: light at 28% / 18% of the panel,
@@ -242,6 +316,23 @@ pub fn grain(p: &Painter, r: Rect, s: &GearSkin, k: f32) {
     p.image(tex.id(), r, uv, tint);
 }
 
+/// Grain over a rounded rectangle (it stays inside the corners).
+pub fn grain_rounded(p: &Painter, r: Rect, radius: f32, s: &GearSkin, k: f32) {
+    if k <= 0.0 {
+        return;
+    }
+    let ctx = p.ctx();
+    let tex = grain_texture(ctx, s.grain_light);
+    let scale = ctx.pixels_per_point() / 128.0;
+    let tint = if s.grain_light {
+        Color32::from_white_alpha((k * 255.0) as u8)
+    } else {
+        Color32::from_black_alpha((k * 255.0) as u8)
+    };
+    let mesh = ring_mesh(p, r, radius, Some(tex.id()), |q| Pos2::new(q.x * scale, q.y * scale), |_, _, _| tint);
+    p.add(Shape::mesh(mesh));
+}
+
 /// Darkens toward the corners of `r` by `k` at the farthest corner.
 pub fn vignette(p: &Painter, r: Rect, k: f32) {
     let c = r.center();
@@ -259,28 +350,31 @@ pub fn seam(p: &Painter, from: Pos2, to: Pos2, s: &GearSkin) {
     p.line_segment([from + below, to + below], Stroke::new(1.0, Color32::from_white_alpha((s.etch * 160.0) as u8)));
 }
 
-/// Insets a recess: dark top and left, light bottom and right.
-fn inset(p: &Painter, r: Rect, depth: f32, dark: f32, light: f32) {
-    let d = depth.min(r.height() / 2.0).min(r.width() / 2.0);
-    let black = Color32::from_black_alpha((dark * 255.0) as u8);
-    let white = Color32::from_white_alpha((light * 255.0) as u8);
-    fade(p, Rect::from_min_size(r.min, Vec2::new(r.width(), d)), black, Color32::TRANSPARENT, true);
-    fade(p, Rect::from_min_size(r.min, Vec2::new(d, r.height())), black, Color32::TRANSPARENT, false);
-    fade(p, Rect::from_min_max(Pos2::new(r.left(), r.bottom() - d), r.max), Color32::TRANSPARENT, white, true);
-    fade(p, Rect::from_min_max(Pos2::new(r.right() - d, r.top()), r.max), Color32::TRANSPARENT, white, false);
+/// Insets a recess with corner `radius`: dark along the top and left edges,
+/// light along the bottom and right, fading in over `depth` and following
+/// the corners' curve.
+fn inset(p: &Painter, r: Rect, radius: f32, depth: f32, dark: f32, light: f32) {
+    let depth = depth.max(1.0);
+    rounded_shade(p, r, radius, move |_, d, n| {
+        let t = (1.0 - d / depth).max(0.0);
+        let t = t * t;
+        let shadowed = ((-n.x).max(0.0) + (-n.y).max(0.0)).min(1.0);
+        let lit = (n.x.max(0.0) + n.y.max(0.0)).min(1.0);
+        light_dark(light * lit * t, dark * shadowed * t)
+    });
 }
 
 /// A recessed tray inside a panel (meters sit in one).
 pub fn tray(p: &Painter, r: Rect, s: &GearSkin) {
     p.rect_filled(r, CornerRadius::same(6), s.well);
-    inset(p, r, 10.0, 0.22, 0.35 * s.hl.max(0.15));
+    inset(p, r, 6.0, 10.0, 0.22, 0.35 * s.hl.max(0.15));
 }
 
 /// A recess cut into the ground (an empty position, the matrix bed).
 pub fn recess(p: &Painter, r: Rect, s: &GearSkin, radius: u8) {
     p.rect_filled(r, CornerRadius::same(radius), s.bed);
-    grain(p, r, s, s.grain * 0.6);
-    inset(p, r, 12.0, if s.light() { 0.14 } else { 0.35 }, 0.25 * s.etch);
+    grain_rounded(p, r, radius as f32, s, s.grain * 0.6);
+    inset(p, r, radius as f32, 12.0, if s.light() { 0.14 } else { 0.35 }, 0.25 * s.etch);
     p.rect_stroke(
         r,
         CornerRadius::same(radius),
@@ -321,8 +415,9 @@ pub fn oled_well(p: &Painter, r: Rect, s: &GearSkin) {
     // Scanlines.
     let mut y = r.top() + 2.0;
     while y < r.bottom() - 1.0 {
+        let x = 2.0 + corner_inset(8.0, (y - r.top()).min(r.bottom() - y));
         p.line_segment(
-            [Pos2::new(r.left() + 2.0, y), Pos2::new(r.right() - 2.0, y)],
+            [Pos2::new(r.left() + x, y), Pos2::new(r.right() - x, y)],
             Stroke::new(1.0, Color32::from_white_alpha(8)),
         );
         y += 3.0;
@@ -369,13 +464,7 @@ fn pill_body(p: &Painter, r: Rect, s: &GearSkin, pressed: f32, lit: bool) {
     let light = s.light();
     if lit {
         p.rect_filled(r, radius, s.accent);
-        fade(
-            p,
-            Rect::from_min_size(r.min, Vec2::new(r.width(), r.height() * 0.5)),
-            Color32::from_white_alpha(70),
-            Color32::TRANSPARENT,
-            true,
-        );
+        reflection(p, r, r.height() / 2.0, 70.0 / 255.0, 0.5, 0.0);
         p.rect_stroke(r, radius, Stroke::new(1.0, Color32::from_black_alpha(90)), StrokeKind::Inside);
         return;
     }
@@ -386,22 +475,10 @@ fn pill_body(p: &Painter, r: Rect, s: &GearSkin, pressed: f32, lit: bool) {
         Color32::from_white_alpha((16.0 - 8.0 * pressed) as u8)
     };
     p.rect_filled(r, radius, body);
-    // The glass reflection on the top half.
-    fade(
-        p,
-        Rect::from_min_size(r.min + Vec2::new(0.0, 1.0), Vec2::new(r.width(), r.height() * 0.5)),
-        Color32::from_white_alpha((s.glass * 255.0 * (1.0 - 0.5 * pressed)) as u8),
-        Color32::TRANSPARENT,
-        true,
-    );
-    // The top shade (the pill sits in a recess) and the outline.
-    fade(
-        p,
-        Rect::from_min_size(r.min + Vec2::new(6.0, 0.0), Vec2::new(r.width() - 12.0, 4.0)),
-        Color32::from_black_alpha((50.0 + 50.0 * pressed) as u8),
-        Color32::TRANSPARENT,
-        true,
-    );
+    // The glass reflection on the top half, and the top shade (the pill
+    // sits in a recess), both inside the pill's rounded ends.
+    let glass = s.glass * (1.0 - 0.5 * pressed);
+    reflection(p, r, r.height() / 2.0, glass, 0.5, (50.0 + 50.0 * pressed) / 255.0);
     p.rect_stroke(
         r,
         radius,
@@ -781,13 +858,7 @@ pub fn raised(p: &Painter, r: Rect, color: Color32, radius: f32) {
     let cr = CornerRadius::same(radius as u8);
     p.rect_filled(r.translate(Vec2::new(1.0, 1.5)), cr, Color32::from_black_alpha(90));
     p.rect_filled(r, cr, color);
-    fade(
-        p,
-        Rect::from_min_size(r.min, Vec2::new(r.width(), r.height() * 0.5)),
-        Color32::from_white_alpha(60),
-        Color32::TRANSPARENT,
-        true,
-    );
+    reflection(p, r, radius, 60.0 / 255.0, 0.5, 0.0);
     p.line_segment(
         [r.left_top() + Vec2::new(radius, 0.5), r.right_top() + Vec2::new(-radius, 0.5)],
         Stroke::new(1.0, Color32::from_white_alpha(110)),
@@ -801,6 +872,55 @@ pub fn raised(p: &Painter, r: Rect, color: Color32, radius: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Distance by which `q` lies outside the rounded rectangle (0 inside).
+    fn outside(r: Rect, radius: f32, q: Pos2) -> f32 {
+        let rad = radius.min(r.width() / 2.0).min(r.height() / 2.0);
+        let inner = r.shrink(rad);
+        let dx = (inner.left() - q.x).max(q.x - inner.right()).max(0.0);
+        let dy = (inner.top() - q.y).max(q.y - inner.bottom()).max(0.0);
+        ((dx * dx + dy * dy).sqrt() - rad).max(0.0)
+    }
+
+    #[test]
+    fn shading_meshes_stay_inside_their_rounded_corners() {
+        let ctx = egui::Context::default();
+        let p = Painter::new(ctx, egui::LayerId::background(), Rect::EVERYTHING);
+        for (r, radius) in [
+            (Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(236.0, 188.0)), 16.0),
+            (Rect::from_min_size(Pos2::ZERO, Vec2::new(80.0, 24.0)), 12.0),
+            (Rect::from_min_size(Pos2::ZERO, Vec2::new(212.0, 30.0)), 6.0),
+            (Rect::from_min_size(Pos2::ZERO, Vec2::new(18.0, 18.0)), 4.0),
+        ] {
+            let m = ring_mesh(&p, r, radius, None, |_| egui::epaint::WHITE_UV, |_, _, _| Color32::WHITE);
+            let feather = 1.0 + 1e-3;
+            for v in &m.vertices {
+                let out = outside(r, radius, v.pos);
+                assert!(out <= feather, "{:?} is {out} px outside {r:?} r{radius}", v.pos);
+                if v.color != Color32::TRANSPARENT {
+                    assert!(out <= 1e-3, "a coloured vertex {:?} is {out} px outside", v.pos);
+                }
+            }
+            assert!(m.indices.iter().all(|&i| (i as usize) < m.vertices.len()));
+        }
+    }
+
+    #[test]
+    fn plain_shading_samples_the_white_texel() {
+        let ctx = egui::Context::default();
+        let p = Painter::new(ctx, egui::LayerId::background(), Rect::EVERYTHING);
+        let r = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(236.0, 188.0));
+        let m = plain_mesh(&p, r, 16.0, |_, _, _| Color32::RED);
+        assert!(m.vertices.iter().all(|v| v.uv == egui::epaint::WHITE_UV));
+    }
+
+    #[test]
+    fn scanlines_stop_where_the_corner_curves() {
+        assert_eq!(corner_inset(8.0, 8.0), 0.0);
+        assert_eq!(corner_inset(8.0, 20.0), 0.0);
+        assert!((corner_inset(8.0, 0.0) - 8.0).abs() < 1e-4);
+        assert!(corner_inset(8.0, 2.0) > 1.5 && corner_inset(8.0, 2.0) < 8.0);
+    }
 
     #[test]
     fn shade_and_light_blend_like_the_mockup() {
