@@ -207,7 +207,8 @@ pub fn show_bridge(
             );
             let mrect = Rect::from_min_max(Pos2::new(dev.left(), top + NAME_ROW), dev.max);
             let m = oled_meter::meter_widget(ui, id.with(&d.key), mrect, &d.groups, &geom, look, motion);
-            let what = format!("Bridge: {} \u{b7} {}", d.tag, d.name);
+            // "Bridge: VASIO A, Ableton" (unlike the card's "VASIO A · Ableton").
+            let what = format!("Bridge: {}, {}", d.tag, d.name);
             m.response.widget_info(|| WidgetInfo::labeled(WidgetType::Other, true, &what));
             x += meter_w + DEVICE_GAP;
         }
