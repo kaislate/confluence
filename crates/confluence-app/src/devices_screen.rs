@@ -511,6 +511,9 @@ fn card(
     let empty = p.status == PositionStatus::Empty;
     let off = p.status == PositionStatus::Off;
     let resp = ui.interact(r, id, Sense::click());
+    if st.picker == Some(p.pos) {
+        st.picker_anchor = r; // the popover follows its tray while the screen scrolls
+    }
     let enabled = ui.is_enabled();
     let label = card_label(&f, empty);
     resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &label));
@@ -902,19 +905,24 @@ fn held_elsewhere(d: &DeviceInfo, pos: PosId, positions: &[PositionState]) -> Op
         .map(|p| p.pos)
 }
 
-/// Where a popover of `size` anchored to `anchor` goes: under it, or above
-/// when there is no room, kept inside `screen`.
-pub fn popover_pos(anchor: Rect, size: Vec2, screen: Rect) -> Pos2 {
+/// The picker popover's width, and the most it can grow to.
+pub const POPOVER_W: f32 = 300.0;
+pub const POPOVER_MAX_H: f32 = 440.0;
+
+/// Where a popover anchored to `anchor` goes, kept inside `screen`: its
+/// top-left corner under the tray, or (true) its bottom-left corner above
+/// it when the room below is short. Decided from the largest size the
+/// popover can take, so it never jumps once it has measured itself.
+pub fn popover_pos(anchor: Rect, screen: Rect) -> (Pos2, bool) {
     let gap = 8.0;
-    let mut x = anchor.left();
-    let mut y = anchor.bottom() + gap;
-    if y + size.y > screen.bottom() {
-        y = (anchor.top() - gap - size.y).max(screen.top());
+    let x = anchor.left().min(screen.right() - POPOVER_W).max(screen.left());
+    if anchor.bottom() + gap + POPOVER_MAX_H <= screen.bottom() {
+        (Pos2::new(x, anchor.bottom() + gap), false)
+    } else if anchor.top() - gap - POPOVER_MAX_H >= screen.top() {
+        (Pos2::new(x, anchor.top() - gap), true)
+    } else {
+        (Pos2::new(x, screen.top() + gap), false)
     }
-    if x + size.x > screen.right() {
-        x = (screen.right() - size.x).max(screen.left());
-    }
-    Pos2::new(x, y)
 }
 
 /// A device row in the picker; `disabled` rows say why.
@@ -986,143 +994,160 @@ fn picker(
     let mut open = true;
     let mut chosen: Option<(DeviceKind, String)> = None;
     let title = if st.swap { format!("Swap {}", pos.label()) } else { format!("Choose a device for {}", pos.label()) };
-    let width = 300.0;
+    let width = POPOVER_W;
     let id = Id::new("device-picker");
     let screen = ctx.content_rect();
     let fade = motion.tween_from(id.with("fade"), 0.0, 1.0, Curve::Enter, ENTER * 0.65);
-    // Sized on its first frame; placed from then on.
+    // The panel under the content is painted at last frame's size.
     let last_size = ctx.data(|d| d.get_temp::<Vec2>(id.with("size"))).unwrap_or(Vec2::new(width, 200.0));
-    let at = popover_pos(st.picker_anchor, last_size, screen) + Vec2::new(0.0, 6.0 * (1.0 - fade));
-    let area = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(at).constrain_to(screen).show(ctx, |ui| {
-        ui.set_opacity(fade);
-        // The floating panel, under the content, at last frame's size.
-        paint::floating(ui.painter(), Rect::from_min_size(ui.cursor().min, last_size), skin, 12);
-        let outer = egui::Frame::NONE.inner_margin(egui::Margin::same(14)).show(ui, |ui| {
-            ui.set_width(width - 28.0);
-            ui.spacing_mut().item_spacing.y = 6.0;
-            paint::etched_text(
-                ui.painter(),
-                ui.cursor().min + Vec2::new(0.0, 6.0),
-                Align2::LEFT_CENTER,
-                &title.to_uppercase(),
-                skin,
-                skin.ink,
-                10.5,
-                true,
-                0.12,
-                0.7,
-            );
-            ui.add_space(16.0);
-            match pos.group {
-                PosGroup::App => {
-                    ui.add(
-                        TextEdit::singleline(&mut st.app_name)
-                            .hint_text("process name or PID")
-                            .desired_width(f32::INFINITY),
-                    );
-                    let name = st.app_name.trim().to_string();
-                    let b = ui
-                        .add_enabled_ui(!name.is_empty(), |ui| paint::pill_labeled(ui, "Capture", "Capture", skin))
-                        .inner;
-                    if b.clicked() && !name.is_empty() {
-                        chosen = Some((DeviceKind::AppCapture, name));
-                    }
-                }
-                PosGroup::NetOut => {
-                    ui.horizontal(|ui| {
-                        ui.add(TextEdit::singleline(&mut st.net_stream).hint_text("stream name").desired_width(120.0));
-                        ui.add(egui::DragValue::new(&mut st.net_channels).range(1..=64).suffix(" ch"));
-                    });
-                    let stream = st.net_stream.trim().to_string();
-                    for d in devices.iter().filter(|d| d.kind == DeviceKind::NetSend) {
-                        if device_row(
-                            ui,
-                            &format!("Send to {}", d.name),
-                            "another Confluence engine",
-                            &format!("Send to {}", d.name),
-                            stream.is_empty().then(|| "name the stream first".into()),
-                            skin,
-                        ) {
-                            chosen = Some((DeviceKind::NetSend, format!("{}/{stream}:{}", d.name, st.net_channels)));
-                        }
-                    }
-                    ui.horizontal(|ui| {
+    let (at, above) = popover_pos(st.picker_anchor, screen);
+    let at = at + Vec2::new(0.0, 4.0 * (1.0 - fade));
+    let pivot = if above { Align2::LEFT_BOTTOM } else { Align2::LEFT_TOP };
+    let area = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(at).pivot(pivot).constrain_to(screen).show(
+        ctx,
+        |ui| {
+            ui.set_opacity(fade);
+            // A new area measures itself in an invisible pass; the frame is
+            // run again at once so nothing (nor anyone) sees it misplaced.
+            if ui.is_sizing_pass() {
+                ui.ctx().request_discard("picker sizing");
+            }
+            // The floating panel, under the content, at last frame's size.
+            paint::floating(ui.painter(), Rect::from_min_size(ui.cursor().min, last_size), skin, 12);
+            let outer = egui::Frame::NONE.inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+                ui.set_width(width - 28.0);
+                ui.spacing_mut().item_spacing.y = 6.0;
+                paint::etched_text(
+                    ui.painter(),
+                    ui.cursor().min + Vec2::new(0.0, 6.0),
+                    Align2::LEFT_CENTER,
+                    &title.to_uppercase(),
+                    skin,
+                    skin.ink,
+                    10.5,
+                    true,
+                    0.12,
+                    0.7,
+                );
+                ui.add_space(16.0);
+                match pos.group {
+                    PosGroup::App => {
                         ui.add(
-                            TextEdit::singleline(&mut st.net_address)
-                                .hint_text("Address (ip:port)")
-                                .desired_width(150.0),
+                            TextEdit::singleline(&mut st.app_name)
+                                .hint_text("process name or PID")
+                                .desired_width(f32::INFINITY),
                         );
-                        let to = st.net_address.trim().to_string();
-                        let ok = !to.is_empty() && !stream.is_empty();
-                        let b =
-                            ui.add_enabled_ui(ok, |ui| paint::pill_labeled(ui, "Send here", "Send here", skin)).inner;
-                        if b.clicked() && ok {
-                            chosen = Some((DeviceKind::NetSend, format!("{to}/{stream}:{}", st.net_channels)));
-                        }
-                    });
-                }
-                g => {
-                    let all: Vec<&DeviceInfo> = devices.iter().filter(|d| kinds(g).contains(&d.kind)).collect();
-                    if all.len() > 6 {
-                        let search = ui
-                            .add(TextEdit::singleline(&mut st.search).hint_text("Search").desired_width(f32::INFINITY));
-                        if st.picker_opened == st.frame {
-                            search.request_focus();
+                        let name = st.app_name.trim().to_string();
+                        let b = ui
+                            .add_enabled_ui(!name.is_empty(), |ui| paint::pill_labeled(ui, "Capture", "Capture", skin))
+                            .inner;
+                        if b.clicked() && !name.is_empty() {
+                            chosen = Some((DeviceKind::AppCapture, name));
                         }
                     }
-                    let needle = st.search.trim().to_lowercase();
-                    let list: Vec<&DeviceInfo> = all
-                        .into_iter()
-                        .filter(|d| needle.is_empty() || d.name.to_lowercase().contains(&needle))
-                        .collect();
-                    if list.is_empty() {
-                        let text = if g == PosGroup::NetIn {
-                            "No streams arriving from other engines"
-                        } else if needle.is_empty() {
-                            "No devices of this kind found"
-                        } else {
-                            "Nothing matches"
-                        };
-                        ui.add_space(4.0);
-                        paint::etched_text(
-                            ui.painter(),
-                            ui.cursor().min + Vec2::new(10.0, 8.0),
-                            Align2::LEFT_CENTER,
-                            text,
-                            skin,
-                            skin.ink,
-                            12.0,
-                            false,
-                            0.0,
-                            0.6,
-                        );
-                        ui.add_space(20.0);
-                    }
-                    let enter = ui.input(|i| i.key_pressed(Key::Enter));
-                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                        for (k, d) in list.iter().enumerate() {
-                            let elsewhere = held_elsewhere(d, pos, positions);
-                            let accessible =
-                                if g == PosGroup::NetIn { format!("Receive {}", d.name) } else { d.name.clone() };
-                            let (name, sub) = split_name(d.kind, &d.name);
-                            let sub = join(&[sub, channels_text(d)]);
-                            let why = elsewhere.map(|p| format!("in use by {}", p.label()));
-                            let hit = device_row(ui, &name, &sub, &accessible, why, skin);
-                            if hit || (enter && k == 0 && elsewhere.is_none() && !needle.is_empty()) {
-                                chosen = Some((d.kind, d.name.clone()));
+                    PosGroup::NetOut => {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut st.net_stream).hint_text("stream name").desired_width(120.0),
+                            );
+                            ui.add(egui::DragValue::new(&mut st.net_channels).range(1..=64).suffix(" ch"));
+                        });
+                        let stream = st.net_stream.trim().to_string();
+                        for d in devices.iter().filter(|d| d.kind == DeviceKind::NetSend) {
+                            if device_row(
+                                ui,
+                                &format!("Send to {}", d.name),
+                                "another Confluence engine",
+                                &format!("Send to {}", d.name),
+                                stream.is_empty().then(|| "name the stream first".into()),
+                                skin,
+                            ) {
+                                chosen =
+                                    Some((DeviceKind::NetSend, format!("{}/{stream}:{}", d.name, st.net_channels)));
                             }
                         }
-                    });
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut st.net_address)
+                                    .hint_text("Address (ip:port)")
+                                    .desired_width(150.0),
+                            );
+                            let to = st.net_address.trim().to_string();
+                            let ok = !to.is_empty() && !stream.is_empty();
+                            let b = ui
+                                .add_enabled_ui(ok, |ui| paint::pill_labeled(ui, "Send here", "Send here", skin))
+                                .inner;
+                            if b.clicked() && ok {
+                                chosen = Some((DeviceKind::NetSend, format!("{to}/{stream}:{}", st.net_channels)));
+                            }
+                        });
+                    }
+                    g => {
+                        let all: Vec<&DeviceInfo> = devices.iter().filter(|d| kinds(g).contains(&d.kind)).collect();
+                        if all.len() > 6 {
+                            let search = ui.add(
+                                TextEdit::singleline(&mut st.search).hint_text("Search").desired_width(f32::INFINITY),
+                            );
+                            if st.picker_opened == st.frame {
+                                search.request_focus();
+                            }
+                        }
+                        let needle = st.search.trim().to_lowercase();
+                        let list: Vec<&DeviceInfo> = all
+                            .into_iter()
+                            .filter(|d| needle.is_empty() || d.name.to_lowercase().contains(&needle))
+                            .collect();
+                        if list.is_empty() {
+                            let text = if g == PosGroup::NetIn {
+                                "No streams arriving from other engines"
+                            } else if needle.is_empty() {
+                                "No devices of this kind found"
+                            } else {
+                                "Nothing matches"
+                            };
+                            ui.add_space(4.0);
+                            paint::etched_text(
+                                ui.painter(),
+                                ui.cursor().min + Vec2::new(10.0, 8.0),
+                                Align2::LEFT_CENTER,
+                                text,
+                                skin,
+                                skin.ink,
+                                12.0,
+                                false,
+                                0.0,
+                                0.6,
+                            );
+                            ui.add_space(20.0);
+                        }
+                        let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                            for (k, d) in list.iter().enumerate() {
+                                let elsewhere = held_elsewhere(d, pos, positions);
+                                let accessible =
+                                    if g == PosGroup::NetIn { format!("Receive {}", d.name) } else { d.name.clone() };
+                                let (name, sub) = split_name(d.kind, &d.name);
+                                let sub = join(&[sub, channels_text(d)]);
+                                let why = elsewhere.map(|p| format!("in use by {}", p.label()));
+                                let hit = device_row(ui, &name, &sub, &accessible, why, skin);
+                                if hit || (enter && k == 0 && elsewhere.is_none() && !needle.is_empty()) {
+                                    chosen = Some((d.kind, d.name.clone()));
+                                }
+                            }
+                        });
+                    }
                 }
-            }
-        });
-        outer.response.rect
-    });
+            });
+            outer.response.rect
+        },
+    );
     let rect = area.inner;
     ctx.data_mut(|d| d.insert_temp(id.with("size"), rect.size()));
     // Esc, or a click outside, closes it; the click that opened it does not.
+    let anchor = st.picker_anchor;
     let (esc, clicked_out) = ctx.input(|i| {
-        let out = i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|q| !rect.contains(q));
+        let out = i.pointer.any_pressed()
+            && i.pointer.interact_pos().is_some_and(|q| !rect.contains(q) && !anchor.contains(q));
         (i.key_pressed(Key::Escape), out)
     });
     if esc || (clicked_out && st.picker_opened < st.frame.saturating_sub(1)) {
@@ -1279,13 +1304,15 @@ mod tests {
 
     #[test]
     fn a_popover_opens_under_its_tray_or_above_when_there_is_no_room() {
-        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 600.0));
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 1000.0));
         let tray = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(240.0, 190.0));
-        let at = popover_pos(tray, Vec2::new(300.0, 200.0), screen);
-        assert_eq!(at, Pos2::new(100.0, 298.0));
-        let low = Rect::from_min_size(Pos2::new(800.0, 450.0), Vec2::new(240.0, 190.0));
-        let at = popover_pos(low, Vec2::new(300.0, 200.0), screen);
-        assert_eq!(at, Pos2::new(700.0, 242.0), "above the tray, pulled in from the right edge");
+        assert_eq!(popover_pos(tray, screen), (Pos2::new(100.0, 298.0), false));
+        let low = Rect::from_min_size(Pos2::new(800.0, 700.0), Vec2::new(240.0, 190.0));
+        let (at, above) = popover_pos(low, screen);
+        assert!(above, "no room below: its bottom sits over the tray");
+        assert_eq!(at, Pos2::new(700.0, 692.0), "pulled in from the right edge");
+        let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 500.0));
+        assert_eq!(popover_pos(tray, short), (Pos2::new(100.0, 8.0), false), "neither fits: pinned to the top");
     }
 
     #[test]

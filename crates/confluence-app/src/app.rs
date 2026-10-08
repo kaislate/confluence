@@ -185,6 +185,12 @@ pub fn fit_cell(area: Vec2, rows: usize, cols: usize) -> f32 {
     by_w.min(by_h).floor().clamp(crate::matrix::CELL_MIN, crate::matrix::CELL_MAX)
 }
 
+/// The rack panel's starting width for a window `window_w` wide: 320 px on
+/// a desktop, narrower on a laptop so the screens keep their room.
+pub fn rack_panel_width(window_w: f32) -> f32 {
+    (window_w * 0.22).clamp(220.0, 320.0)
+}
+
 /// The two screens the central panel switches between.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Screen {
@@ -751,7 +757,7 @@ impl ConfluenceApp {
         let actions = egui::Panel::right("inspector")
             .frame(egui::Frame::NONE)
             .resizable(true)
-            .default_size(320.0)
+            .default_size(rack_panel_width(ui.ctx().content_rect().width()))
             .show_separator_line(false)
             .show(ui, |ui| {
                 let r = ui.max_rect();
@@ -769,7 +775,7 @@ impl ConfluenceApp {
                     .state
                     .as_ref()
                     .map(|s| crate::inspector::header(s, &selection, point.as_ref()))
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| ("NO ENGINE".into(), "WAITING\u{2026}".into()));
                 let oled = Rect::from_min_size(r.min + Vec2::new(16.0, 14.0), Vec2::new(r.width() - 32.0, 52.0));
                 paint::oled(ui.painter(), oled, &skin, &l1, &l2, crate::gear::skins::OLED_CYAN);
                 let body =
@@ -919,7 +925,7 @@ impl ConfluenceApp {
             let routed: HashSet<(u32, u32)> = state.points.iter().map(|p| (p.input, p.output)).collect();
             let fresh: HashSet<(u32, u32)> = routed.difference(&self.routes_seen).copied().collect();
             self.routes_seen = routed;
-            let inner = ui.max_rect().shrink(12.0);
+            let inner = ui.max_rect().shrink(8.0);
             self.matrix_area = inner.size() - Vec2::new(grid_view::HEADER_W, grid_view::HEADER_H);
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
             child.set_opacity(reveal);
@@ -1115,6 +1121,13 @@ mod tests {
         assert_eq!(flag(&args(&["--skin=C:/skins/x", "--pipe", "lab"]), "--skin"), Some("C:/skins/x".into()));
         assert_eq!(flag(&args(&["--pipe", "lab"]), "--skin"), None);
         assert_eq!(flag(&args(&["--pipe"]), "--pipe"), None);
+    }
+
+    #[test]
+    fn the_rack_panel_is_narrower_on_a_small_window() {
+        assert_eq!(rack_panel_width(1920.0), 320.0);
+        assert_eq!(rack_panel_width(520.0), 220.0);
+        assert!((rack_panel_width(1200.0) - 264.0).abs() < 1e-3);
     }
 
     #[test]
