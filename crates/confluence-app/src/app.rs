@@ -1,7 +1,9 @@
-//! The window: one `StoreView` per frame drives the top bar, the banner, the
-//! matrix, the inspector and the devices panel; edits go to the worker.
+//! The window: one `StoreView` per frame drives the rail, the matrix or the
+//! Devices screen, the rack panel (inspector) and the scene rail; edits go
+//! to the worker. One `Motion` owns every animation and asks for frames
+//! only while something moves.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,14 +11,18 @@ use std::time::{Duration, Instant};
 
 use confluence_api::PointState;
 use confluence_client::{ConnState, StateStore, StoreView, Update};
-use eframe::egui::{self, Align, Align2, Button, Id, Key, Layout, RichText};
+use eframe::egui::{self, Align, Align2, Id, Key, Layout, Pos2, Rect, Vec2};
 
 use crate::commands::{Edit, Outcome, Worker};
 use crate::engine_launch::Launcher;
+use crate::gear::motion::Motion;
+use crate::gear::paint;
+use crate::gear::skins::{Finish, GearSkin};
 use crate::grid_view;
 use crate::matrix::{key_edit, move_selection, selection_valid, CellKey, GridLayout, Selection};
 use crate::notify::Notes;
 use crate::pending::Pending;
+use crate::shell;
 use crate::skin::Look;
 
 /// eframe storage key for the inspector's open state.
@@ -168,8 +174,19 @@ pub fn flag(args: &[String], name: &str) -> Option<String> {
     None
 }
 
+/// The cell size at which `cols` × `rows` cells fit `area` (the cell area,
+/// headers excluded), within the zoom range.
+pub fn fit_cell(area: Vec2, rows: usize, cols: usize) -> f32 {
+    if rows == 0 || cols == 0 {
+        return crate::matrix::CELL_DEFAULT;
+    }
+    let by_w = area.x / cols as f32;
+    let by_h = area.y / rows as f32;
+    by_w.min(by_h).floor().clamp(crate::matrix::CELL_MIN, crate::matrix::CELL_MAX)
+}
+
 /// The two screens the central panel switches between.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Screen {
     Matrix,
     Devices,
@@ -201,9 +218,6 @@ pub struct ConfluenceApp {
     /// Which screen the central panel shows.
     screen: Screen,
     screen_state: crate::devices_screen::ScreenState,
-    /// A position waiting for "Clear ‹position›?" (true) or "Turn off
-    /// ‹position›?" (false) to be confirmed.
-    confirm_clear: Option<(confluence_api::PosId, bool)>,
     /// The plugin picker, while open.
     picker: Option<crate::plugins::Picker>,
     /// Parameter values sent and not yet confirmed: (bus, param) → value.
@@ -213,9 +227,18 @@ pub struct ConfluenceApp {
     scene_bar: crate::scenes::SceneBar,
     scripts_open: bool,
     scripts: crate::scripts::ScriptsUi,
-    /// The gear finish (Settings).
-    finish: crate::gear::skins::Finish,
+    /// The gear finish (Settings), and the one egui's widgets were last styled for.
+    finish: Finish,
+    styled_for: Option<Finish>,
     settings_open: bool,
+    motion: Motion,
+    /// Engine notices and when they were first seen (they toast once).
+    notices_seen: HashMap<String, Instant>,
+    /// The matrix's routes last frame (a new one pops in).
+    routes_seen: HashSet<(u32, u32)>,
+    grid_state: grid_view::GridState,
+    /// The cell area's size last frame, for Ctrl+0.
+    matrix_area: Vec2,
 }
 
 /// The engine owns plugin editor windows; Windows lets a background process
@@ -283,15 +306,20 @@ impl ConfluenceApp {
             confirm_remove: None,
             screen: Screen::Matrix,
             screen_state: crate::devices_screen::ScreenState::default(),
-            confirm_clear: None,
             picker: None,
             param_pending: HashMap::new(),
             plugin_loading: None,
             scene_bar: crate::scenes::SceneBar::default(),
             scripts_open: false,
             scripts: crate::scripts::ScriptsUi::default(),
-            finish: crate::gear::skins::Finish::default(),
+            finish: Finish::default(),
+            styled_for: None,
             settings_open: false,
+            motion: Motion::default(),
+            notices_seen: HashMap::new(),
+            routes_seen: HashSet::new(),
+            grid_state: grid_view::GridState::default(),
+            matrix_area: Vec2::new(800.0, 600.0),
         }
     }
 
@@ -307,6 +335,11 @@ impl ConfluenceApp {
 
     pub fn selection(&self) -> Selection {
         self.selection
+    }
+
+    /// The gear skin for the finish chosen in Settings.
+    pub fn skin(&self) -> GearSkin {
+        GearSkin::preset(self.finish)
     }
 
     fn send(&mut self, edit: Edit) {
@@ -371,6 +404,9 @@ impl ConfluenceApp {
         if let Edit::FillPosition { pos, name, .. } = edit {
             self.screen_state.filling.remove(pos);
             self.notes.info(format!("{} now holds {name}", pos.label()), now);
+            if let Some(id) = ids.first() {
+                self.selection = Selection::Slot(*id);
+            }
         }
         if let Edit::SetVirtual { pos, on, .. } = edit {
             let what = if *on { "Turned on" } else { "Turned off" };
@@ -392,6 +428,7 @@ impl ConfluenceApp {
         }
         if let Edit::FillPosition { pos, .. } = edit {
             self.screen_state.filling.remove(pos);
+            self.screen_state.just_filled.remove(pos);
         }
     }
 
@@ -419,6 +456,11 @@ impl ConfluenceApp {
                 *r = Some(ctx.clone());
             }
         }
+        if self.skin_dir.is_none() && self.styled_for != Some(self.finish) {
+            crate::gear::apply_visuals(&ctx, &self.skin());
+            self.styled_for = Some(self.finish);
+        }
+        self.motion.begin_frame(&ctx);
         self.view = self.store.view();
         for o in self.worker.outcomes() {
             self.on_outcome(o, now);
@@ -439,23 +481,28 @@ impl ConfluenceApp {
             }
         }
         self.notes.prune(now);
+        self.shortcuts(ui);
 
         let graphs = self.inspector_open && matches!(self.selection, Selection::Slot(_));
         self.graphs_live.store(graphs, Ordering::Relaxed);
         self.meters_live.store(self.screen == Screen::Devices, Ordering::Relaxed);
-        self.top_bar(ui, &view, now);
-        self.scene_bar(ui, &view);
+        self.rail(ui, &view, now);
+        self.scene_rail(ui, &view);
         self.side_panels(ui, &view, now);
-        match self.screen {
-            Screen::Matrix => {
-                self.matrix(ui, &view);
-                self.keyboard(ui, &view);
-            }
-            Screen::Devices => {
-                self.devices_screen(ui, &view);
+        if matches!(view.conn, ConnState::Connecting) && view.state.is_none() {
+            self.powered_off(ui, now);
+        } else {
+            match self.screen {
+                Screen::Matrix => {
+                    self.matrix(ui, &view);
+                    self.keyboard(ui, &view);
+                }
+                Screen::Devices => {
+                    self.devices_screen(ui, &view);
+                }
             }
         }
-        self.notifications(&ctx, &view);
+        self.notifications(&ctx, &view, now);
         self.dialogs(&ctx, &view);
 
         if let Some(wait) = next_check(&view.conn, view.last_event, now) {
@@ -464,101 +511,175 @@ impl ConfluenceApp {
         if self.notes.has_info() || self.xruns.1.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+        self.motion.end_frame(&ctx);
     }
 
-    fn scene_bar(&mut self, ui: &mut egui::Ui, view: &StoreView) {
+    /// Ctrl+1 / Ctrl+2 switch screens; Ctrl+0 fits the matrix.
+    fn shortcuts(&mut self, ui: &egui::Ui) {
+        if ui.ctx().memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let (one, two, zero) = ui.input(|i| {
+            let c = i.modifiers.command;
+            (c && i.key_pressed(Key::Num1), c && i.key_pressed(Key::Num2), c && i.key_pressed(Key::Num0))
+        });
+        if one {
+            self.screen = Screen::Matrix;
+        }
+        if two {
+            self.screen = Screen::Devices;
+        }
+        if zero {
+            if let Some(state) = &self.view.state {
+                let l = GridLayout::new(&state.slots, self.cell);
+                self.cell = fit_cell(self.matrix_area, l.rows.len, l.cols.len);
+            }
+        }
+    }
+
+    fn scene_rail(&mut self, ui: &mut egui::Ui, view: &StoreView) {
         let Some(state) = &view.state else { return };
         let editable = self.live();
+        let skin = self.skin();
+        let (bar, motion) = (&mut self.scene_bar, &mut self.motion);
         let edits = egui::Panel::bottom("scene-bar")
-            .show(ui, |ui| crate::scenes::show(ui, state, &mut self.scene_bar, editable))
+            .frame(egui::Frame::NONE)
+            .exact_size(shell::SCENE_RAIL_H)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                let r = ui.max_rect();
+                shell::rail_face(ui.painter(), r, &skin);
+                paint::seam(ui.painter(), Pos2::new(r.left(), r.top()), Pos2::new(r.right(), r.top()), &skin);
+                let inner = Rect::from_min_max(r.min + Vec2::new(12.0, 8.0), r.max - Vec2::new(12.0, 8.0));
+                let mut child =
+                    ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
+                crate::scenes::show(&mut child, state, bar, &skin, motion, editable)
+            })
             .inner;
         for e in edits {
             self.send(e);
         }
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui, view: &StoreView, now: Instant) {
-        egui::Panel::top("top-bar").show(ui, |ui| {
-            let (warn, error) = (self.look.skin.colors.warn, self.look.skin.colors.error);
-            self.look.paint_surface(ui.painter(), ui.max_rect(), "top_bar", self.look.skin.colors.panel);
-            ui.horizontal(|ui| {
-                let text = badge(&view.conn, view.last_event, now);
-                let colour = match text.as_str() {
-                    "Live" => None,
-                    "Not responding" => Some(error),
-                    _ => Some(warn),
-                };
-                let badge = RichText::new(&text).strong();
-                ui.label(match colour {
-                    Some(c) => badge.color(c),
-                    None => badge,
-                });
-                if let Some(s) = &view.status {
-                    ui.separator();
-                    ui.label(format!("Master {}", s.master));
-                    ui.label(format!("{:.0} Hz", s.sample_rate));
-                    ui.label(format!("Block {}", s.block));
-                    let dsp = RichText::new(format!("DSP {:.0}%", s.dsp_load * 100.0));
-                    ui.label(match self.look.dsp_color(s.dsp_load) {
-                        Some(c) => dsp.color(c),
-                        None => dsp,
-                    });
-                    self.xruns = track_xruns(self.xruns, s.xruns, now);
-                    let flashing = self.xruns.1.is_some_and(|t| now.saturating_duration_since(t) < XRUN_FLASH);
-                    if !flashing {
-                        self.xruns.1 = None;
+    fn rail(&mut self, ui: &mut egui::Ui, view: &StoreView, now: Instant) {
+        let skin = self.skin();
+        let text = badge(&view.conn, view.last_event, now);
+        let (status, dsp_warn) = match &view.status {
+            Some(s) => {
+                self.xruns = track_xruns(self.xruns, s.xruns, now);
+                (Some(s.clone()), self.look.dsp_color(s.dsp_load))
+            }
+            None => (None, None),
+        };
+        let flashing = self.xruns.1.is_some_and(|t| now.saturating_duration_since(t) < XRUN_FLASH);
+        if !flashing {
+            self.xruns.1 = None;
+        }
+        let motion = &mut self.motion;
+        let screen = &mut self.screen;
+        let (inspector, scripts, settings) =
+            (&mut self.inspector_open, &mut self.scripts_open, &mut self.settings_open);
+        egui::Panel::top("top-bar").frame(egui::Frame::NONE).exact_size(shell::RAIL_H).show_separator_line(false).show(
+            ui,
+            |ui| {
+                let r = ui.max_rect();
+                shell::rail_face(ui.painter(), r, &skin);
+                let inner = Rect::from_min_max(r.min + Vec2::new(10.0, 6.0), r.max - Vec2::new(10.0, 8.0));
+                let mut row =
+                    ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
+                row.spacing_mut().item_spacing.x = 6.0;
+                shell::wordmark(&mut row, &skin);
+                shell::segmented(&mut row, &skin, screen);
+                row.add_space(14.0);
+                shell::engine_cluster(&mut row, &skin, motion, &text, status.as_ref(), flashing, dsp_warn);
+                row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (open, label) in [(settings, "Settings…"), (scripts, "Scripts…"), (inspector, "Inspector")]
+                    {
+                        let resp = paint::pill_lit(ui, label, label, *open, &skin);
+                        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, *open, label));
+                        if resp.clicked() {
+                            *open = !*open;
+                        }
                     }
-                    let xr = RichText::new(format!("Xruns {}", s.xruns));
-                    ui.label(if flashing { xr.color(error).strong() } else { xr });
-                }
-                ui.separator();
-                ui.selectable_value(&mut self.screen, Screen::Matrix, "Matrix");
-                ui.selectable_value(&mut self.screen, Screen::Devices, "Devices");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    self.top_bar_buttons(ui);
                 });
-            });
-            self.banner(ui, view, now);
-        });
+            },
+        );
+        self.banner(ui, view, now);
     }
 
+    /// A thin strip under the rail while the engine is away or quiet.
     fn banner(&mut self, ui: &mut egui::Ui, view: &StoreView, now: Instant) {
-        let (warn, error) = (self.look.skin.colors.warn, self.look.skin.colors.error);
-        match view.conn {
-            ConnState::Connecting => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Engine not running").color(warn));
-                    self.start_button(ui, now);
-                });
-            }
+        let skin = self.skin();
+        let (text, offer_start) = match view.conn {
+            ConnState::Connecting if view.state.is_some() => ("Engine not running".to_string(), true),
+            ConnState::Connecting => return, // the powered-off face says it
             ConnState::Reconnecting { since } => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Reconnecting…").color(warn));
-                    if now.saturating_duration_since(since) >= OFFER_START_AFTER {
-                        self.start_button(ui, now);
-                    }
-                });
+                ("Reconnecting…".to_string(), now.saturating_duration_since(since) >= OFFER_START_AFTER)
             }
             ConnState::Live => {
                 if view.last_event.is_some_and(|t| now.saturating_duration_since(t) >= QUIET) {
-                    ui.label(RichText::new("Engine not responding").color(error));
+                    ("Engine not responding".to_string(), false)
+                } else {
+                    return;
                 }
             }
-        }
-    }
-
-    fn start_button(&mut self, ui: &mut egui::Ui, now: Instant) {
-        if ui.add_enabled(self.launcher.ready(now), Button::new("Start engine")).clicked() {
+        };
+        let ready = self.launcher.ready(now);
+        let mut start = false;
+        egui::Panel::top("banner").frame(egui::Frame::NONE).exact_size(30.0).show_separator_line(false).show(
+            ui,
+            |ui| {
+                let r = ui.max_rect();
+                ui.painter().rect_filled(r, egui::CornerRadius::ZERO, skin.ground);
+                ui.painter().rect_filled(r, egui::CornerRadius::ZERO, paint::alpha(crate::gear::skins::AMBER, 0.12));
+                let inner = Rect::from_min_max(r.min + Vec2::new(16.0, 3.0), r.max - Vec2::new(16.0, 3.0));
+                let mut row =
+                    ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
+                let (tr, label) = row.allocate_exact_size(Vec2::new(170.0, 24.0), egui::Sense::hover());
+                label.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &text));
+                paint::etched_text(
+                    row.painter(),
+                    tr.left_center(),
+                    Align2::LEFT_CENTER,
+                    &text,
+                    &skin,
+                    crate::gear::skins::AMBER,
+                    11.5,
+                    true,
+                    0.04,
+                    1.0,
+                );
+                if offer_start {
+                    start = row
+                        .add_enabled_ui(ready, |ui| paint::pill_labeled(ui, "Start engine", "Start engine", &skin))
+                        .inner
+                        .clicked()
+                        && ready;
+                }
+            },
+        );
+        if start {
             if let Err(e) = self.launcher.start(now) {
                 self.notes.error(e, now);
             }
         }
     }
 
-    fn top_bar_buttons(&mut self, ui: &mut egui::Ui) {
-        ui.toggle_value(&mut self.inspector_open, "Inspector");
-        ui.toggle_value(&mut self.scripts_open, "Scripts…");
-        ui.toggle_value(&mut self.settings_open, "Settings…");
+    /// No engine has ever answered: the rack is switched off.
+    fn powered_off(&mut self, ui: &mut egui::Ui, now: Instant) {
+        let skin = self.skin();
+        let ready = self.launcher.ready(now);
+        let motion = &mut self.motion;
+        let start = egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| shell::powered_off(ui, &skin, motion, ready, "Engine not running"))
+            .inner;
+        if start {
+            if let Err(e) = self.launcher.start(now) {
+                self.notes.error(e, now);
+            }
+        }
     }
 
     /// Shows the matrix or the Devices screen.
@@ -567,35 +688,44 @@ impl ConfluenceApp {
     }
 
     /// The gear finish chosen in Settings.
-    pub fn finish(&self) -> crate::gear::skins::Finish {
+    pub fn finish(&self) -> Finish {
         self.finish
     }
 
     /// Restores the finish saved last time (see [`crate::settings::FINISH_KEY`]).
-    pub fn set_finish(&mut self, finish: crate::gear::skins::Finish) {
+    pub fn set_finish(&mut self, finish: Finish) {
         self.finish = finish;
+    }
+
+    /// Reduce motion (Settings): tweens land at once.
+    pub fn set_reduce_motion(&mut self, reduce: bool) {
+        self.motion.reduce = reduce;
+    }
+
+    pub fn reduce_motion(&self) -> bool {
+        self.motion.reduce
     }
 
     /// The Devices screen in the central panel.
     fn devices_screen(&mut self, ui: &mut egui::Ui, view: &StoreView) {
         let editable = self.live();
-        let skin = crate::gear::skins::GearSkin::preset(self.finish);
+        let skin = self.skin();
         let palette = self.look.skin.slot_colors.clone();
         let list = view.state.as_ref().map(|s| s.devices.clone()).unwrap_or_default();
-        let screen_state = &mut self.screen_state;
+        let (screen_state, motion) = (&mut self.screen_state, &mut self.motion);
         let actions = egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                let ground = crate::devices_screen::screen_skin(&skin).p3;
-                ui.painter().rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, ground);
-                crate::devices_screen::show(ui, view, &list, &skin, &palette, screen_state, editable)
+                paint::ground(ui.painter(), ui.max_rect(), &skin);
+                let inner = ui.max_rect().shrink2(Vec2::new(0.0, 0.0));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+                crate::devices_screen::show(&mut child, view, &list, &skin, &palette, screen_state, motion, editable)
             })
             .inner;
         for a in actions {
             match a {
                 crate::devices_screen::ScreenAction::Edit(e) => self.send(e),
                 crate::devices_screen::ScreenAction::Select(id) => self.selection = Selection::Slot(id),
-                crate::devices_screen::ScreenAction::AskClear(pos) => self.confirm_clear = Some((pos, true)),
-                crate::devices_screen::ScreenAction::AskTurnOff(pos) => self.confirm_clear = Some((pos, false)),
             }
         }
     }
@@ -616,13 +746,38 @@ impl ConfluenceApp {
             _ => None,
         };
         let look = &self.look;
+        let skin = self.skin();
+        let motion = &mut self.motion;
         let actions = egui::Panel::right("inspector")
+            .frame(egui::Frame::NONE)
             .resizable(true)
-            .default_size(300.0)
+            .default_size(320.0)
+            .show_separator_line(false)
             .show(ui, |ui| {
-                look.paint_surface(ui.painter(), ui.max_rect(), "panel", look.skin.colors.panel);
+                let r = ui.max_rect();
+                // The panel keeps its width: its content is laid out in a child.
+                ui.expand_to_include_rect(r);
+                paint::ground(ui.painter(), r, &skin);
+                paint::seam(
+                    ui.painter(),
+                    Pos2::new(r.left() + 0.5, r.top()),
+                    Pos2::new(r.left() + 0.5, r.bottom()),
+                    &skin,
+                );
+                let reveal = shell::reveal(motion, Id::new("inspector-reveal"));
+                let (l1, l2) = view
+                    .state
+                    .as_ref()
+                    .map(|s| crate::inspector::header(s, &selection, point.as_ref()))
+                    .unwrap_or_default();
+                let oled = Rect::from_min_size(r.min + Vec2::new(16.0, 14.0), Vec2::new(r.width() - 32.0, 52.0));
+                paint::oled(ui.painter(), oled, &skin, &l1, &l2, crate::gear::skins::OLED_CYAN);
+                let body =
+                    Rect::from_min_max(Pos2::new(r.left() + 16.0, oled.bottom() + 16.0), r.max - Vec2::new(12.0, 8.0));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
+                child.set_opacity(reveal);
                 egui::ScrollArea::vertical()
-                    .show(ui, |ui| {
+                    .show(&mut child, |ui| {
                         let plugin_ui =
                             crate::inspector::PluginUi { pending: &self.param_pending, loading: self.plugin_loading };
                         crate::inspector::show(
@@ -651,35 +806,10 @@ impl ConfluenceApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
-        if let Some((pos, clear)) = self.confirm_clear {
-            let mut answer = None;
-            let (title, verb) = if clear { ("Clear position", "Clear") } else { ("Turn off position", "Turn off") };
-            egui::Window::new(title).collapsible(false).resizable(false).show(ctx, |ui| {
-                ui.label(format!("{verb} {}? Its routes are removed.", pos.label()));
-                ui.horizontal(|ui| {
-                    if ui.button(verb).clicked() {
-                        answer = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        answer = Some(false);
-                    }
-                });
-            });
-            match answer {
-                Some(true) => {
-                    self.confirm_clear = None;
-                    self.send(if clear {
-                        Edit::ClearPosition { pos }
-                    } else {
-                        Edit::SetVirtual { pos, on: false, shape: None }
-                    });
-                }
-                Some(false) => self.confirm_clear = None,
-                None => {}
-            }
-        }
         if self.settings_open {
-            crate::settings::show(ctx, &mut self.settings_open, &mut self.finish);
+            let mut reduce = self.motion.reduce;
+            crate::settings::show(ctx, &mut self.settings_open, &mut self.finish, &mut reduce);
+            self.motion.reduce = reduce;
         }
         if let (true, Some(state)) = (self.scripts_open, view.state.as_ref()) {
             let editable = self.live();
@@ -738,14 +868,42 @@ impl ConfluenceApp {
 
     fn matrix(&mut self, ui: &mut egui::Ui, view: &StoreView) {
         let editable = self.live();
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.look.paint_surface(ui.painter(), ui.max_rect(), "background", self.look.skin.colors.background);
+        let skin = self.skin();
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            if self.look.has_image("background") {
+                self.look.paint_surface(ui.painter(), ui.max_rect(), "background", self.look.skin.colors.background);
+            } else {
+                paint::ground(ui.painter(), ui.max_rect(), &skin);
+            }
+            let reveal = shell::reveal(&mut self.motion, Id::new("matrix-reveal"));
             let Some(state) = &view.state else {
-                ui.label("Waiting for the engine…");
+                paint::etched_text(
+                    ui.painter(),
+                    ui.max_rect().center(),
+                    Align2::CENTER_CENTER,
+                    "Waiting for the engine…",
+                    &skin,
+                    skin.ground_ink,
+                    13.0,
+                    false,
+                    0.0,
+                    0.7,
+                );
                 return;
             };
             if state.slots.is_empty() {
-                ui.label("No slots yet: add a device on the Devices screen");
+                paint::etched_text(
+                    ui.painter(),
+                    ui.max_rect().center(),
+                    Align2::CENTER_CENTER,
+                    "No slots yet: add a device on the Devices screen",
+                    &skin,
+                    skin.ground_ink,
+                    13.0,
+                    false,
+                    0.0,
+                    0.7,
+                );
                 return;
             }
             let layout = GridLayout::new(&state.slots, self.cell);
@@ -757,7 +915,26 @@ impl ConfluenceApp {
                 Selection::Cell { input, output } => Some((input, output)),
                 _ => None,
             };
-            let actions = grid_view::show(ui, &layout, &self.look, &lookup, selected, editable);
+            // Routes that appeared since last frame pop in.
+            let routed: HashSet<(u32, u32)> = state.points.iter().map(|p| (p.input, p.output)).collect();
+            let fresh: HashSet<(u32, u32)> = routed.difference(&self.routes_seen).copied().collect();
+            self.routes_seen = routed;
+            let inner = ui.max_rect().shrink(12.0);
+            self.matrix_area = inner.size() - Vec2::new(grid_view::HEADER_W, grid_view::HEADER_H);
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+            child.set_opacity(reveal);
+            let actions = grid_view::show(
+                &mut child,
+                &layout,
+                &self.look,
+                &skin,
+                &mut self.motion,
+                &mut self.grid_state,
+                &lookup,
+                selected,
+                &fresh,
+                editable,
+            );
             if let Some(z) = actions.zoom {
                 self.cell = z.clamp(crate::matrix::CELL_MIN, crate::matrix::CELL_MAX);
             }
@@ -812,37 +989,11 @@ impl ConfluenceApp {
         }
     }
 
-    fn notifications(&mut self, ctx: &egui::Context, view: &StoreView) {
-        let (warn, error) = (self.look.skin.colors.warn, self.look.skin.colors.error);
-        let mut dismiss = None;
-        egui::Area::new(Id::new("notifications")).anchor(Align2::RIGHT_BOTTOM, [-12.0, -12.0]).show(ctx, |ui| {
-            if let Some(state) = &view.state {
-                for n in &state.notices {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.label(RichText::new(n).color(warn));
-                    });
-                }
-            }
-            for note in self.notes.shown() {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let text = if note.count > 1 {
-                            format!("{} (×{})", note.text, note.count)
-                        } else {
-                            note.text.clone()
-                        };
-                        ui.label(if note.error { RichText::new(text).color(error) } else { RichText::new(text) });
-                        if note.error {
-                            let b = ui.small_button("✕");
-                            b.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Dismiss"));
-                            if b.clicked() {
-                                dismiss = Some(note.id);
-                            }
-                        }
-                    });
-                });
-            }
-        });
+    fn notifications(&mut self, ctx: &egui::Context, view: &StoreView, now: Instant) {
+        let skin = self.skin();
+        let notices = view.state.as_ref().map(|s| s.notices.clone()).unwrap_or_default();
+        let shown = self.notes.shown();
+        let dismiss = shell::toasts(ctx, &skin, &mut self.motion, &shown, &notices, &mut self.notices_seen, now);
         if let Some(id) = dismiss {
             self.notes.dismiss(id);
         }
@@ -857,6 +1008,7 @@ impl eframe::App for ConfluenceApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(INSPECTOR_KEY, self.inspector_open.to_string());
         storage.set_string(crate::settings::FINISH_KEY, self.finish.name().to_string());
+        storage.set_string(crate::settings::REDUCE_MOTION_KEY, self.motion.reduce.to_string());
     }
 }
 
@@ -963,5 +1115,13 @@ mod tests {
         assert_eq!(flag(&args(&["--skin=C:/skins/x", "--pipe", "lab"]), "--skin"), Some("C:/skins/x".into()));
         assert_eq!(flag(&args(&["--pipe", "lab"]), "--skin"), None);
         assert_eq!(flag(&args(&["--pipe"]), "--pipe"), None);
+    }
+
+    #[test]
+    fn fit_picks_the_cell_that_shows_the_whole_grid() {
+        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), 20, 30), 26.0, "limited by the width: 800 / 30");
+        assert_eq!(fit_cell(Vec2::new(800.0, 200.0), 20, 10), 12.0, "clamped at the minimum");
+        assert_eq!(fit_cell(Vec2::new(8000.0, 6000.0), 2, 2), crate::matrix::CELL_MAX);
+        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), 0, 5), crate::matrix::CELL_DEFAULT);
     }
 }

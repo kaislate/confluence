@@ -522,7 +522,7 @@ background = \"wide.png\"
         skin.slot_colors = vec![Color32::from_rgb(1, 1, 1), Color32::from_rgb(2, 2, 2)];
         let look = Look { skin, textures: BTreeMap::new() };
         assert_eq!(look.routed(12.0), Color32::from_rgb(255, 0, 0));
-        assert_eq!(look.routed(-60.0).r(), 64);
+        assert_eq!(look.routed(-60.0).r(), 140, "55 % at the quietest shown gain");
         assert_eq!(look.slot(3), Color32::from_rgb(2, 2, 2));
         assert_eq!(look.dsp_color(0.95), Some(look.skin.colors.error));
     }

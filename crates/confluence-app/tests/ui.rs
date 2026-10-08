@@ -221,6 +221,13 @@ fn a_vasio_is_turned_on_from_the_devices_screen() {
     let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
     h.get_by_label("Devices").click();
+    // The wall is collapsed: only the next switched-off position (B) shows
+    // until the group is opened.
+    pump_until(&mut h, "the collapsed Virtual group", LONG, |h| {
+        h.query_by_label("Show all Virtual positions").is_some()
+    });
+    assert!(h.query_by_label("Turn on VASIO C").is_none(), "C is folded away");
+    h.get_by_label("Show all Virtual positions").click();
     pump_until(&mut h, "VASIO C's card", LONG, |h| h.query_by_label("Turn on VASIO C").is_some());
     h.get_by_label("Turn on VASIO C").click();
     pump_until(&mut h, "the new slot", LONG, |_| slots(&mut client(&d)).iter().any(|s| s.name == "VASIO 3"));

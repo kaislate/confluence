@@ -14,16 +14,9 @@ pub const OFFLINE: Color32 = Color32::from_gray(90);
 pub const WARN: Color32 = Color32::from_rgb(230, 170, 40);
 pub const ERROR: Color32 = Color32::from_rgb(230, 70, 60);
 
-pub const SLOT_COLORS: [Color32; 8] = [
-    Color32::from_rgb(86, 156, 214),
-    Color32::from_rgb(78, 201, 176),
-    Color32::from_rgb(220, 160, 90),
-    Color32::from_rgb(197, 134, 192),
-    Color32::from_rgb(214, 102, 102),
-    Color32::from_rgb(156, 204, 101),
-    Color32::from_rgb(240, 200, 80),
-    Color32::from_rgb(120, 144, 230),
-];
+/// The default device colours: the gear palette, so a device's bands match
+/// its card on every finish.
+pub const SLOT_COLORS: [Color32; 8] = crate::gear::skins::DEVICE_PALETTE;
 
 pub use confluence_api::taper::{fader_db, fader_pos, FADER_KNEE, FADER_KNEE_DB};
 
@@ -36,13 +29,14 @@ pub fn clamp_gain(db: f32) -> f32 {
     }
 }
 
-/// Cell brightness: 0.25 at −60 dB (and below) to 1.0 at +12 dB (and above).
+/// Cell brightness: 0.55 at −60 dB (and below) to 1.0 at +12 dB (and
+/// above), so quiet routes stay visible.
 pub fn gain_brightness(db: f32) -> f32 {
     if !db.is_finite() {
-        return 0.25;
+        return 0.55;
     }
     let t = ((db - SHOWN_MIN_DB) / (SHOWN_MAX_DB - SHOWN_MIN_DB)).clamp(0.0, 1.0);
-    0.25 + 0.75 * t
+    0.55 + 0.45 * t
 }
 
 /// `c` with its colour channels scaled by `brightness` (alpha kept).
@@ -77,13 +71,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn brightness_spans_a_quarter_to_full_over_the_shown_range() {
-        assert_eq!(gain_brightness(SHOWN_MIN_DB), 0.25);
+    fn brightness_spans_half_to_full_over_the_shown_range() {
+        assert_eq!(gain_brightness(SHOWN_MIN_DB), 0.55);
         assert_eq!(gain_brightness(SHOWN_MAX_DB), 1.0);
-        assert_eq!(gain_brightness(GAIN_MIN_DB), 0.25, "clamped below");
+        assert_eq!(gain_brightness(GAIN_MIN_DB), 0.55, "clamped below");
         assert_eq!(gain_brightness(GAIN_MAX_DB), 1.0, "clamped above");
         assert!(gain_brightness(-24.0) > gain_brightness(-30.0));
-        assert_eq!(gain_brightness(f32::NAN), 0.25);
+        assert_eq!(gain_brightness(f32::NAN), 0.55);
     }
 
     #[test]

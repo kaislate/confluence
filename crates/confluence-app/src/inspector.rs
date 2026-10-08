@@ -36,6 +36,46 @@ pub fn routes_of(state: &State, slot: &SlotState) -> usize {
     state.points.iter().filter(|p| ins.contains(&p.input) || outs.contains(&p.output)).count()
 }
 
+/// The rack panel's OLED: what is selected, and its state in one line.
+pub fn header(state: &State, selection: &Selection, point: Option<&PointState>) -> (String, String) {
+    match *selection {
+        Selection::None => (
+            format!("{} DEVICES \u{b7} {} ROUTES", state.slots.len(), state.points.len()),
+            "SELECT A CARD OR A CROSSPOINT".into(),
+        ),
+        Selection::Cell { input, output } => {
+            let label = point_label(&state.slots, input, output).replace('\u{2192}', ">").to_uppercase();
+            let state_line = match point {
+                Some(p) => format!(
+                    "{:+.1} DB{}{}",
+                    p.gain_db,
+                    if p.mute { " \u{b7} MUTED" } else { "" },
+                    if p.invert { " \u{b7} INVERTED" } else { "" }
+                ),
+                None => "NO ROUTE".into(),
+            };
+            (label, state_line)
+        }
+        Selection::Slot(id) => match state.slots.iter().find(|s| s.id == id) {
+            Some(s) => {
+                let mut parts = Vec::new();
+                if s.role == ClockRole::Master {
+                    parts.push("MASTER".to_string());
+                }
+                parts.push(if s.online { "ONLINE".into() } else { "OFFLINE".into() });
+                if s.inputs > 0 {
+                    parts.push(format!("{} IN", s.inputs));
+                }
+                if s.outputs > 0 {
+                    parts.push(format!("{} OUT", s.outputs));
+                }
+                (s.name.to_uppercase(), parts.join(" \u{b7} "))
+            }
+            None => ("SLOT REMOVED".into(), String::new()),
+        },
+    }
+}
+
 fn range_text(first: u32, n: u32) -> String {
     match n {
         0 => "none".into(),
@@ -69,12 +109,12 @@ pub fn show(
 }
 
 fn summary(ui: &mut egui::Ui, look: &Look, state: &State) {
-    ui.heading("Engine");
-    ui.label(format!("{} slots · {} routes", state.slots.len(), state.points.len()));
     for n in &state.notices {
         ui.label(RichText::new(n).color(look.skin.colors.warn));
     }
-    ui.add_space(8.0);
+    if !state.notices.is_empty() {
+        ui.add_space(8.0);
+    }
     ui.label(RichText::new("Click a cell or a slot header to inspect it.").weak());
 }
 
@@ -86,7 +126,13 @@ fn point_panel(
     point: Option<PointState>,
     actions: &mut Vec<Action>,
 ) {
-    ui.heading(point_label(&state.slots, input, output));
+    // "From … / To …": the arrow glyph is not in every face.
+    let label = point_label(&state.slots, input, output);
+    let (from, to) = label.split_once(" \u{2192} ").unwrap_or((label.as_str(), ""));
+    ui.heading(format!("From {from}"));
+    if !to.is_empty() {
+        ui.heading(format!("To {to}"));
+    }
     let set =
         |gain_db: f32, mute: bool, invert: bool| Action::Edit(Edit::SetPoint { input, output, gain_db, mute, invert });
     match point {

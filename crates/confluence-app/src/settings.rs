@@ -1,4 +1,4 @@
-//! The Settings window: the gear finish, with a live preview.
+//! The Settings window: the gear finish, with a live preview, and motion.
 
 use eframe::egui::{self, Color32, Id, Rect, Vec2};
 
@@ -7,9 +7,12 @@ use crate::gear::skins::{Finish, GearSkin};
 
 /// Where the chosen finish is stored (eframe storage).
 pub const FINISH_KEY: &str = "skin_finish";
+/// Where "Reduce motion" is stored.
+pub const REDUCE_MOTION_KEY: &str = "reduce_motion";
 
-/// Shows the window while `open`; the radio buttons change `finish`.
-pub fn show(ctx: &egui::Context, open: &mut bool, finish: &mut Finish) {
+/// Shows the window while `open`; the radio buttons change `finish`, the
+/// checkbox `reduce` (tweens land at once; meters and LEDs keep their timing).
+pub fn show(ctx: &egui::Context, open: &mut bool, finish: &mut Finish, reduce: &mut bool) {
     egui::Window::new("Settings").open(open).resizable(false).collapsible(false).show(ctx, |ui| {
         ui.label("Finish");
         ui.horizontal(|ui| {
@@ -19,6 +22,9 @@ pub fn show(ctx: &egui::Context, open: &mut bool, finish: &mut Finish) {
         });
         ui.add_space(8.0);
         preview(ui, *finish);
+        ui.add_space(8.0);
+        ui.checkbox(reduce, "Reduce motion")
+            .on_hover_text("Panels and highlights move at once; meters and LEDs keep their timing");
     });
 }
 
@@ -26,6 +32,7 @@ pub fn show(ctx: &egui::Context, open: &mut bool, finish: &mut Finish) {
 fn preview(ui: &mut egui::Ui, finish: Finish) {
     let s = GearSkin::preset(finish);
     let (r, _) = ui.allocate_exact_size(Vec2::new(300.0, 150.0), egui::Sense::hover());
+    paint::ground(ui.painter(), r, &s);
     let face = r.shrink(14.0);
     paint::panel(ui.painter(), face, &s, None);
     let oled = Rect::from_min_size(face.min + Vec2::new(16.0, 18.0), Vec2::new(140.0, 44.0));
