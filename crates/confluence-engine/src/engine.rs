@@ -22,6 +22,7 @@ use confluence_core::processor::Processor;
 use crate::alloc::ChannelAllocator;
 
 mod colours;
+mod labels;
 mod midi_map;
 mod scenes;
 mod scripts;
@@ -29,7 +30,7 @@ use crate::audio::{
     AudioEngine, AudioMsg, BusEntry, InputEntry, LoadMeter, MeterRanges, Metering, OutputEntry, Returned, StrictEntry,
     StrictSide, MAX_BUSES, MAX_SLOTS,
 };
-use confluence_api::{meter_byte, MeterFrame};
+use confluence_api::{meter_byte, ChannelRef, MeterFrame};
 use confluence_core::meter::{rms_coeff, MeterBank};
 
 /// Time constant of the RMS meters, in seconds.
@@ -341,6 +342,8 @@ pub struct Engine {
     scripts: confluence_script::ScriptHost,
     /// Colours chosen for devices and buses.
     colours: colours::Colours,
+    /// Custom names for devices and channels.
+    labels: labels::Labels,
     /// Editor changes not saved yet, by (send column, param).
     edits_held: std::collections::BTreeMap<(u32, u32), f64>,
     /// When each (send column, param) was last saved.
@@ -418,6 +421,7 @@ impl Engine {
             midi: midi_map::Midi::default(),
             scripts: confluence_script::ScriptHost::new(),
             colours: colours::Colours::default(),
+            labels: labels::Labels::default(),
             edits_saved: std::collections::HashMap::new(),
             blocks,
             master_ppm,
@@ -1224,7 +1228,19 @@ impl Engine {
             .iter()
             .map(|s| {
                 let (input_names, output_names) = channel_names(&s.state);
-                SlotState { color: self.colours.of_key(&Self::key_of(s)), input_names, output_names, ..s.state.clone() }
+                let key = Self::key_of(s);
+                let named = |input: bool, n: u32| -> Vec<Option<String>> {
+                    (0..n).map(|i| self.labels.of(&labels::channel_key(&key, input, i)).map(str::to_string)).collect()
+                };
+                SlotState {
+                    color: self.colours.of_key(&key),
+                    input_names,
+                    output_names,
+                    label: self.labels.of(&key).map(str::to_string),
+                    input_labels: named(true, s.state.inputs),
+                    output_labels: named(false, s.state.outputs),
+                    ..s.state.clone()
+                }
             })
             .collect()
     }
@@ -1259,6 +1275,25 @@ impl Engine {
         if let Some(s) = self.slots.iter_mut().find(|s| s.state.id == id) {
             s.color_key = key;
         }
+    }
+
+    /// The key slot `id`'s name (`channel: None`) or one of its channels'
+    /// names is kept under; `None` if there is no such slot or channel.
+    pub fn label_key(&self, id: u32, channel: Option<ChannelRef>) -> Option<String> {
+        let s = self.slots.iter().find(|s| s.state.id == id)?;
+        let base = Self::key_of(s);
+        match channel {
+            None => Some(base),
+            Some(c) => {
+                let count = if c.input { s.state.inputs } else { s.state.outputs };
+                (c.index < count).then(|| labels::channel_key(&base, c.input, c.index))
+            }
+        }
+    }
+
+    /// The commands that recreate every custom name (for the journal).
+    pub fn label_commands(&self) -> Vec<Command> {
+        self.labels.commands()
     }
 
     /// The commands that recreate every colour chosen (for the journal).
@@ -1327,8 +1362,15 @@ impl Engine {
             | Command::SetVirtual { .. }
             | Command::SetMaster { .. } => Response::Error("positions are handled by the engine process".into()),
             Command::SubscribeMeters => Response::Error("subscriptions are served by the engine process".into()),
-            Command::SetSlotLabel { .. } | Command::SetLabel { .. } => {
-                Response::Error("custom names are not supported yet".into())
+            Command::SetSlotLabel { id, channel, ref name } => match self.label_key(id, channel) {
+                Some(key) => self.labels.set(&key, name.as_deref()).map_or_else(Response::Error, |()| Response::Ok),
+                None if channel.is_some() && self.slots.iter().any(|s| s.state.id == id) => {
+                    Response::Error(format!("slot {id} has no such channel"))
+                }
+                None => Response::Error(format!("there is no slot {id}")),
+            },
+            Command::SetLabel { ref key, ref name } => {
+                self.labels.set(key, name.as_deref()).map_or_else(Response::Error, |()| Response::Ok)
             }
             Command::ClearClip => {
                 self.meters_in.clear_clips();

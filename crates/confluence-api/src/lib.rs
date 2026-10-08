@@ -349,6 +349,8 @@ impl Command {
                 | Command::DeleteScript { .. }
                 | Command::SetSlotColor { .. }
                 | Command::SetColor { .. }
+                | Command::SetSlotLabel { .. }
+                | Command::SetLabel { .. }
         )
     }
 }

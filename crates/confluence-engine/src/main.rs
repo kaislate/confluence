@@ -264,6 +264,10 @@ mod app {
                 Command::LoadPlugin { bus: at(bus), path: path.clone(), plugin_id: plugin_id.clone() }
             }
             // Slot ids change between runs: a colour is kept under its device.
+            Command::SetSlotLabel { id, channel, name } => match engine.label_key(*id, *channel) {
+                Some(key) => Command::SetLabel { key, name: confluence_api::clean_label(name.as_deref()) },
+                None => cmd.clone(),
+            },
             Command::SetSlotColor { id, color } => match engine.color_key(*id) {
                 Some(key) => Command::SetColor { key, color: *color },
                 None => cmd.clone(),
@@ -653,6 +657,7 @@ mod app {
         out.extend(engine.midi_commands());
         out.extend(engine.script_commands());
         out.extend(engine.color_commands());
+        out.extend(engine.label_commands());
         // Mid-morph, the routes are saved where the morph is taking them.
         out.extend(engine.settled_points().into_iter().map(|p| Command::SetPoint {
             input: p.input,

@@ -814,3 +814,36 @@ fn routes_moved_by_a_swap_survive_an_engine_that_is_killed() {
     assert_eq!(points(&mut c), vec![(0, after + 1)], "the route is where the swap moved it");
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn custom_names_survive_an_engine_that_is_killed_and_a_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let pipe = format!("confluence-labels-{}", std::process::id());
+    let mut engine = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+    let vasio = slots.iter().find(|s| s.name == "VASIO 1").expect("a fresh setup has VASIO A").id;
+    let set = |name: &str, channel| Command::SetSlotLabel { id: vasio, channel, name: Some(name.into()) };
+    let ch = Some(confluence_api::ChannelRef { input: true, index: 0 });
+    assert!(matches!(c.call(set("Ableton", None)).unwrap(), Response::Applied { .. }));
+    assert!(matches!(c.call(set("Kick", ch)).unwrap(), Response::Applied { .. }));
+    engine.kill();
+    let mut engine = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let names = |c: &mut Client| {
+        let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+        let s = slots.into_iter().find(|s| s.name == "VASIO 1").unwrap();
+        (s.label, s.input_labels.first().cloned().flatten())
+    };
+    assert_eq!(names(&mut c), (Some("Ableton".into()), Some("Kick".into())));
+    // A compaction (removing a slot rewrites the journal) keeps them too.
+    let bus = Command::AddBus { name: "Verb".into(), channels: 2, first_input: None, first_output: None };
+    let Response::Added { ids, .. } = c.call(bus).unwrap() else { panic!() };
+    assert!(matches!(c.call(Command::RemoveSlot { id: ids[0] }).unwrap(), Response::Applied { .. }));
+    engine.kill();
+    let _engine = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(names(&mut c), (Some("Ableton".into()), Some("Kick".into())));
+    c.call(Command::Shutdown).unwrap();
+}
