@@ -221,6 +221,13 @@ fn a_vasio_is_turned_on_from_the_devices_screen() {
     let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
     h.get_by_label("Devices").click();
+    // The wall is collapsed: only the next switched-off position (B) shows
+    // until the group is opened.
+    pump_until(&mut h, "the collapsed Virtual group", LONG, |h| {
+        h.query_by_label("Show all Virtual positions").is_some()
+    });
+    assert!(h.query_by_label("Turn on VASIO C").is_none(), "C is folded away");
+    h.get_by_label("Show all Virtual positions").click();
     pump_until(&mut h, "VASIO C's card", LONG, |h| h.query_by_label("Turn on VASIO C").is_some());
     h.get_by_label("Turn on VASIO C").click();
     pump_until(&mut h, "the new slot", LONG, |_| slots(&mut client(&d)).iter().any(|s| s.name == "VASIO 3"));
@@ -660,6 +667,15 @@ fn a_devices_colour_is_picked_in_the_inspector() {
     let rgb = [first.r(), first.g(), first.b()];
     let swatch = format!("Colour #{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
     pump_until(&mut h, "the colour swatches", LONG, |h| h.query_by_label(&swatch).is_some());
+    // The rack panel animates into place: click once the swatch stops moving
+    // (a slow machine could otherwise click where it was a frame ago).
+    let mut last = h.get_by_label(&swatch).rect();
+    pump_until(&mut h, "the swatch to settle", LONG, |h| {
+        let now = h.get_by_label(&swatch).rect();
+        let still = now == last;
+        last = now;
+        still
+    });
     settle(&mut h);
     h.get_by_label(&swatch).click();
     pump_until(&mut h, "the device coloured in the engine", LONG, |_| {

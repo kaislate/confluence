@@ -9,7 +9,7 @@ use confluence_api::{PointState, SlotState};
 use crate::commands::Edit;
 use crate::theme::clamp_gain;
 
-pub const CELL_DEFAULT: f32 = 18.0;
+pub const CELL_DEFAULT: f32 = 22.0;
 pub const CELL_MIN: f32 = 12.0;
 pub const CELL_MAX: f32 = 40.0;
 /// Pixels of vertical drag per gain step.

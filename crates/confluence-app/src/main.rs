@@ -32,6 +32,9 @@ fn main() -> eframe::Result {
             if let Some(f) = saved.as_deref().and_then(confluence_app::gear::skins::Finish::from_name) {
                 app.set_finish(f);
             }
+            if let Some(v) = cc.storage.and_then(|s| s.get_string(confluence_app::settings::REDUCE_MOTION_KEY)) {
+                app.set_reduce_motion(v == "true");
+            }
             Ok(Box::new(app))
         }),
     );

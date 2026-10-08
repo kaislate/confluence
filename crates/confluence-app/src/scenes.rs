@@ -1,10 +1,13 @@
-//! The scene bar: one button per scene (click to recall), and a form to save
-//! the current mix as a scene.
+//! The scene rail: one glass pill per scene (click to recall, the current
+//! one lit), and a form to save the current mix as a scene.
 
 use confluence_api::{State, MAX_MORPH_MS};
-use eframe::egui::{self, DragValue, RichText, TextEdit, WidgetInfo, WidgetType};
+use eframe::egui::{self, Align2, DragValue, TextEdit, Vec2, WidgetInfo, WidgetType};
 
 use crate::commands::Edit;
+use crate::gear::motion::Motion;
+use crate::gear::paint;
+use crate::gear::skins::GearSkin;
 
 /// The bar's own state: the "+ Scene" form.
 pub struct SceneBar {
@@ -24,22 +27,54 @@ fn ms(seconds: f32) -> u32 {
     ((seconds.clamp(0.0, MAX_MORPH_MS as f32 / 1000.0)) * 1000.0).round() as u32
 }
 
-/// Draws the bar; returns what the user asked for.
-pub fn show(ui: &mut egui::Ui, state: &State, bar: &mut SceneBar, editable: bool) -> Vec<Edit> {
+/// Draws the rail; returns what the user asked for.
+pub fn show(
+    ui: &mut egui::Ui,
+    state: &State,
+    bar: &mut SceneBar,
+    skin: &GearSkin,
+    motion: &mut Motion,
+    editable: bool,
+) -> Vec<Edit> {
     let mut edits = Vec::new();
     ui.add_enabled_ui(editable, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Scenes").strong());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (r, _) = ui.allocate_exact_size(Vec2::new(58.0, paint::PILL_H), egui::Sense::hover());
+            paint::etched_text(
+                ui.painter(),
+                r.left_center() + Vec2::new(4.0, 0.0),
+                Align2::LEFT_CENTER,
+                "SCENES",
+                skin,
+                skin.ground_ink,
+                10.5,
+                true,
+                0.16,
+                0.7,
+            );
             if state.scenes.is_empty() && !bar.adding {
-                ui.label(RichText::new("Save the current mix as a scene to recall it later").weak());
+                let (r, _) = ui.allocate_exact_size(Vec2::new(300.0, paint::PILL_H), egui::Sense::hover());
+                paint::etched_text(
+                    ui.painter(),
+                    r.left_center(),
+                    Align2::LEFT_CENTER,
+                    "Save the current mix as a scene to recall it later",
+                    skin,
+                    skin.ground_ink,
+                    11.5,
+                    false,
+                    0.0,
+                    0.55,
+                );
             }
             for s in &state.scenes {
                 let current = state.current_scene.as_deref() == Some(s.name.as_str());
-                let r = ui.selectable_label(current, &s.name);
                 let label = format!("Scene {}", s.name);
+                let r = paint::pill_lit(ui, &s.name, &label, current, skin);
                 r.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, current, &label));
                 let r = r.on_hover_text(format!(
-                    "Recall (glides over {:.1} s) · {} routes, {} plugin settings · right-click for more",
+                    "Recall (glides over {:.1} s) \u{b7} {} routes, {} plugin settings \u{b7} right-click for more",
                     s.morph_ms as f32 / 1000.0,
                     s.routes,
                     s.params
@@ -67,24 +102,38 @@ pub fn show(ui: &mut egui::Ui, state: &State, bar: &mut SceneBar, editable: bool
                 });
             }
             if state.morphing {
-                ui.label(RichText::new("morphing…").italics());
+                let k = 0.5 + 0.5 * motion.pulse(1.0);
+                let (r, l) = ui.allocate_exact_size(Vec2::new(80.0, paint::PILL_H), egui::Sense::hover());
+                l.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, "morphing\u{2026}"));
+                paint::etched_text(
+                    ui.painter(),
+                    r.left_center(),
+                    Align2::LEFT_CENTER,
+                    "MORPHING",
+                    skin,
+                    skin.accent,
+                    10.5,
+                    true,
+                    0.14,
+                    k,
+                );
             }
-            ui.separator();
+            ui.add_space(6.0);
             if bar.adding {
                 ui.add(TextEdit::singleline(&mut bar.name).hint_text("Scene name").desired_width(120.0));
                 ui.add(DragValue::new(&mut bar.morph_s).range(0.0..=10.0).speed(0.05).prefix("morph ").suffix(" s"));
                 let name = bar.name.trim().to_string();
-                let save = ui.add_enabled(!name.is_empty(), egui::Button::new("Save"));
-                save.widget_info(|| WidgetInfo::labeled(WidgetType::Button, !name.is_empty(), "Save scene"));
-                if save.clicked() {
+                let ok = !name.is_empty();
+                let save = ui.add_enabled_ui(ok, |ui| paint::pill_labeled(ui, "Save", "Save scene", skin)).inner;
+                if save.clicked() && ok {
                     edits.push(Edit::SaveScene { name, morph_ms: ms(bar.morph_s) });
                     bar.adding = false;
                     bar.name.clear();
                 }
-                if ui.button("Cancel").clicked() {
+                if paint::pill_labeled(ui, "Cancel", "Cancel", skin).clicked() {
                     bar.adding = false;
                 }
-            } else if ui.button("+ Scene").clicked() {
+            } else if paint::pill_labeled(ui, "+ Scene", "+ Scene", skin).clicked() {
                 bar.adding = true;
             }
         });
@@ -95,6 +144,7 @@ pub fn show(ui: &mut egui::Ui, state: &State, bar: &mut SceneBar, editable: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gear::skins::Finish;
     use confluence_api::{EngineStatus, SceneInfo, State};
     use egui_kittest::kittest::Queryable;
     use egui_kittest::Harness;
@@ -132,10 +182,15 @@ mod tests {
         }
     }
 
-    fn harness(st: State) -> Harness<'static, (SceneBar, Vec<Edit>)> {
+    fn harness(st: State) -> Harness<'static, (SceneBar, Vec<Edit>, Motion)> {
+        let skin = GearSkin::preset(Finish::Graphite);
         Harness::new_ui_state(
-            move |ui, (bar, edits): &mut (SceneBar, Vec<Edit>)| edits.extend(show(ui, &st, bar, true)),
-            (SceneBar::default(), Vec::new()),
+            move |ui, (bar, edits, motion): &mut (SceneBar, Vec<Edit>, Motion)| {
+                motion.begin_frame(ui.ctx());
+                edits.extend(show(ui, &st, bar, &skin, motion, true));
+                motion.end_frame(ui.ctx());
+            },
+            (SceneBar::default(), Vec::new(), Motion::default()),
         )
     }
 
@@ -185,7 +240,7 @@ mod tests {
     #[test]
     fn a_morph_in_progress_is_shown() {
         let mut h = harness(state(Some("Chorus"), true));
-        h.run();
+        h.run_steps(3); // the pulse keeps asking for frames
         assert!(h.query_by_label_contains("morphing").is_some());
     }
 }

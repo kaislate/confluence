@@ -18,5 +18,6 @@ pub mod plugins;
 pub mod scenes;
 pub mod scripts;
 pub mod settings;
+pub mod shell;
 pub mod skin;
 pub mod theme;
