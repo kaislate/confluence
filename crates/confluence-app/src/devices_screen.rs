@@ -21,6 +21,8 @@ pub enum ScreenAction {
     Select(u32),
     /// Ask before emptying this position.
     AskClear(PosId),
+    /// Ask before switching this virtual position off (its routes go).
+    AskTurnOff(PosId),
 }
 
 pub struct ScreenState {
@@ -425,7 +427,7 @@ fn card(
     } else {
         if virt {
             if paint::pill_labeled(&mut row, "Turn off", &format!("Turn off {label}"), &skin).clicked() {
-                actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: false, shape: None }));
+                actions.push(ScreenAction::AskTurnOff(p.pos));
             }
             if p.pos.group == PosGroup::Vasio {
                 shape_menu(&mut row, p, &skin, actions);

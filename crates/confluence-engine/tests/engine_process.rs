@@ -773,3 +773,44 @@ fn a_version_1_setup_migrates_once_with_backups() {
     assert!(!state.notices.iter().any(|n| n.contains("Out 9")), "the note was a one-time one");
     shutdown(child, &mut c);
 }
+
+#[test]
+fn routes_moved_by_a_swap_survive_an_engine_that_is_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let pipe = format!("confluence-swap-kill-{}", std::process::id());
+    let pos = |s: &str| -> confluence_api::PosId { s.parse().unwrap() };
+    let fill = |p: &str, name: &str| Command::FillPosition {
+        pos: pos(p),
+        kind: confluence_api::DeviceKind::NetSend,
+        name: name.into(),
+    };
+    let first_output = |c: &mut Client, stream: &str| {
+        let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+        let device = format!("net-out:127.0.0.1:9/{stream}");
+        slots.iter().find(|s| s.device.starts_with(&device)).unwrap().first_output
+    };
+    let points = |c: &mut Client| {
+        let Response::Points(p) = c.call(Command::ListPoints).unwrap() else { panic!() };
+        p.into_iter().map(|p| (p.input, p.output)).collect::<Vec<_>>()
+    };
+    let mut engine = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert!(matches!(c.call(fill("net-out:1", "127.0.0.1:9/A:2")).unwrap(), Response::Added { .. }));
+    assert!(matches!(c.call(fill("net-out:2", "127.0.0.1:9/B:2")).unwrap(), Response::Added { .. }));
+    let before = first_output(&mut c, "A");
+    let set = Command::SetPoint { input: 0, output: before + 1, gain_db: -6.0, mute: false, invert: false };
+    assert!(matches!(c.call(set).unwrap(), Response::Applied { .. }));
+    // Another stream, of eight channels, does not fit where it is (net-out:2 follows it): it moves, its route with it.
+    let r = c.call(fill("net-out:1", "127.0.0.1:9/C:8")).unwrap();
+    assert!(matches!(r, Response::Added { .. }), "{r:?}");
+    let after = first_output(&mut c, "C");
+    assert_ne!(after, before, "moved to a free block");
+    assert_eq!(points(&mut c), vec![(0, after + 1)]);
+    engine.kill(); // no clean shutdown: only what was saved counts
+    let _engine = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(first_output(&mut c, "C"), after);
+    assert_eq!(points(&mut c), vec![(0, after + 1)], "the route is where the swap moved it");
+    c.call(Command::Shutdown).unwrap();
+}

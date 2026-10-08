@@ -751,3 +751,55 @@ fn meters_read_the_fake_drivers_quarter_scale_input_and_its_routed_output() {
     assert!(f.clipped_in.is_empty());
     clock.stop();
 }
+
+#[test]
+fn making_another_device_the_master_keeps_both_on_their_channels() {
+    let _budget = driver_budget();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("devices.json");
+    let (m, soft) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
+    let open = || opener(vec![("fake:m", m.clone()), ("fake:soft", soft.clone())]);
+    let asio = |n: &str| -> confluence_api::PosId { n.parse().unwrap() };
+    {
+        // First run: fake:m is the master (ASIO 1), fake:soft fills ASIO 2; then ASIO 2 is made master.
+        let (devices, _) = DeviceManager::open_file(path.clone());
+        let mut devices = devices.with_asio_opener(open());
+        let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 128));
+        let mut master = open()("fake:m").unwrap();
+        let (_, _, ch) = start_asio_master(&mut master, &mut engine, audio, "fake:m", None).unwrap();
+        devices.set_master("fake:m", ch).unwrap();
+        devices.add(&mut engine, DeviceKind::Asio, "fake:soft").unwrap();
+        let soft_in = engine.slots().into_iter().find(|s| s.name == "fake:soft in").unwrap().first_input;
+        assert_eq!(soft_in, 2);
+        let r = devices.handle(&mut engine, &Command::SetMaster { pos: Some(asio("asio:2")) });
+        assert_eq!(r, Some(Response::Ok));
+        let ps = devices.positions(&engine);
+        let at = |p: &str| ps.iter().find(|s| s.pos == asio(p)).unwrap().clone();
+        assert_eq!(at("asio:1").device.unwrap().name, "fake:m", "the running master still shows in its position");
+        assert!(at("asio:2").master, "ASIO 2 is master from the next start");
+        master.stop();
+    }
+    // Second run: fake:soft is the master on its own channels; fake:m is an ordinary device on its own.
+    let (devices, _) = DeviceManager::open_file(path.clone());
+    let mut devices = devices.with_asio_opener(open());
+    assert_eq!(devices.saved_master_name().as_deref(), Some("fake:soft"));
+    let placement = devices.saved_master("fake:soft");
+    assert_eq!(placement, Some((2, 2)), "the new master keeps its channels");
+    devices.claim_master("fake:soft");
+    let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 128));
+    let mut master = open()("fake:soft").unwrap();
+    let (_, _, ch) = start_asio_master(&mut master, &mut engine, audio, "fake:soft", placement).unwrap();
+    assert_eq!((ch.first_input, ch.first_output), (2, 2));
+    let warnings = devices.restore(&mut engine);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    devices.set_master("fake:soft", ch).unwrap();
+    let old = engine.slots().into_iter().find(|s| s.name == "fake:m in").expect("the old master is kept");
+    assert_eq!(old.first_input, 0, "on its own channels: {warnings:?}");
+    let ps = devices.positions(&engine);
+    let at = |p: &str| ps.iter().find(|s| s.pos == asio(p)).unwrap().clone();
+    assert_eq!(at("asio:1").device.unwrap().name, "fake:m");
+    assert!(at("asio:2").master);
+    assert_eq!(at("asio:2").device.unwrap().name, "fake:soft");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("fake:m"), "the old master stays in the setup");
+    master.stop();
+}

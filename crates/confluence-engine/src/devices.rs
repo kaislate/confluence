@@ -140,7 +140,7 @@ enum Loaded {
 type DirectionPlace = (Option<u32>, Option<(u32, u32, u32)>);
 
 /// A loaded device's (inputs, outputs), where known before it is attached.
-fn loaded_shape(name: &str, loaded: &Loaded) -> Option<(u32, u32)> {
+fn loaded_shape(kind: DeviceKind, name: &str, loaded: &Loaded) -> Option<(u32, u32)> {
     match loaded {
         Loaded::Asio(dev) => Some((dev.info().inputs() as u32, dev.info().outputs() as u32)),
         Loaded::Wasapi(stream, _) => {
@@ -149,7 +149,11 @@ fn loaded_shape(name: &str, loaded: &Loaded) -> Option<(u32, u32)> {
             Some(if f.direction == Direction::Render { (0, ch) } else { (ch, 0) })
         }
         Loaded::Vasio => parse_vasio(name).ok().map(|(_, daw_in, daw_out)| (daw_out as u32, daw_in as u32)),
-        Loaded::Vaio | Loaded::Net(..) => None,
+        // A stream named with its channel count (a receive learns it only when heard).
+        Loaded::Net(n, _) => {
+            n.channels.map(|c| if kind == DeviceKind::NetSend { (0, c as u32) } else { (c as u32, 0) })
+        }
+        Loaded::Vaio => None,
     }
 }
 
@@ -413,6 +417,9 @@ pub struct DeviceManager {
     migration_notes: Vec<String>,
     /// Colour keys a migration changed (old, new), for the engine's colours.
     color_rekeys: Vec<(String, String)>,
+    /// The position of the master running now (the flag may name another
+    /// for the next start).
+    master_now: Option<PosId>,
 }
 
 impl DeviceManager {
@@ -440,6 +447,7 @@ impl DeviceManager {
             reserved: Vec::new(),
             migration_notes: Vec::new(),
             color_rekeys: Vec::new(),
+            master_now: None,
         }
     }
 
@@ -589,7 +597,16 @@ impl DeviceManager {
 
     /// Saved channel placement (first input, first output) of the master `name`, if any.
     pub fn saved_master(&self, name: &str) -> Option<(u32, u32)> {
-        self.saved.master.as_ref().filter(|b| b.name == name).map(|b| (b.first_input, b.first_output))
+        let saved = self.saved.master.as_ref().filter(|b| b.name == name);
+        // A device made master since: its binding at the master position.
+        let made = || {
+            let p = self.table.master()?;
+            self.restore_list
+                .iter()
+                .find(|(q, b)| *q == Some(p) && b.kind == DeviceKind::Asio && b.name == name)
+                .map(|(_, b)| b)
+        };
+        saved.or_else(made).map(|b| (b.first_input, b.first_output))
     }
 
     /// Declares which ASIO driver is the master, before [`restore`](Self::restore):
@@ -606,6 +623,10 @@ impl DeviceManager {
             // A master given on the command line takes the first free ASIO position.
             let _ = self.table.set_master(next_free(PosGroup::Asio, &self.taken()));
         }
+        self.master_now = self.table.master();
+        // Its binding as an ordinary device (from when it was not master) is done with.
+        let at = self.master_now;
+        self.restore_list.retain(|(q, b)| !(*q == at && b.kind == DeviceKind::Asio && b.name == name));
         self.master = Some(Binding {
             kind: DeviceKind::Asio,
             name: name.to_string(),
@@ -801,6 +822,8 @@ impl DeviceManager {
     /// Positions in use: filled, held for a device being opened, or the master's.
     fn taken(&self) -> Vec<PosId> {
         let mut t: Vec<PosId> = self.bound.iter().filter_map(|b| b.pos).collect();
+        t.extend(self.restore_list.iter().filter_map(|(p, _)| *p));
+        t.extend(self.master_now.filter(|_| self.master.is_some()));
         t.extend(self.reserved.iter().map(|(_, _, p)| *p));
         t.extend(self.table.master().filter(|_| self.master.is_some() || self.saved.master.is_some()));
         t
@@ -896,7 +919,7 @@ impl DeviceManager {
         name: &str,
         loaded: Loaded,
     ) -> Result<Bound, String> {
-        let shape = loaded_shape(name, &loaded);
+        let shape = loaded_shape(kind, name, &loaded);
         let Bound { binding: old, slots, handles, pos } = self.bound.remove(i);
         drop(handles); // stop callbacks before the slots are detached
         for id in &slots {
@@ -1020,7 +1043,11 @@ impl DeviceManager {
                 continue;
             }
             if b.kind == DeviceKind::Asio && self.master_name.as_deref() == Some(b.name.as_str()) {
-                warnings.push(format!("{} is now the master clock device; its device binding was dropped", b.device()));
+                // Made master at its own position: expected, nothing to say.
+                if pos.is_none() || pos != self.table.master() {
+                    warnings
+                        .push(format!("{} is now the master clock device; its device binding was dropped", b.device()));
+                }
                 continue;
             }
             let pos = pos.or_else(|| self.default_pos(&b));
@@ -1177,6 +1204,14 @@ impl DeviceManager {
     /// The ASIO position to use as master from the next start.
     pub fn set_master_pos(&mut self, pos: Option<PosId>) -> Result<(), String> {
         self.table.set_master(pos)?;
+        // The master running now stays in the setup: from the next start it is
+        // an ordinary device in its own position (unless it is chosen again).
+        if let (Some(now), Some(m)) = (self.master_now, self.master.clone()) {
+            self.restore_list.retain(|(q, b)| !(*q == Some(now) && b.name == m.name));
+            if pos != Some(now) {
+                self.restore_list.push((Some(now), m));
+            }
+        }
         self.save()
     }
 
@@ -1212,7 +1247,7 @@ impl DeviceManager {
                     (status, v.map(|v| v.shape), device, ids)
                 } else if let Some(b) = b {
                     (PositionStatus::Filled { online: !b.handles.is_empty() }, None, device, ids)
-                } else if master && self.master.is_some() {
+                } else if Some(pos) == self.master_now && self.master.is_some() {
                     let m =
                         self.master.as_ref().map(|m| PositionDevice { kind: DeviceKind::Asio, name: m.name.clone() });
                     let ids = self.master_health.as_ref().map(|(id, _)| vec![*id]).unwrap_or_default();

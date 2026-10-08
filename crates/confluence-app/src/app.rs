@@ -76,6 +76,24 @@ pub fn telemetry_repaint(graphs_shown: bool) -> Option<Duration> {
     }
 }
 
+/// What a store update asks of the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Repaint {
+    Now,
+    After(Duration),
+    Skip,
+}
+
+/// How to repaint for `what`: meter frames only while meters are on screen
+/// (the Devices screen), telemetry slowly unless live graphs are shown.
+pub fn repaint_for(what: Update, graphs_shown: bool, meters_shown: bool) -> Repaint {
+    match what {
+        Update::Meters if !meters_shown => Repaint::Skip,
+        Update::Telemetry => telemetry_repaint(graphs_shown).map_or(Repaint::Now, Repaint::After),
+        _ => Repaint::Now,
+    }
+}
+
 /// True once per new snapshot: `seen` is the snapshot count last handled.
 pub fn fresh_snapshot(seen: &mut u64, snapshots: u64) -> bool {
     let fresh = snapshots != *seen;
@@ -174,6 +192,8 @@ pub struct ConfluenceApp {
     snapshots_seen: u64,
     /// Whether live health graphs are on screen (telemetry repaints at full rate).
     graphs_live: Arc<AtomicBool>,
+    /// Whether meters are on screen (meter frames repaint only then).
+    meters_live: Arc<AtomicBool>,
     look: Look,
     skin_dir: Option<PathBuf>,
     /// A slot waiting for "Remove ‹name›?" to be confirmed.
@@ -181,8 +201,9 @@ pub struct ConfluenceApp {
     /// Which screen the central panel shows.
     screen: Screen,
     screen_state: crate::devices_screen::ScreenState,
-    /// A position waiting for "Clear ‹position›?" to be confirmed.
-    confirm_clear: Option<confluence_api::PosId>,
+    /// A position waiting for "Clear ‹position›?" (true) or "Turn off
+    /// ‹position›?" (false) to be confirmed.
+    confirm_clear: Option<(confluence_api::PosId, bool)>,
     /// The plugin picker, while open.
     picker: Option<crate::plugins::Picker>,
     /// Parameter values sent and not yet confirmed: (bus, param) → value.
@@ -222,15 +243,19 @@ impl ConfluenceApp {
             })
         };
         let graphs_live = Arc::new(AtomicBool::new(false));
+        let meters_live = Arc::new(AtomicBool::new(false));
         // Always with meters: the Devices screen shows them.
         let store = StateStore::spawn_with_meters(config.pipe.clone(), {
-            let (repaint, graphs_live) = (repaint.clone(), graphs_live.clone());
+            let (repaint, graphs_live, meters_live) = (repaint.clone(), graphs_live.clone(), meters_live.clone());
             Box::new(move |what| {
                 if let Ok(ctx) = repaint.lock() {
                     if let Some(ctx) = ctx.as_ref() {
-                        match (what, telemetry_repaint(graphs_live.load(Ordering::Relaxed))) {
-                            (Update::Telemetry, Some(after)) => ctx.request_repaint_after(after),
-                            _ => ctx.request_repaint(),
+                        let (graphs, meters) =
+                            (graphs_live.load(Ordering::Relaxed), meters_live.load(Ordering::Relaxed));
+                        match repaint_for(what, graphs, meters) {
+                            Repaint::Now => ctx.request_repaint(),
+                            Repaint::After(after) => ctx.request_repaint_after(after),
+                            Repaint::Skip => {}
                         }
                     }
                 }
@@ -252,6 +277,7 @@ impl ConfluenceApp {
             xruns: (0, None),
             snapshots_seen: 0,
             graphs_live,
+            meters_live,
             look: Look::builtin(),
             skin_dir: config.skin,
             confirm_remove: None,
@@ -416,6 +442,7 @@ impl ConfluenceApp {
 
         let graphs = self.inspector_open && matches!(self.selection, Selection::Slot(_));
         self.graphs_live.store(graphs, Ordering::Relaxed);
+        self.meters_live.store(self.screen == Screen::Devices, Ordering::Relaxed);
         self.top_bar(ui, &view, now);
         self.scene_bar(ui, &view);
         self.side_panels(ui, &view, now);
@@ -426,8 +453,6 @@ impl ConfluenceApp {
             }
             Screen::Devices => {
                 self.devices_screen(ui, &view);
-                // Meters move: up to 30 frames a second while they are on screen.
-                ctx.request_repaint_after(Duration::from_millis(33));
             }
         }
         self.notifications(&ctx, &view);
@@ -569,7 +594,8 @@ impl ConfluenceApp {
             match a {
                 crate::devices_screen::ScreenAction::Edit(e) => self.send(e),
                 crate::devices_screen::ScreenAction::Select(id) => self.selection = Selection::Slot(id),
-                crate::devices_screen::ScreenAction::AskClear(pos) => self.confirm_clear = Some(pos),
+                crate::devices_screen::ScreenAction::AskClear(pos) => self.confirm_clear = Some((pos, true)),
+                crate::devices_screen::ScreenAction::AskTurnOff(pos) => self.confirm_clear = Some((pos, false)),
             }
         }
     }
@@ -625,12 +651,13 @@ impl ConfluenceApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
-        if let Some(pos) = self.confirm_clear {
+        if let Some((pos, clear)) = self.confirm_clear {
             let mut answer = None;
-            egui::Window::new("Clear position").collapsible(false).resizable(false).show(ctx, |ui| {
-                ui.label(format!("Clear {}? Its routes are removed.", pos.label()));
+            let (title, verb) = if clear { ("Clear position", "Clear") } else { ("Turn off position", "Turn off") };
+            egui::Window::new(title).collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label(format!("{verb} {}? Its routes are removed.", pos.label()));
                 ui.horizontal(|ui| {
-                    if ui.button("Clear").clicked() {
+                    if ui.button(verb).clicked() {
                         answer = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -641,7 +668,11 @@ impl ConfluenceApp {
             match answer {
                 Some(true) => {
                     self.confirm_clear = None;
-                    self.send(Edit::ClearPosition { pos });
+                    self.send(if clear {
+                        Edit::ClearPosition { pos }
+                    } else {
+                        Edit::SetVirtual { pos, on: false, shape: None }
+                    });
                 }
                 Some(false) => self.confirm_clear = None,
                 None => {}
@@ -896,6 +927,15 @@ mod tests {
         let text = startup_error_text(&"no suitable graphics adapter");
         assert!(text.contains("no suitable graphics adapter"), "{text}");
         assert!(text.contains("audio"), "says that audio is unaffected: {text}");
+    }
+
+    #[test]
+    fn meters_repaint_only_while_they_are_on_screen() {
+        assert_eq!(repaint_for(Update::Meters, false, false), Repaint::Skip, "the matrix shows no meters");
+        assert_eq!(repaint_for(Update::Meters, false, true), Repaint::Now, "the Devices screen does");
+        assert_eq!(repaint_for(Update::State, false, false), Repaint::Now);
+        assert_eq!(repaint_for(Update::Telemetry, false, false), Repaint::After(TELEMETRY_REPAINT));
+        assert_eq!(repaint_for(Update::Telemetry, true, false), Repaint::Now);
     }
 
     #[test]

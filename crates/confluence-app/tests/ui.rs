@@ -753,3 +753,20 @@ fn a_filled_position_is_cleared_after_confirming() {
     pump_until(&mut h, "the slot gone", LONG, |_| !slots(&mut c).iter().any(|s| s.device.starts_with("net-out:")));
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn turning_a_vasio_off_asks_first() {
+    let d = EngineDir::new("vasio-off");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO A's Turn off", LONG, |h| h.query_by_label("Turn off VASIO A").is_some());
+    h.get_by_label("Turn off VASIO A").click();
+    pump_until(&mut h, "the question", LONG, |h| h.query_by_label_contains("Its routes are removed").is_some());
+    assert!(slots(&mut c).iter().any(|s| s.name == "VASIO 1"), "nothing happens before the answer");
+    h.get_by_label("Turn off").click();
+    pump_until(&mut h, "VASIO A off", LONG, |_| !slots(&mut c).iter().any(|s| s.name == "VASIO 1"));
+    c.call(Command::Shutdown).unwrap();
+}

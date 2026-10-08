@@ -495,9 +495,14 @@ mod app {
                     name,
                 } => {
                     let mut s = lock(state);
-                    let State { engine, devices, .. } = &mut *s;
+                    let State { engine, devices, journal, .. } = &mut *s;
                     return match devices.add(engine, *kind, name) {
                         Ok(ids) => {
+                            // A swap or reshape moves and drops routes: save them as they are now.
+                            if let Err(e) = journal.compact(&state_commands(engine)) {
+                                publish(&mut s);
+                                return Response::Error(format!("applied but not saved: {e}"));
+                            }
                             let version = publish(&mut s);
                             Response::Added { ids, version }
                         }
@@ -534,10 +539,15 @@ mod app {
                     // Starting an ASIO driver can be slow too: not under the lock.
                     let started = attached.start();
                     let mut s = lock(state);
-                    let State { engine, devices, .. } = &mut *s;
+                    let State { engine, devices, journal, .. } = &mut *s;
                     let added = devices.commit_add(engine, started);
                     return match added {
                         Ok(ids) => {
+                            // A swap or reshape moves and drops routes: save them as they are now.
+                            if let Err(e) = journal.compact(&state_commands(engine)) {
+                                publish(&mut s);
+                                return Response::Error(format!("applied but not saved: {e}"));
+                            }
                             let version = publish(&mut s);
                             Response::Added { ids, version }
                         }
