@@ -667,6 +667,15 @@ fn a_devices_colour_is_picked_in_the_inspector() {
     let rgb = [first.r(), first.g(), first.b()];
     let swatch = format!("Colour #{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
     pump_until(&mut h, "the colour swatches", LONG, |h| h.query_by_label(&swatch).is_some());
+    // The rack panel animates into place: click once the swatch stops moving
+    // (a slow machine could otherwise click where it was a frame ago).
+    let mut last = h.get_by_label(&swatch).rect();
+    pump_until(&mut h, "the swatch to settle", LONG, |h| {
+        let now = h.get_by_label(&swatch).rect();
+        let still = now == last;
+        last = now;
+        still
+    });
     settle(&mut h);
     h.get_by_label(&swatch).click();
     pump_until(&mut h, "the device coloured in the engine", LONG, |_| {
