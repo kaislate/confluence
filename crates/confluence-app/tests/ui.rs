@@ -61,7 +61,13 @@ fn a_click_selects_a_cell_and_space_or_a_double_click_toggles_its_route() {
     pump_until(&mut h, "the route in the engine", LONG, |h| {
         h.state().point(i, o + 1).is_some() && engine_points(&mut c).contains(&(i, o + 1))
     });
-    // A double-click removes it again.
+    // A double-click removes it again. The harness clock moves 1/60 s per
+    // frame whatever the wall clock does: let it pass egui's double-click
+    // window, or the first click below pairs with the selecting click above
+    // whenever the engine answered in few frames.
+    for _ in 0..40 {
+        h.step();
+    }
     let node = h.get_by_role_and_label(Role::Button, cell);
     node.click();
     node.click();
