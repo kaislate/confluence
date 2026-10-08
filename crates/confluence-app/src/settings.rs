@@ -258,11 +258,12 @@ fn meter_tiles(ui: &mut egui::Ui, pane: Rect, look: &mut MeterLook, skin: &GearS
         let p = ui.painter_at(well.expand(2.0));
         paint::oled_well(&p, well, skin);
         let inner = well.shrink2(Vec2::new(8.0, 6.0));
-        if style == MeterStyle::DotMatrix {
-            oled_meter::dot_grid(&p.with_clip_rect(well.shrink(2.0)), well.shrink(2.0), inner.height());
-        }
         let geom = Geom { readout: false, ..Geom::bridge() }.resolve(style, ppp, inner.height());
         let geom = oled_meter::fit_geom(&groups, inner.width(), geom);
+        if style == MeterStyle::DotMatrix {
+            let dots = oled_meter::grid_dots(&geom, ppp, inner.height());
+            oled_meter::dot_grid(&p.with_clip_rect(well.shrink(2.0)), well.shrink(2.0), dots);
+        }
         let layout = oled_meter::meter_layout(&groups, inner, &geom);
         oled_meter::paint_meter(&p, &layout, &groups, &levels, MeterLook { style, ..*look });
     }

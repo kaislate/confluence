@@ -1031,3 +1031,21 @@ fn the_app_picker_lists_apps_and_keeps_pid_entry_behind_advanced_options() {
     });
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn leaving_the_devices_screen_stops_the_app_list() {
+    let d = EngineDir::new("app-list-stop");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "APP 1", LONG, |h| h.query_by_label_contains("APP 1 \u{b7} click").is_some());
+    h.get_by_label_contains("APP 1 \u{b7} click").scroll_to_me();
+    settle(&mut h);
+    h.get_by_label_contains("APP 1 \u{b7} click").click();
+    pump_until(&mut h, "the app list", LONG, |h| h.state().app_list_running());
+    h.key_press_modifiers(eframe::egui::Modifiers::COMMAND, eframe::egui::Key::Num1);
+    settle(&mut h);
+    assert!(!h.state().app_list_running(), "the reader stops when the Devices screen is left");
+    client(&d).call(Command::Shutdown).unwrap();
+}

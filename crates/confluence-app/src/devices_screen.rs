@@ -934,9 +934,19 @@ fn card(
     let well = Rect::from_min_size(r.min + Vec2::new(WELL_INSET, 66.0), Vec2::new(w - 2.0 * WELL_INSET, 74.0));
     paint::oled_well(&painter, well, &skin);
     let inner = well.shrink2(Vec2::new(METER_INSET, 5.0));
+    // The meter's geometry, worked out first: the grid behind takes its dots.
+    let groups = if off { Vec::new() } else { device_groups(p, v) };
+    let mrect = Rect::from_min_max(Pos2::new(inner.left(), inner.top() + 9.0), inner.max);
+    let ppp = ui.ctx().pixels_per_point();
+    let geom = crate::gear::oled_meter::fit_geom(
+        &groups,
+        mrect.width(),
+        Geom::card().resolve(prefs.meter.style, ppp, mrect.height()),
+    );
     if prefs.meter.style == crate::gear::oled_meter::MeterStyle::DotMatrix && !off {
         // The display's own pixel grid, behind its text and meters.
-        crate::gear::oled_meter::dot_grid(&painter.with_clip_rect(well.shrink(2.0)), well.shrink(2.0), inner.height());
+        let dots = crate::gear::oled_meter::grid_dots(&geom, ppp, mrect.height());
+        crate::gear::oled_meter::dot_grid(&painter.with_clip_rect(well.shrink(2.0)), well.shrink(2.0), dots);
     }
     let state_text = if f.line2.is_empty() { f.line1.clone() } else { format!("{} {}", f.line1, f.line2) };
     let state_text: String =
@@ -949,22 +959,14 @@ fn card(
         crate::gear::pixel_font::draw(&mut text_mesh, inner.left_top(), &state_text, 1.0, oled_c, false);
     }
     painter.with_clip_rect(inner).add(egui::Shape::mesh(text_mesh));
-    if !off {
-        let groups = device_groups(p, v);
-        if !groups.is_empty() {
-            // The state line has its own row; the meter fills the rest.
-            let mrect = Rect::from_min_max(Pos2::new(inner.left(), inner.top() + 9.0), inner.max);
-            let ppp = ui.ctx().pixels_per_point();
-            let full = Geom::card().resolve(prefs.meter.style, ppp, mrect.height());
-            let geom = crate::gear::oled_meter::fit_geom(&groups, mrect.width(), full);
-            let m =
-                crate::gear::oled_meter::meter_widget(ui, id.with("meter"), mrect, &groups, &geom, prefs.meter, motion);
-            let what = format!("Channels of {}", p.pos.label());
-            m.response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
-            if m.response.clicked() {
-                st.channels_of = Some(p.pos);
-                st.channel_drafts.clear();
-            }
+    if !groups.is_empty() {
+        // The state line has its own row; the meter fills the rest.
+        let m = crate::gear::oled_meter::meter_widget(ui, id.with("meter"), mrect, &groups, &geom, prefs.meter, motion);
+        let what = format!("Channels of {}", p.pos.label());
+        m.response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
+        if m.response.clicked() {
+            st.channels_of = Some(p.pos);
+            st.channel_drafts.clear();
         }
     }
     // The controls, top right: faint until the card is hovered.

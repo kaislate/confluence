@@ -395,12 +395,17 @@ pub fn dot_columns(width: f32, ppp: f32, dot_px: u32, gap_px: u32) -> usize {
     ((width * ppp + gap_px as f32) / (dot_px + gap_px) as f32).round().max(1.0) as usize
 }
 
+/// The (dot, gap) in pixels the background grid uses behind a meter laid out
+/// with `geom`: the geometry's own dots, so lit dots sit on the grid.
+pub fn grid_dots(geom: &Geom, ppp: f32, height: f32) -> (u32, u32) {
+    geom.dot.map(|(d, g, _)| (d, g)).unwrap_or_else(|| PixelGrid { ppp }.dots_px(height))
+}
+
 /// The faint pixel grid of an OLED behind the dot-matrix, over `r`: one quad
 /// with a repeating one-dot texture, anchored to the screen so it lines up
 /// with the meters' dots.
-pub fn dot_grid(p: &egui::Painter, r: Rect, height_hint: f32) {
+pub fn dot_grid(p: &egui::Painter, r: Rect, (dot, gap): (u32, u32)) {
     let grid = PixelGrid { ppp: p.ctx().pixels_per_point() };
-    let (dot, gap) = grid.dots_px(height_hint);
     let pitch = (dot + gap) as usize;
     let key = Id::new(("oled-dot-grid", dot, gap));
     let tex = p.ctx().data_mut(|d| d.get_temp::<egui::TextureHandle>(key)).unwrap_or_else(|| {
@@ -642,6 +647,21 @@ mod tests {
             assert!(whole(d, ppp) && whole(gap, ppp));
             assert!(d > gap, "dots stay larger than their gaps");
         }
+    }
+
+    #[test]
+    fn the_background_grid_uses_the_bars_dot_size() {
+        // A tall bridge resolves bigger dots; the narrowing fallback ends on 1 px dots.
+        let tall = Geom::bridge().resolve(MeterStyle::DotMatrix, 1.0, 600.0);
+        assert_eq!(grid_dots(&tall, 1.0, 296.0), (3, 2), "from the geometry, not the line height");
+        let g = {
+            let chans = (0..64).map(|i| Chan { number: i + 1, ..Chan::silent() }).collect();
+            vec![Group { label: "IN 64".into(), channels: chans }]
+        };
+        let tiny = fit_geom(&g, 150.0, Geom::card().resolve(MeterStyle::DotMatrix, 1.0, 50.0));
+        assert_eq!(grid_dots(&tiny, 1.0, 50.0), (1, 1));
+        let seg = Geom::card().resolve(MeterStyle::Segments, 1.0, 50.0);
+        assert_eq!(grid_dots(&seg, 1.0, 50.0), PixelGrid { ppp: 1.0 }.dots_px(50.0), "no dots: the default size");
     }
 
     #[test]

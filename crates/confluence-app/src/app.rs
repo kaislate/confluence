@@ -498,6 +498,12 @@ impl ConfluenceApp {
         self.rail(ui, &view, now);
         self.scene_rail(ui, &view);
         self.side_panels(ui, &view, now);
+        if self.screen != Screen::Devices {
+            // A picker belongs to the Devices screen: leaving it closes the
+            // picker (and stops its running-app reader).
+            self.screen_state.picker = None;
+            self.screen_state.apps = None;
+        }
         if self.screen == Screen::Settings {
             // Settings work whether or not the engine is there.
             self.settings_screen(ui);
@@ -761,6 +767,11 @@ impl ConfluenceApp {
     /// The screen shown.
     pub fn screen(&self) -> Screen {
         self.screen
+    }
+
+    /// The Apps picker's list of running apps is being read.
+    pub fn app_list_running(&self) -> bool {
+        self.screen_state.apps.is_some()
     }
 
     fn devices_screen(&mut self, ui: &mut egui::Ui, view: &StoreView) {

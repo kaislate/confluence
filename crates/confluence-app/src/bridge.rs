@@ -198,7 +198,12 @@ pub fn show_bridge(
     let n = lines.len().max(1) as f32;
     let line_h = ((content.height() - (n - 1.0) * 8.0) / n).max(30.0);
     if look.style == oled_meter::MeterStyle::DotMatrix {
-        oled_meter::dot_grid(&p.with_clip_rect(r.shrink(2.0)), r.shrink(2.0), line_h);
+        // The bars' own dot size (resolved from the whole bridge), so they sit on the grid.
+        oled_meter::dot_grid(
+            &p.with_clip_rect(r.shrink(2.0)),
+            r.shrink(2.0),
+            oled_meter::grid_dots(&base, ppp, line_h),
+        );
     }
     let mut names = egui::epaint::Mesh::default();
     for (li, line) in lines.iter().enumerate() {
