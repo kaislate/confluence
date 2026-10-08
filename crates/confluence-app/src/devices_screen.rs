@@ -35,6 +35,9 @@ pub struct Confirm {
     pub at: f64,
 }
 
+/// Two clicks closer than this are a double-click.
+pub const DOUBLE_CLICK_SECS: f64 = 0.45;
+
 /// The confirmation strip gives up after this long.
 pub const CONFIRM_SECS: f64 = 5.0;
 
@@ -54,6 +57,14 @@ pub struct ScreenState {
     /// Bays showing every position, not only the next free ones.
     pub expanded: HashSet<Bay>,
     pub confirm: Option<Confirm>,
+    /// The device being renamed on its card, and the text so far.
+    pub renaming: Option<(PosId, String)>,
+    /// The last click on a card's name (a second one soon after renames it).
+    pub name_click: Option<(PosId, f64)>,
+    /// The position whose channel list is open.
+    pub channels_of: Option<PosId>,
+    /// Channel names being typed, by (input?, channel index).
+    pub channel_drafts: HashMap<(bool, u32), String>,
     /// Each card's LED colour and when it last changed (for the bloom).
     pub led_seen: HashMap<PosId, (Option<Color32>, f64)>,
     pub adding_bus: bool,
@@ -78,6 +89,10 @@ impl Default for ScreenState {
             just_filled: HashSet::new(),
             expanded: HashSet::new(),
             confirm: None,
+            renaming: None,
+            name_click: None,
+            channels_of: None,
+            channel_drafts: HashMap::new(),
             led_seen: HashMap::new(),
             adding_bus: false,
             bus_name: String::new(),
@@ -426,7 +441,75 @@ pub fn show(
     if let Some(pos) = st.picker {
         picker(ui.ctx(), pos, devices, &state.positions, skin, st, motion, &mut actions);
     }
+    if let Some(pos) = st.channels_of {
+        channel_editor(ui.ctx(), pos, &state.positions, &v, st, &mut actions);
+    }
     actions
+}
+
+/// Every channel of a device with a field for its custom name (spec: meter
+/// bridge 4.5). A name is committed with Enter or when the field loses focus.
+fn channel_editor(
+    ctx: &egui::Context,
+    pos: PosId,
+    positions: &[PositionState],
+    v: &Views,
+    st: &mut ScreenState,
+    actions: &mut Vec<ScreenAction>,
+) {
+    let Some(p) = positions.iter().find(|p| p.pos == pos) else {
+        st.channels_of = None;
+        return;
+    };
+    let slots: Vec<&SlotState> = p.slots.iter().filter_map(|id| v.slots.iter().find(|s| s.id == *id)).collect();
+    let mut open = true;
+    egui::Window::new(format!("Channels of {}", pos.label()))
+        .id(Id::new("channel-editor"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(320.0)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                for s in &slots {
+                    for input in [true, false] {
+                        let n = if input { s.inputs } else { s.outputs };
+                        if n == 0 {
+                            continue;
+                        }
+                        ui.label(if input { "Inputs" } else { "Outputs" });
+                        egui::Grid::new(("channels", s.id, input)).num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+                            for i in 0..n {
+                                let names = if input { &s.input_names } else { &s.output_names };
+                                let device_name =
+                                    names.get(i as usize).cloned().unwrap_or_else(|| format!("Ch {}", i + 1));
+                                let labels = if input { &s.input_labels } else { &s.output_labels };
+                                let current = labels.get(i as usize).cloned().flatten().unwrap_or_default();
+                                ui.label(format!("{}", i + 1));
+                                let draft = st.channel_drafts.entry((input, i)).or_insert(current.clone());
+                                let field =
+                                    ui.add(TextEdit::singleline(draft).hint_text(device_name).desired_width(220.0));
+                                let enter = ui.input(|k| k.key_pressed(Key::Enter));
+                                if field.lost_focus() || (enter && field.has_focus()) {
+                                    let typed = draft.trim().to_string();
+                                    if typed != current {
+                                        actions.push(ScreenAction::Edit(Edit::SetSlotLabel {
+                                            id: s.id,
+                                            channel: Some(confluence_api::ChannelRef { input, index: i }),
+                                            name: Some(typed),
+                                        }));
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    }
+                }
+            });
+        });
+    if !open {
+        st.channels_of = None;
+    }
 }
 
 /// An etched group title with a hairline rule.
@@ -673,17 +756,59 @@ fn card(
             1.0,
         );
     }
-    // Row 2: the name and its sub-line.
+    // Row 2: the name (double-click to rename it) and its sub-line.
     let ctx = ui.ctx().clone();
-    paint::truncated(
-        &painter,
-        r.min + Vec2::new(15.0, 33.0),
-        Align2::LEFT_TOP,
-        &f.name,
-        paint::font(&ctx, "label-bold", 15.0),
-        skin.ink,
-        w - 30.0,
-    );
+    let name_rect = Rect::from_min_size(r.min + Vec2::new(12.0, 31.0), Vec2::new(w - 24.0, 20.0));
+    let first_slot = p.slots.first().copied();
+    let renaming = st.renaming.as_ref().is_some_and(|(pos, _)| *pos == p.pos);
+    if renaming {
+        let mut text = st.renaming.as_ref().map(|r| r.1.clone()).unwrap_or_default();
+        let edit = ui.put(
+            name_rect,
+            TextEdit::singleline(&mut text).hint_text("Custom name").font(paint::font(&ctx, "label-bold", 14.0)),
+        );
+        if !edit.has_focus() && !edit.lost_focus() {
+            edit.request_focus();
+        }
+        let (enter, escape) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+        if escape {
+            st.renaming = None;
+        } else if edit.lost_focus() || enter {
+            st.renaming = None;
+            if let Some(id) = first_slot {
+                actions.push(ScreenAction::Edit(Edit::SetSlotLabel { id, channel: None, name: Some(text) }));
+            }
+        } else if let Some(r) = st.renaming.as_mut() {
+            r.1 = text;
+        }
+    } else {
+        paint::truncated(
+            &painter,
+            r.min + Vec2::new(15.0, 33.0),
+            Align2::LEFT_TOP,
+            &f.name,
+            paint::font(&ctx, "label-bold", 15.0),
+            skin.ink,
+            w - 30.0,
+        );
+        if !off && first_slot.is_some() {
+            let name_resp = ui.interact(name_rect, id.with("name"), Sense::click());
+            let what = format!("Rename {}", p.pos.label());
+            name_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
+            // A double-click, timed here so screen readers (whose clicks
+            // never pair up as double-clicks) can rename too.
+            if name_resp.clicked() {
+                let t = ui.input(|i| i.time);
+                match st.name_click {
+                    Some((pos, at)) if pos == p.pos && t - at < DOUBLE_CLICK_SECS => {
+                        st.name_click = None;
+                        st.renaming = Some((p.pos, custom.clone().unwrap_or_default()));
+                    }
+                    _ => st.name_click = Some((p.pos, t)),
+                }
+            }
+        }
+    }
     if !f.sub.is_empty() {
         paint::truncated(
             &painter,
@@ -722,8 +847,11 @@ fn card(
             }
             let m =
                 crate::gear::oled_meter::meter_widget(ui, id.with("meter"), mrect, &groups, &geom, prefs.meter, motion);
-            if m.response.double_clicked() {
-                actions.push(ScreenAction::Edit(Edit::ClearClip));
+            let what = format!("Channels of {}", p.pos.label());
+            m.response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
+            if m.response.clicked() {
+                st.channels_of = Some(p.pos);
+                st.channel_drafts.clear();
             }
         }
     }

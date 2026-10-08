@@ -22,31 +22,106 @@ const ADD_DEVICE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A change the user asked for.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Edit {
-    SetPoint { input: u32, output: u32, gain_db: f32, mute: bool, invert: bool },
-    RemovePoint { input: u32, output: u32 },
-    AddDevice { kind: DeviceKind, name: String },
-    RemoveSlot { id: u32 },
-    AddBus { name: String, channels: u32 },
-    LoadPlugin { bus: u32, path: String, plugin_id: String },
-    UnloadPlugin { bus: u32 },
-    SetParam { bus: u32, param: u32, value: f64 },
-    ShowEditor { bus: u32 },
-    HideEditor { bus: u32 },
-    SaveScene { name: String, morph_ms: u32 },
-    RecallScene { name: String },
-    DeleteScene { name: String },
-    SetSceneMorph { name: String, morph_ms: u32 },
-    LearnMidi { input: u32, output: u32 },
+    SetPoint {
+        input: u32,
+        output: u32,
+        gain_db: f32,
+        mute: bool,
+        invert: bool,
+    },
+    RemovePoint {
+        input: u32,
+        output: u32,
+    },
+    AddDevice {
+        kind: DeviceKind,
+        name: String,
+    },
+    RemoveSlot {
+        id: u32,
+    },
+    AddBus {
+        name: String,
+        channels: u32,
+    },
+    LoadPlugin {
+        bus: u32,
+        path: String,
+        plugin_id: String,
+    },
+    UnloadPlugin {
+        bus: u32,
+    },
+    SetParam {
+        bus: u32,
+        param: u32,
+        value: f64,
+    },
+    ShowEditor {
+        bus: u32,
+    },
+    HideEditor {
+        bus: u32,
+    },
+    SaveScene {
+        name: String,
+        morph_ms: u32,
+    },
+    RecallScene {
+        name: String,
+    },
+    DeleteScene {
+        name: String,
+    },
+    SetSceneMorph {
+        name: String,
+        morph_ms: u32,
+    },
+    LearnMidi {
+        input: u32,
+        output: u32,
+    },
     CancelMidiLearn,
-    RemoveMidiBinding { device: String, channel: u8, cc: u8 },
-    SetScript { name: String, source: String, enabled: bool },
-    DeleteScript { name: String },
-    SetSlotColor { id: u32, color: Option<confluence_api::Rgb> },
-    FillPosition { pos: confluence_api::PosId, kind: DeviceKind, name: String },
-    ClearPosition { pos: confluence_api::PosId },
-    SetVirtual { pos: confluence_api::PosId, on: bool, shape: Option<(u32, u32)> },
-    SetMaster { pos: Option<confluence_api::PosId> },
+    RemoveMidiBinding {
+        device: String,
+        channel: u8,
+        cc: u8,
+    },
+    SetScript {
+        name: String,
+        source: String,
+        enabled: bool,
+    },
+    DeleteScript {
+        name: String,
+    },
+    SetSlotColor {
+        id: u32,
+        color: Option<confluence_api::Rgb>,
+    },
+    FillPosition {
+        pos: confluence_api::PosId,
+        kind: DeviceKind,
+        name: String,
+    },
+    ClearPosition {
+        pos: confluence_api::PosId,
+    },
+    SetVirtual {
+        pos: confluence_api::PosId,
+        on: bool,
+        shape: Option<(u32, u32)>,
+    },
+    SetMaster {
+        pos: Option<confluence_api::PosId>,
+    },
     ClearClip,
+    /// A custom name for a slot's device (`channel: None`) or one channel.
+    SetSlotLabel {
+        id: u32,
+        channel: Option<confluence_api::ChannelRef>,
+        name: Option<String>,
+    },
 }
 
 /// What a merged, rate-limited edit is about.
@@ -101,6 +176,9 @@ impl Edit {
             Edit::SetVirtual { pos, on, shape } => Command::SetVirtual { pos: *pos, on: *on, shape: *shape },
             Edit::SetMaster { pos } => Command::SetMaster { pos: *pos },
             Edit::ClearClip => Command::ClearClip,
+            Edit::SetSlotLabel { id, channel, name } => {
+                Command::SetSlotLabel { id: *id, channel: *channel, name: name.clone() }
+            }
         }
     }
 

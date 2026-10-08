@@ -188,10 +188,9 @@ fn a_slot_can_be_removed_after_confirming() {
     pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO 1 outputs").is_some());
     h.get_by_label("VASIO 1 outputs").click();
     pump_until(&mut h, "the slot panel", LONG, |h| h.query_by_label("Remove slot…").is_some());
-    h.get_by_label("Remove slot…").click();
+    click_when_still(&mut h, "Remove slot…");
     pump_until(&mut h, "the confirmation", LONG, |h| h.query_by_label_contains("routes are removed too").is_some());
-    settle(&mut h); // the dialog is sized on its first frame and centred on the next
-    h.get_by_label("Remove").click();
+    click_when_still(&mut h, "Remove");
     pump_until(&mut h, "the slot gone", LONG, |_| slots(&mut client(&d)).is_empty());
     client(&d).call(Command::Shutdown).unwrap();
 }
@@ -817,4 +816,48 @@ fn devices_sit_in_bays_by_type() {
         assert!(h.query_by_label(bay).is_some(), "{bay}");
     }
     client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_device_is_renamed_on_its_card() {
+    let d = EngineDir::new("rename");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let mut h = harness_fast(app_for(&d));
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO A's name", LONG, |h| h.query_by_label("Rename VASIO A").is_some());
+    let name = h.get_by_label("Rename VASIO A");
+    name.click();
+    name.click();
+    pump_until(&mut h, "the name field", LONG, |h| h.query_by(|n| n.placeholder() == Some("Custom name")).is_some());
+    h.get_by(|n| n.placeholder() == Some("Custom name")).type_text("Ableton");
+    h.key_press(eframe::egui::Key::Enter);
+    pump_until(&mut h, "the name in the engine", LONG, |_| {
+        slots(&mut c).iter().any(|s| s.name == "VASIO 1" && s.label.as_deref() == Some("Ableton"))
+    });
+    pump_until(&mut h, "the name on the card", LONG, |h| h.query_by_label_contains("VASIO A · Ableton").is_some());
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_channel_is_renamed_from_the_cards_meter() {
+    let d = EngineDir::new("rename-ch");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO A's meter", LONG, |h| h.query_by_label("Channels of VASIO A").is_some());
+    h.get_by_label("Channels of VASIO A").click();
+    pump_until(&mut h, "the channel list", LONG, |h| h.query_by(|n| n.placeholder() == Some("DAW out 1")).is_some());
+    h.get_by(|n| n.placeholder() == Some("DAW out 1")).click();
+    h.get_by(|n| n.placeholder() == Some("DAW out 1")).type_text("Kick");
+    h.key_press(eframe::egui::Key::Enter);
+    pump_until(&mut h, "the channel name in the engine", LONG, |_| {
+        slots(&mut c)
+            .iter()
+            .any(|s| s.name == "VASIO 1" && s.input_labels.first().cloned().flatten().as_deref() == Some("Kick"))
+    });
+    c.call(Command::Shutdown).unwrap();
 }

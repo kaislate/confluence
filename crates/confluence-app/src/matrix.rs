@@ -19,7 +19,10 @@ pub const DRAG_PX_PER_STEP: f32 = 4.0;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Band {
     pub slot: u32,
+    /// The device's custom name if it has one, else the slot's name.
     pub name: String,
+    /// Custom names of its channels in this direction (one per channel).
+    pub channel_labels: Vec<Option<String>>,
     pub online: bool,
     /// An insert bus: its rows are returns and its columns sends.
     pub bus: bool,
@@ -43,19 +46,19 @@ pub struct Axis {
 
 impl Axis {
     pub fn inputs(slots: &[SlotState]) -> Axis {
-        Self::build(slots, |s| (s.first_input, s.inputs))
+        Self::build(slots, |s| (s.first_input, s.inputs, s.input_labels.clone()))
     }
 
     pub fn outputs(slots: &[SlotState]) -> Axis {
-        Self::build(slots, |s| (s.first_output, s.outputs))
+        Self::build(slots, |s| (s.first_output, s.outputs, s.output_labels.clone()))
     }
 
-    fn build(slots: &[SlotState], range: impl Fn(&SlotState) -> (u32, u32)) -> Axis {
+    fn build(slots: &[SlotState], range: impl Fn(&SlotState) -> (u32, u32, Vec<Option<String>>)) -> Axis {
         let mut sorted: Vec<&SlotState> = slots.iter().collect();
         sorted.sort_by_key(|s| s.id);
         let mut axis = Axis::default();
         for s in sorted {
-            let (first_channel, channels) = range(s);
+            let (first_channel, channels, channel_labels) = range(s);
             if channels == 0 {
                 continue;
             }
@@ -65,7 +68,8 @@ impl Axis {
                 palette,
                 color: s.color,
                 slot: s.id,
-                name: s.name.clone(),
+                name: s.label.clone().unwrap_or_else(|| s.name.clone()),
+                channel_labels,
                 online: s.online,
                 bus: s.is_bus(),
                 first_channel,
@@ -153,7 +157,11 @@ impl GridLayout {
         let (ib, ik) = self.rows.at(row)?;
         let (ob, ok) = self.cols.at(col)?;
         let (iw, ow) = (if ib.bus { "return" } else { "in" }, if ob.bus { "send" } else { "out" });
-        Some(format!("{} {iw} {} → {} {ow} {}", ib.name, ik + 1, ob.name, ok + 1))
+        // A channel's custom name follows its number.
+        let named = |b: &Band, k: u32| {
+            b.channel_labels.get(k as usize).cloned().flatten().map(|n| format!(" ({n})")).unwrap_or_default()
+        };
+        Some(format!("{} {iw} {}{} → {} {ow} {}{}", ib.name, ik + 1, named(ib, ik), ob.name, ok + 1, named(ob, ok)))
     }
 }
 
@@ -273,6 +281,18 @@ pub fn move_selection(l: &GridLayout, at: (usize, usize), dr: i32, dc: i32) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_names_show_on_the_bands_and_in_crosspoint_labels() {
+        let mut a = slot(1, "VASIO 1", 0, 2, 0, 2);
+        a.label = Some("Ableton".into());
+        a.input_labels = vec![Some("Kick".into()), None];
+        a.output_labels = vec![None, None];
+        let l = GridLayout::new(&[a], CELL_DEFAULT);
+        assert_eq!(l.rows.bands[0].name, "Ableton");
+        assert_eq!(l.label(0, 1).unwrap(), "Ableton in 1 (Kick) → Ableton out 2");
+        assert_eq!(l.label(1, 0).unwrap(), "Ableton in 2 → Ableton out 1");
+    }
     use confluence_api::ClockRole;
 
     fn slot(id: u32, name: &str, first_input: u32, inputs: u32, first_output: u32, outputs: u32) -> SlotState {

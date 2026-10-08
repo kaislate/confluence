@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use confluence_api::{Command, Response, SlotState};
 use confluence_app::app::{AppConfig, ConfluenceApp};
 use confluence_client::Client;
+use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
 
 /// `target/debug/confluence-engine.exe`, next to this test's `deps` folder.
@@ -166,4 +167,18 @@ pub fn settle(h: &mut Harness<'static, ConfluenceApp>) {
     for _ in 0..3 {
         h.step();
     }
+}
+
+/// Clicks the widget labelled `label` once it has stopped moving (panels
+/// and dialogs animate into place; a busy machine could otherwise click
+/// where it was a frame earlier).
+pub fn click_when_still(h: &mut Harness<'static, ConfluenceApp>, label: &str) {
+    let mut last = h.get_by_label(label).rect();
+    pump_until(h, label, Duration::from_secs(15), |h| {
+        let now = h.get_by_label(label).rect();
+        let still = now == last;
+        last = now;
+        still
+    });
+    h.get_by_label(label).click();
 }
