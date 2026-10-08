@@ -257,6 +257,84 @@ fn dim(k: f32) -> Color32 {
 /// The most rows a segment or dot ladder has: taller bars space them out.
 pub const MAX_ROWS: usize = 120;
 
+/// The screen's physical pixels, for geometry that must land on whole pixels
+/// (the dot-matrix: square dots with real gaps at any display scale).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PixelGrid {
+    /// Physical pixels per point.
+    pub ppp: f32,
+}
+
+impl PixelGrid {
+    /// `v` points as a whole number of pixels (at least one), in points.
+    pub fn snap(&self, v: f32) -> f32 {
+        (v * self.ppp).round().max(1.0) / self.ppp
+    }
+
+    /// The pixel boundary nearest the coordinate `x`.
+    pub fn snap_pos(&self, x: f32) -> f32 {
+        (x * self.ppp).round() / self.ppp
+    }
+
+    /// The dot and gap sizes in whole pixels for a ladder `height` tall:
+    /// 2-point dots with 1-point gaps, grown together while the ladder would
+    /// have more than [`MAX_ROWS`] rows.
+    pub fn dots_px(&self, height: f32) -> (u32, u32) {
+        let mut k = 1.0f32;
+        loop {
+            let dot = (2.0 * k * self.ppp).round().max(2.0);
+            let gap = (k * self.ppp).round().max(1.0);
+            if height * self.ppp / (dot + gap) <= MAX_ROWS as f32 || k > 64.0 {
+                return (dot as u32, gap as u32);
+            }
+            k += 0.5;
+        }
+    }
+
+    /// [`dots_px`](Self::dots_px) in points: (dot, gap).
+    pub fn dots(&self, height: f32) -> (f32, f32) {
+        let (d, g) = self.dots_px(height);
+        (d as f32 / self.ppp, g as f32 / self.ppp)
+    }
+}
+
+/// The width of a dot-matrix bar `cols` dots wide (at least one).
+pub fn dot_bar_width(cols: usize, dot: f32, gap: f32) -> f32 {
+    let cols = cols.max(1) as f32;
+    cols * dot + (cols - 1.0) * gap
+}
+
+/// The faint pixel grid of an OLED behind the dot-matrix, over `r`: one quad
+/// with a repeating one-dot texture, anchored to the screen so it lines up
+/// with the meters' dots.
+pub fn dot_grid(p: &egui::Painter, r: Rect, height_hint: f32) {
+    let grid = PixelGrid { ppp: p.ctx().pixels_per_point() };
+    let (dot, gap) = grid.dots_px(height_hint);
+    let pitch = (dot + gap) as usize;
+    let key = Id::new(("oled-dot-grid", dot, gap));
+    let tex = p.ctx().data_mut(|d| d.get_temp::<egui::TextureHandle>(key)).unwrap_or_else(|| {
+        let mut img = egui::ColorImage::filled([pitch, pitch], Color32::TRANSPARENT);
+        for y in 0..dot as usize {
+            for x in 0..dot as usize {
+                img[(x, y)] = Color32::WHITE;
+            }
+        }
+        let t = p.ctx().load_texture("oled-dot-grid", img, egui::TextureOptions::NEAREST_REPEAT);
+        p.ctx().data_mut(|d| d.insert_temp(key, t.clone()));
+        t
+    });
+    let r = Rect::from_min_max(
+        Pos2::new(grid.snap_pos(r.left()), grid.snap_pos(r.top())),
+        Pos2::new(grid.snap_pos(r.right()), grid.snap_pos(r.bottom())),
+    );
+    // One tile is `pitch` pixels; tiles start at the screen's origin.
+    let tile = pitch as f32 / grid.ppp;
+    let uv = Rect::from_min_max((r.min.to_vec2() / tile).to_pos2(), (r.max.to_vec2() / tile).to_pos2());
+    let mut m = Mesh::with_texture(tex.id());
+    m.add_rect_with_uv(r, uv, Color32::from_white_alpha(9));
+    p.add(Shape::mesh(m));
+}
+
 /// The row pitch of a ladder `height` tall: fine on small meters, coarser on
 /// very tall ones (a maximized pop-out) so the mesh stays small.
 pub fn ladder_pitch(height: f32, dot: bool) -> f32 {
@@ -268,6 +346,7 @@ pub fn ladder_pitch(height: f32, dot: bool) -> f32 {
 /// in dB, in bar order.
 pub fn paint_meter(p: &egui::Painter, l: &MeterLayout, groups: &[Group], levels: &[(f32, f32, f32)], look: MeterLook) {
     let dot = look.style == MeterStyle::DotMatrix;
+    let grid = PixelGrid { ppp: p.ctx().pixels_per_point() };
     let mut m = Mesh::default();
     let clip_on = if look.clip_red { RED } else { LIT };
     for (i, b) in l.bars.iter().enumerate() {
@@ -275,28 +354,43 @@ pub fn paint_meter(p: &egui::Painter, l: &MeterLayout, groups: &[Group], levels:
         let (lv, hv) = (frac(level), frac(hold));
         let r = b.rect;
         match look.style {
-            MeterStyle::Segments | MeterStyle::DotMatrix => {
-                let pitch = ladder_pitch(r.height(), dot);
-                let seg_h = pitch * if dot { 0.8 } else { 2.0 / 3.0 };
-                let n = (r.height() / pitch).floor().max(1.0) as usize;
+            MeterStyle::DotMatrix => {
+                // Square dots on the screen's pixel grid (the same grid as
+                // `dot_grid`): cells `pitch` pixels apart from the origin.
+                let (dot_px, gap_px) = grid.dots_px(r.height());
+                let pitch_px = (dot_px + gap_px) as f32;
+                let ppp = grid.ppp;
+                let cell = |v: f32| v * pitch_px / ppp;
+                let (dot_pt, x0, x1) = (dot_px as f32 / ppp, (r.left() * ppp / pitch_px).round(), r.right() * ppp);
+                let cols = (((x1 - x0 * pitch_px - dot_px as f32) / pitch_px).floor() + 1.0).max(1.0) as usize;
+                let top = (r.top() * ppp / pitch_px).ceil();
+                let bottom = ((r.bottom() * ppp - dot_px as f32) / pitch_px).floor();
+                let n = ((bottom - top) + 1.0).max(1.0) as usize;
                 let held = hold_segments(hv, n, look.double_peak);
                 for k in 0..n {
-                    let y = r.bottom() - (k + 1) as f32 * pitch + (pitch - seg_h);
+                    let y = cell(bottom - k as f32);
                     let on =
                         (k + 1) as f32 / n as f32 <= lv + 1e-4 || held.is_some_and(|(a, b)| k == a || Some(k) == b);
                     let colour = if on { LIT } else { dim(0.10) };
-                    if dot {
-                        let mut x = r.left();
-                        while x + 1.0 <= r.right() + 0.01 {
-                            m.add_colored_rect(Rect::from_min_size(Pos2::new(x, y), Vec2::new(1.6, seg_h)), colour);
-                            x += 2.0;
-                        }
-                    } else {
-                        m.add_colored_rect(
-                            Rect::from_min_size(Pos2::new(r.left(), y), Vec2::new(r.width(), seg_h)),
-                            colour,
-                        );
+                    for c in 0..cols {
+                        let x = cell(x0 + c as f32);
+                        m.add_colored_rect(Rect::from_min_size(Pos2::new(x, y), Vec2::splat(dot_pt)), colour);
                     }
+                }
+            }
+            MeterStyle::Segments => {
+                let pitch = grid.snap(ladder_pitch(r.height(), false));
+                let seg_h = grid.snap(pitch * 2.0 / 3.0);
+                let n = (r.height() / pitch).floor().max(1.0) as usize;
+                let held = hold_segments(hv, n, look.double_peak);
+                let (left, right, bottom) =
+                    (grid.snap_pos(r.left()), grid.snap_pos(r.right()), grid.snap_pos(r.bottom()));
+                for k in 0..n {
+                    let y = bottom - (k + 1) as f32 * pitch + (pitch - seg_h);
+                    let on =
+                        (k + 1) as f32 / n as f32 <= lv + 1e-4 || held.is_some_and(|(a, b)| k == a || Some(k) == b);
+                    let colour = if on { LIT } else { dim(0.10) };
+                    m.add_colored_rect(Rect::from_min_max(Pos2::new(left, y), Pos2::new(right, y + seg_h)), colour);
                 }
             }
             MeterStyle::Solid => {
@@ -413,6 +507,41 @@ pub fn meter_widget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn whole(points: f32, ppp: f32) -> bool {
+        let px = points * ppp;
+        (px - px.round()).abs() < 1e-4
+    }
+
+    #[test]
+    fn dots_are_whole_square_pixels_at_any_scale() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let g = PixelGrid { ppp };
+            let (d, gap) = g.dots(100.0);
+            assert!(whole(d, ppp) && whole(gap, ppp), "ppp {ppp}: {d} {gap}");
+            assert!(d * ppp >= 2.0 - 1e-4 && gap * ppp >= 1.0 - 1e-4, "ppp {ppp}: {d} {gap}");
+            assert!(whole(g.snap(2.3), ppp) && whole(g.snap_pos(10.37), ppp));
+            assert!(g.snap(0.01) * ppp >= 1.0 - 1e-4, "never below one pixel");
+        }
+    }
+
+    #[test]
+    fn tall_dot_ladders_grow_the_dots_and_stay_square() {
+        for ppp in [1.0, 1.5] {
+            let g = PixelGrid { ppp };
+            let (d, gap) = g.dots(2000.0);
+            assert!(2000.0 / (d + gap) <= MAX_ROWS as f32 + 1e-3, "ppp {ppp}: {d} {gap}");
+            assert!(whole(d, ppp) && whole(gap, ppp));
+            assert!(d > gap, "dots stay larger than their gaps");
+        }
+    }
+
+    #[test]
+    fn a_dot_bar_is_whole_dot_columns() {
+        assert_eq!(dot_bar_width(3, 2.0, 1.0), 8.0);
+        assert_eq!(dot_bar_width(4, 2.0, 1.0), 11.0);
+        assert_eq!(dot_bar_width(0, 2.0, 1.0), 2.0, "at least one column");
+    }
 
     #[test]
     fn tall_ladders_keep_a_bounded_number_of_rows() {

@@ -877,6 +877,10 @@ fn card(
     let well = Rect::from_min_size(r.min + Vec2::new(12.0, 66.0), Vec2::new(w - 24.0, 74.0));
     paint::oled_well(&painter, well, &skin);
     let inner = well.shrink2(Vec2::new(7.0, 5.0));
+    if prefs.meter.style == crate::gear::oled_meter::MeterStyle::DotMatrix && !off {
+        // The display's own pixel grid, behind its text and meters.
+        crate::gear::oled_meter::dot_grid(&painter.with_clip_rect(well.shrink(2.0)), well.shrink(2.0), inner.height());
+    }
     let state_text = if f.line2.is_empty() { f.line1.clone() } else { format!("{} {}", f.line1, f.line2) };
     let state_text: String =
         state_text.replace('\u{b7}', " ").replace('\u{2026}', "...").replace('\u{d7}', "X").to_uppercase();
