@@ -107,10 +107,10 @@ pub fn wordmark(ui: &mut egui::Ui, s: &GearSkin) {
     );
 }
 
-/// The Matrix | Devices toggle: two pills in one recessed housing.
+/// The Matrix | Devices | Settings toggle: pills in one recessed housing.
 pub fn segmented(ui: &mut egui::Ui, s: &GearSkin, screen: &mut Screen) {
     let (housing, _) = ui.allocate_exact_size(Vec2::new(4.0, paint::PILL_H + 8.0), Sense::hover());
-    let labels = [(Screen::Matrix, "Matrix"), (Screen::Devices, "Devices")];
+    let labels = [(Screen::Matrix, "Matrix"), (Screen::Devices, "Devices"), (Screen::Settings, "Settings")];
     let widths: Vec<f32> = labels
         .iter()
         .map(|(_, l)| {

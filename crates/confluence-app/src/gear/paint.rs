@@ -517,6 +517,53 @@ pub fn pill_labeled(ui: &mut Ui, label: &str, accessible: &str, s: &GearSkin) ->
     pill_full(ui, label, accessible, s, false, None)
 }
 
+/// A gear toggle in `r`: a dark track whose knob slides right and glows gold
+/// when `on`, with `label` and a `sub` line beside it. The whole row
+/// toggles; it is one accessible checkbox labelled `label`.
+pub fn switch(ui: &mut Ui, r: Rect, on: &mut bool, label: &str, sub: &str, s: &GearSkin) -> Response {
+    let resp = ui.interact(r, ui.id().with(("switch", label)), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+    }
+    let state = *on;
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, state, label));
+    let p = ui.painter();
+    let k = ui.ctx().animate_bool_with_time(resp.id.with("knob"), state, 0.15);
+    let track = Rect::from_min_size(Pos2::new(r.left(), r.center().y - 12.0), Vec2::new(46.0, 24.0));
+    let gold = Color32::from_rgb(0xf3, 0xc2, 0x4f);
+    p.rect_filled(track, CornerRadius::same(12), Color32::from_rgb(0x16, 0x17, 0x1a));
+    p.rect_filled(track, CornerRadius::same(12), alpha(Color32::from_rgb(0x5a, 0x42, 0x10), k));
+    p.rect_stroke(
+        track,
+        CornerRadius::same(12),
+        egui::Stroke::new(1.0, alpha(Color32::BLACK, 0.5)),
+        egui::StrokeKind::Inside,
+    );
+    let c = Pos2::new(track.left() + 12.0 + 22.0 * k, track.center().y);
+    if k > 0.01 {
+        p.circle_filled(c, 12.0, alpha(gold, 0.25 * k));
+    }
+    let knob = Color32::from_rgb(0xc8, 0xc8, 0xcc).lerp_to_gamma(gold, k);
+    p.circle_filled(c, 9.0, knob);
+    p.circle_filled(c - Vec2::new(0.0, 2.0), 5.0, alpha(Color32::WHITE, 0.25));
+    let ink = s.ground_ink;
+    p.text(
+        Pos2::new(track.right() + 12.0, r.center().y - 8.0),
+        Align2::LEFT_CENTER,
+        label,
+        font(ui.ctx(), "label-bold", 13.0),
+        alpha(ink, if resp.hovered() { 1.0 } else { 0.92 }),
+    );
+    p.text(
+        Pos2::new(track.right() + 12.0, r.center().y + 9.0),
+        Align2::LEFT_CENTER,
+        sub,
+        font(ui.ctx(), "label", 11.5),
+        alpha(ink, 0.58),
+    );
+    resp
+}
+
 /// A pill that is lit (filled with the accent) while `lit`: tabs, scenes.
 pub fn pill_lit(ui: &mut Ui, label: &str, accessible: &str, lit: bool, s: &GearSkin) -> Response {
     pill_full(ui, label, accessible, s, lit, None)

@@ -695,8 +695,8 @@ fn the_skin_is_chosen_in_settings() {
     let _engine = Engine::spawn(&d);
     let mut h = harness(app_for(&d));
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
-    h.get_by_label("Settings…").click();
-    pump_until(&mut h, "the Settings window", LONG, |h| h.query_by_label("Silver").is_some());
+    h.get_by_label("Settings").click();
+    pump_until(&mut h, "the Settings screen", LONG, |h| h.query_by_label("Silver").is_some());
     h.get_by_label("Silver").click();
     settle(&mut h);
     assert_eq!(h.state().finish(), confluence_app::gear::skins::Finish::Silver);
@@ -798,7 +798,7 @@ fn the_meter_style_is_chosen_in_settings() {
     let _engine = Engine::spawn(&d);
     let mut h = harness(app_for(&d));
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
-    h.get_by_label("Settings…").click();
+    h.get_by_label("Settings").click();
     pump_until(&mut h, "the meter choices", LONG, |h| h.query_by_label("Dot-matrix").is_some());
     h.get_by_label("Dot-matrix").click();
     h.get_by_label("Double line").click();
@@ -927,4 +927,43 @@ fn a_sixteen_channel_vasio_gets_a_double_card() {
     assert!(wide > 400.0, "16x16 takes a double card: its meter is {wide} wide");
     assert!(single < 220.0, "8x8 stays single: its meter is {single} wide");
     c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn ctrl_3_opens_settings_and_advanced_options_start_off() {
+    let d = EngineDir::new("settings-screen");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1400.0, 900.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    assert!(h.query_by_label("Settings…").is_none(), "no Settings window button any more");
+    h.key_press_modifiers(eframe::egui::Modifiers::COMMAND, eframe::egui::Key::Num3);
+    pump_until(&mut h, "the Settings screen", LONG, |h| h.query_by_label("Enable advanced options").is_some());
+    assert_eq!(h.state().screen(), confluence_app::app::Screen::Settings);
+    assert!(!h.state().prefs().advanced);
+    // The section list scrolls the pane into view (off-screen widgets take no clicks).
+    h.get_by_label("Advanced section").click();
+    for _ in 0..30 {
+        h.step();
+    }
+    h.get_by_label("Enable advanced options").click();
+    settle(&mut h);
+    assert!(h.state().prefs().advanced);
+    for label in ["Graphite", "Candy", "Silver", "Segments", "Solid", "Single line", "White", "Red", "Reduce motion"] {
+        assert!(h.query_by_label(label).is_some(), "{label}");
+    }
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn settings_work_without_an_engine() {
+    let d = EngineDir::new("settings-offline");
+    let mut h = harness(app_for(&d));
+    for _ in 0..10 {
+        h.step();
+    }
+    h.get_by_label("Settings").click();
+    pump_until(&mut h, "the Settings screen", LONG, |h| h.query_by_label("Candy").is_some());
+    h.get_by_label("Candy").click();
+    settle(&mut h);
+    assert_eq!(h.state().finish(), confluence_app::gear::skins::Finish::Candy);
 }
