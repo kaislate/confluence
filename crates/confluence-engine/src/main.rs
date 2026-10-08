@@ -404,6 +404,8 @@ mod app {
 
     /// How often state is diffed and telemetry sent, in control-loop ticks of 10 ms.
     const PUBLISH_TICKS: u64 = 10;
+    /// App captures are checked every 2 s.
+    const FOLLOW_APPS_TICKS: u64 = 200;
     /// The control loop's tick.
     const TICK: Duration = Duration::from_millis(10);
     /// Between meter frames: about 60 a second.
@@ -848,6 +850,12 @@ mod app {
                 // Network streams whose engine was not found come back once it is.
                 let State { devices, engine, .. } = &mut *s;
                 devices.retry_offline_net(engine);
+                // App captures follow their app: offline when it exits, back when it runs.
+                if ticks.is_multiple_of(FOLLOW_APPS_TICKS) {
+                    devices.follow_apps(engine, &confluence_provider_wasapi::process_alive, &|name| {
+                        confluence_provider_wasapi::find_process(name).ok()
+                    });
+                }
                 // Catches changes no command made: devices lost or back, a DAW attaching.
                 publish(&mut s);
                 // Values changed in plugin editors are saved like any other change.

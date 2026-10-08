@@ -12,7 +12,7 @@ mod stream;
 #[cfg(windows)]
 pub use endpoints::{default_endpoint, endpoints, find_endpoint, Direction, Endpoint};
 #[cfg(windows)]
-pub use process::find_process;
+pub use process::{find_process, process_alive};
 #[cfg(windows)]
 pub use stream::{CaptureFn, Handler, RenderFn, StreamFormat, StreamHealth, Target, WasapiStream};
 
