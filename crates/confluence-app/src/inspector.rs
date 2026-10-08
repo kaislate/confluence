@@ -471,6 +471,11 @@ mod tests {
 
     fn slot(id: u32, first_input: u32, inputs: u32, first_output: u32, outputs: u32) -> SlotState {
         SlotState {
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+            label: None,
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
             id,
             name: format!("S{id}"),
             device: String::new(),
@@ -531,6 +536,11 @@ mod display_tests {
 
     fn view_with(point: PointState) -> StoreView {
         let slot = SlotState {
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+            label: None,
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
             id: 1,
             name: "S".into(),
             device: String::new(),
@@ -583,6 +593,11 @@ mod display_tests {
         let mut view = view_with(PointState { input: 0, output: 0, gain_db: 0.0, mute: false, invert: false });
         let state = view.state.as_mut().unwrap();
         state.slots.push(SlotState {
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+            label: None,
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
             id: 2,
             name: "FX".into(),
             device: confluence_api::BUS_DEVICE.into(),

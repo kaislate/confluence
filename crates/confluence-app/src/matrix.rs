@@ -277,6 +277,11 @@ mod tests {
 
     fn slot(id: u32, name: &str, first_input: u32, inputs: u32, first_output: u32, outputs: u32) -> SlotState {
         SlotState {
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+            label: None,
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
             id,
             name: name.into(),
             device: String::new(),

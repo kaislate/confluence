@@ -1301,6 +1301,9 @@ impl Engine {
             | Command::SetVirtual { .. }
             | Command::SetMaster { .. } => Response::Error("positions are handled by the engine process".into()),
             Command::SubscribeMeters => Response::Error("subscriptions are served by the engine process".into()),
+            Command::SetSlotLabel { .. } | Command::SetLabel { .. } => {
+                Response::Error("custom names are not supported yet".into())
+            }
             Command::ClearClip => {
                 self.meters_in.clear_clips();
                 self.meters_out.clear_clips();
@@ -1428,6 +1431,11 @@ impl Engine {
         (first_output, outputs): (u32, u32),
     ) -> SlotState {
         SlotState {
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+            label: None,
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
             id,
             name: name.to_string(),
             device: device.to_string(),
