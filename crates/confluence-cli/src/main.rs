@@ -189,10 +189,7 @@ fn render_names(slots: &[confluence_api::SlotState]) -> String {
     if lines.is_empty() {
         "no custom names".into()
     } else {
-        lines.join(
-            "
-",
-        )
+        lines.join("\n")
     }
 }
 
