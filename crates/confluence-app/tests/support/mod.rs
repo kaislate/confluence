@@ -173,12 +173,15 @@ pub fn settle(h: &mut Harness<'static, ConfluenceApp>) {
 /// and dialogs animate into place; a busy machine could otherwise click
 /// where it was a frame earlier).
 pub fn click_when_still(h: &mut Harness<'static, ConfluenceApp>, label: &str) {
+    // Ten unchanged frames in a row: two equal frames can come just before an
+    // animation starts, and the click would land where the widget was.
     let mut last = h.get_by_label(label).rect();
+    let mut still = 0;
     pump_until(h, label, Duration::from_secs(15), |h| {
         let now = h.get_by_label(label).rect();
-        let still = now == last;
+        still = if now == last { still + 1 } else { 0 };
         last = now;
-        still
+        still >= 10
     });
     h.get_by_label(label).click();
 }
