@@ -879,3 +879,25 @@ fn a_device_is_hidden_from_the_meter_bridge_but_keeps_its_card() {
     assert!(h.query_by_label_contains("VASIO A \u{b7} ").is_some(), "the card stays");
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn the_meter_bridge_pops_out_and_docks_back() {
+    let d = EngineDir::new("popout");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "the bridge", LONG, |h| h.query_by_label("Pop out meters").is_some());
+    h.get_by_label("Pop out meters").click();
+    pump_until(&mut h, "the meters window", LONG, |h| h.query_by_label("Dock meters").is_some());
+    assert!(h.state().prefs().bridge.popped);
+    settle(&mut h); // the frame it popped out on still drew the docked bridge
+    assert!(h.query_by_label("Pop out meters").is_none(), "the docked bridge is hidden");
+    h.get_by_label("Keep meters on top").click();
+    settle(&mut h);
+    assert!(h.state().prefs().bridge.pinned);
+    h.get_by_label("Dock meters").click();
+    pump_until(&mut h, "the docked bridge", LONG, |h| h.query_by_label("Pop out meters").is_some());
+    assert!(!h.state().prefs().bridge.popped);
+    client(&d).call(Command::Shutdown).unwrap();
+}

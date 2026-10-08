@@ -494,7 +494,8 @@ impl ConfluenceApp {
 
         let graphs = self.inspector_open && matches!(self.selection, Selection::Slot(_));
         self.graphs_live.store(graphs, Ordering::Relaxed);
-        self.meters_live.store(self.screen == Screen::Devices, Ordering::Relaxed);
+        // Meters are on screen on the Devices screen and in the popped-out bridge.
+        self.meters_live.store(self.screen == Screen::Devices || self.prefs.bridge.popped, Ordering::Relaxed);
         self.rail(ui, &view, now);
         self.scene_rail(ui, &view);
         self.side_panels(ui, &view, now);
@@ -510,6 +511,10 @@ impl ConfluenceApp {
                     self.devices_screen(ui, &view);
                 }
             }
+        }
+        if self.prefs.bridge.popped {
+            let skin = self.skin();
+            crate::bridge::popout(&ctx, &view, &skin, &mut self.prefs, &mut self.motion);
         }
         self.notifications(&ctx, &view, now);
         self.dialogs(&ctx, &view);
@@ -700,6 +705,11 @@ impl ConfluenceApp {
     /// How meters and names are shown, and the meter bridge.
     pub fn prefs(&self) -> &crate::prefs::ViewPrefs {
         &self.prefs
+    }
+
+    /// Docks the meter bridge back from its own window.
+    pub fn close_popout(&mut self) {
+        self.prefs.bridge.popped = false;
     }
 
     /// Restores the preferences saved last time (see [`crate::prefs::PREFS_KEY`]).

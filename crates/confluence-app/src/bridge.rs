@@ -108,7 +108,8 @@ pub fn show_bridge(
     popped: bool,
 ) -> BridgeResponse {
     let mut out = BridgeResponse::default();
-    let id = Id::new("meter-bridge");
+    // The docked bridge and its window have their own ids (both draw on the frame it pops out).
+    let id = Id::new(("meter-bridge", popped));
     let p = ui.painter_at(r.expand(4.0));
     paint::oled_well(&p, r, skin);
     let well = ui.interact(r, id, Sense::hover());
@@ -248,6 +249,71 @@ pub fn collapsed_strip(ui: &mut egui::Ui, r: Rect, skin: &GearSkin, prefs: &mut 
     }
 }
 
+/// The pop-out window: its title, its last place and size, and whether it
+/// stays on top.
+pub fn viewport_builder(prefs: &BridgePrefs) -> egui::ViewportBuilder {
+    let level = if prefs.pinned { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+    let b = egui::ViewportBuilder::default()
+        .with_title("Confluence meters")
+        .with_min_inner_size([360.0, 140.0])
+        .with_window_level(level);
+    match prefs.window {
+        Some([x, y, w, h]) => b.with_position([x, y]).with_inner_size([w, h]),
+        None => b.with_inner_size([960.0, 280.0]),
+    }
+}
+
+/// The bridge in its own window (an embedded one where the platform cannot
+/// open windows): a pin to keep it on top, and Dock to put it back.
+pub fn popout(
+    ctx: &egui::Context,
+    view: &confluence_client::StoreView,
+    skin: &GearSkin,
+    prefs: &mut crate::prefs::ViewPrefs,
+    motion: &mut Motion,
+) {
+    let Some(state) = view.state.as_ref() else { return };
+    let v = Views {
+        slots: &state.slots,
+        health: &view.health,
+        meters: view.meters.as_ref(),
+        sample_rate: view.status.as_ref().map(|s| s.sample_rate),
+    };
+    let only = prefs.only_custom_names;
+    let all = bridge_devices(&state.positions, &v, &BridgePrefs::default(), only);
+    let shown = bridge_devices(&state.positions, &v, &prefs.bridge, only);
+    let look = prefs.meter;
+    let id = egui::ViewportId::from_hash_of("confluence-meters");
+    ctx.show_viewport_immediate(id, viewport_builder(&prefs.bridge), |ui, class| {
+        let area = ui.max_rect();
+        paint::ground(ui.painter(), area, skin);
+        // The pin, top left.
+        let pin_at = Rect::from_min_size(area.min + Vec2::new(10.0, 8.0), Vec2::new(140.0, paint::PILL_H));
+        let mut row = ui.new_child(
+            egui::UiBuilder::new().max_rect(pin_at).layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let pinned = prefs.bridge.pinned;
+        if paint::pill_lit(&mut row, "Pin", "Keep meters on top", pinned, skin).clicked() {
+            prefs.bridge.pinned = !pinned;
+            let level = if prefs.bridge.pinned { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        }
+        let r = Rect::from_min_max(area.min + Vec2::new(8.0, 12.0 + paint::PILL_H), area.max - Vec2::splat(8.0));
+        let resp = show_bridge(ui, r, &all, &shown, skin, &mut prefs.bridge, look, motion, true);
+        let closing =
+            class != egui::ViewportClass::EmbeddedWindow && ui.ctx().input(|i| i.viewport().close_requested());
+        if resp.toggle_popout || closing {
+            prefs.bridge.popped = false;
+        }
+        if class != egui::ViewportClass::EmbeddedWindow {
+            let (outer, inner) = ui.ctx().input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+            if let (Some(o), Some(i)) = (outer, inner) {
+                prefs.bridge.window = Some([o.min.x, o.min.y, i.width(), i.height()]);
+            }
+        }
+    });
+}
+
 /// True if `p` is a position the bridge can show (it holds a device).
 pub fn on_bridge(p: &PositionState) -> bool {
     !matches!(p.status, PositionStatus::Empty | PositionStatus::Off)
@@ -332,6 +398,21 @@ mod tests {
         let v = Views { slots: &slots, health: &[], meters: None, sample_rate: None };
         let d = bridge_devices(&positions, &v, &BridgePrefs::default(), true);
         assert_eq!(d[0].name, "Desk");
+    }
+
+    #[test]
+    fn the_pop_out_window_is_titled_remembers_its_place_and_can_stay_on_top() {
+        let mut prefs = BridgePrefs::default();
+        let b = viewport_builder(&prefs);
+        assert_eq!(b.title.as_deref(), Some("Confluence meters"));
+        assert_eq!(b.window_level, Some(egui::WindowLevel::Normal));
+        assert_eq!(b.inner_size, Some(Vec2::new(960.0, 280.0)));
+        prefs.pinned = true;
+        prefs.window = Some([100.0, 50.0, 700.0, 240.0]);
+        let b = viewport_builder(&prefs);
+        assert_eq!(b.window_level, Some(egui::WindowLevel::AlwaysOnTop));
+        assert_eq!(b.position, Some(Pos2::new(100.0, 50.0)));
+        assert_eq!(b.inner_size, Some(Vec2::new(700.0, 240.0)));
     }
 
     #[test]
