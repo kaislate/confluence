@@ -379,7 +379,7 @@ pub fn show(
     palette: &[Color32],
     st: &mut ScreenState,
     motion: &mut Motion,
-    prefs: &ViewPrefs,
+    prefs: &mut ViewPrefs,
     editable: bool,
 ) -> Vec<ScreenAction> {
     let mut actions = Vec::new();
@@ -413,6 +413,31 @@ pub fn show(
     // The screen is revealed, not slid in.
     let reveal = motion.tween_from(Id::new("devices-reveal"), 0.0, 1.0, Curve::Enter, 0.15);
     ui.set_opacity(reveal);
+    // The meter bridge, above the bays (unless it is in its own window).
+    if !prefs.bridge.popped {
+        let full = ui.available_width();
+        let width = (full - 32.0).min(CONTENT_MAX);
+        let left = ui.max_rect().left() + (full - width) / 2.0;
+        let h = if prefs.bridge.shown {
+            crate::bridge::bridge_height(prefs.bridge.height_frac, ui.available_height())
+        } else {
+            26.0
+        };
+        let (band, _) = ui.allocate_exact_size(Vec2::new(full, h + 18.0), Sense::hover());
+        let r = Rect::from_min_size(Pos2::new(left, band.top() + 10.0), Vec2::new(width, h));
+        if prefs.bridge.shown {
+            let only = prefs.only_custom_names;
+            let all = crate::bridge::bridge_devices(&state.positions, &v, &crate::prefs::BridgePrefs::default(), only);
+            let shown = crate::bridge::bridge_devices(&state.positions, &v, &prefs.bridge, only);
+            let look = prefs.meter;
+            let resp = crate::bridge::show_bridge(ui, r, &all, &shown, skin, &mut prefs.bridge, look, motion, false);
+            if resp.toggle_popout {
+                prefs.bridge.popped = true;
+            }
+        } else {
+            crate::bridge::collapsed_strip(ui, r, skin, &mut prefs.bridge);
+        }
+    }
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.add_enabled_ui(editable, |ui| {
             let full = ui.available_width();

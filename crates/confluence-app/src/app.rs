@@ -731,7 +731,7 @@ impl ConfluenceApp {
         let skin = self.skin();
         let palette = self.look.skin.slot_colors.clone();
         let list = view.state.as_ref().map(|s| s.devices.clone()).unwrap_or_default();
-        let (screen_state, motion, prefs) = (&mut self.screen_state, &mut self.motion, &self.prefs);
+        let (screen_state, motion, prefs) = (&mut self.screen_state, &mut self.motion, &mut self.prefs);
         let actions = egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {

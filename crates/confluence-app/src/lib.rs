@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod bays;
+pub mod bridge;
 pub mod commands;
 pub mod devices;
 pub mod devices_screen;

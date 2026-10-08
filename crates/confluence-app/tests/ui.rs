@@ -861,3 +861,21 @@ fn a_channel_is_renamed_from_the_cards_meter() {
     });
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_device_is_hidden_from_the_meter_bridge_but_keeps_its_card() {
+    let d = EngineDir::new("bridge-hide");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "the bridge", LONG, |h| h.query_by_label("Meter bridge").is_some());
+    assert!(h.query_by_label_contains("Bridge: VASIO A").is_some(), "VASIO A is on the bridge");
+    h.get_by_label("Bridge channels").click();
+    pump_until(&mut h, "the bridge menu", LONG, |h| h.query_by_label_contains("Show VASIO A").is_some());
+    h.get_by_label_contains("Show VASIO A").click();
+    pump_until(&mut h, "VASIO A off the bridge", LONG, |h| h.query_by_label_contains("Bridge: VASIO A").is_none());
+    assert!(h.state().prefs().bridge.hidden_devices.contains("pos:vasio:A"));
+    assert!(h.query_by_label_contains("VASIO A \u{b7} ").is_some(), "the card stays");
+    client(&d).call(Command::Shutdown).unwrap();
+}
