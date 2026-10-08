@@ -11,10 +11,13 @@ use confluence_api::{
 };
 use eframe::egui::{self, Align2, Color32, Id, Key, Pos2, Rect, Sense, TextEdit, Vec2, WidgetInfo, WidgetType};
 
+use crate::bays::{Bay, BayView};
 use crate::commands::Edit;
 use crate::gear::motion::{Curve, Motion, ENTER, PHOSPHOR_TAU, POP, SETTLE};
+use crate::gear::oled_meter::{Chan, Geom, Group};
 use crate::gear::paint;
 use crate::gear::skins::{self, GearSkin, AMBER, GREEN, RED};
+use crate::prefs::ViewPrefs;
 
 /// What the screen asks the app to do.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,8 +51,8 @@ pub struct ScreenState {
     pub filling: HashSet<PosId>,
     /// Positions that just appeared (their card pops in).
     pub just_filled: HashSet<PosId>,
-    /// Groups showing every position, not only the next free one.
-    pub expanded: HashSet<PosGroup>,
+    /// Bays showing every position, not only the next free ones.
+    pub expanded: HashSet<Bay>,
     pub confirm: Option<Confirm>,
     /// Each card's LED colour and when it last changed (for the bloom).
     pub led_seen: HashMap<PosId, (Option<Color32>, f64)>,
@@ -98,56 +101,6 @@ impl ScreenState {
     }
 }
 
-/// The card rows, in screen order: Virtual (VASIO and VAIO, switched-on
-/// VASIOs first), ASIO, WIN IN, WIN OUT, APP, NET IN, NET OUT.
-pub fn card_rows(positions: &[PositionState]) -> Vec<(PosGroup, Vec<&PositionState>)> {
-    let of = |g: PosGroup| -> Vec<&PositionState> {
-        let mut v: Vec<&PositionState> = positions.iter().filter(|p| p.pos.group == g).collect();
-        v.sort_by_key(|p| p.pos.index);
-        v
-    };
-    let mut virt = of(PosGroup::Vasio);
-    // Stable: on ones keep letter order, then the off ones in letter order.
-    virt.sort_by_key(|p| matches!(p.status, PositionStatus::Off));
-    virt.extend(of(PosGroup::Vaio));
-    let mut rows = vec![(PosGroup::Vasio, virt)];
-    for g in [PosGroup::Asio, PosGroup::WinIn, PosGroup::WinOut, PosGroup::App, PosGroup::NetIn, PosGroup::NetOut] {
-        rows.push((g, of(g)));
-    }
-    rows
-}
-
-/// One group as shown: its cards, and how many positions stay folded away.
-pub struct GroupView<'a> {
-    pub group: PosGroup,
-    pub cards: Vec<&'a PositionState>,
-    pub hidden: usize,
-}
-
-/// A position that holds nothing the user chose: an empty tray or a
-/// switched-off virtual position.
-fn vacant(p: &PositionState) -> bool {
-    matches!(p.status, PositionStatus::Empty | PositionStatus::Off)
-}
-
-/// The groups with their wall collapsed: every device, then one vacant
-/// position (the next free one); `expanded` groups show every position.
-pub fn group_views<'a>(positions: &'a [PositionState], expanded: &HashSet<PosGroup>) -> Vec<GroupView<'a>> {
-    card_rows(positions)
-        .into_iter()
-        .filter(|(_, cards)| !cards.is_empty())
-        .map(|(group, cards)| {
-            if expanded.contains(&group) {
-                return GroupView { group, cards, hidden: 0 };
-            }
-            let mut shown: Vec<&PositionState> = cards.iter().copied().filter(|p| !vacant(p)).collect();
-            let vacant_ones = cards.iter().copied().filter(|p| vacant(p)).count();
-            shown.extend(cards.iter().copied().find(|p| vacant(p)));
-            GroupView { group, cards: shown, hidden: vacant_ones.saturating_sub(1) }
-        })
-        .collect()
-}
-
 pub fn row_title(g: PosGroup) -> &'static str {
     match g {
         PosGroup::Vasio | PosGroup::Vaio => "Virtual",
@@ -167,21 +120,6 @@ fn kinds(g: PosGroup) -> &'static [DeviceKind] {
 
 /// VASIO shapes per direction (as the engine offers them).
 const SHAPES: [u32; 5] = [2, 4, 8, 16, 32];
-
-/// Card size: the width adapts a little so rows fill the screen.
-pub const CARD_H: f32 = 194.0;
-pub const CARD_W_MIN: f32 = 228.0;
-pub const CARD_W_MAX: f32 = 264.0;
-pub const GAP: f32 = 20.0;
-/// Content is centred and capped at this width on very wide windows.
-pub const CONTENT_MAX: f32 = 1680.0;
-
-/// How many cards fit across `width`, and how wide each is.
-pub fn cards_across(width: f32) -> (usize, f32) {
-    let n = (((width + GAP) / (CARD_W_MIN + GAP)).floor() as usize).max(1);
-    let w = ((width - (n as f32 - 1.0) * GAP) / n as f32).clamp(CARD_W_MIN, CARD_W_MAX);
-    (n, w)
-}
 
 /// A device name split for the card: the name, and the vendor noise or
 /// the kind as a sub-line. "Game (4- TC-HELICON GoXLR)" is "Game" over
@@ -330,25 +268,6 @@ pub struct Views<'a> {
     pub sample_rate: Option<f64>,
 }
 
-/// The levels of `p`'s channels: (input?, channel, peak dB).
-fn levels(p: &PositionState, v: &Views) -> Vec<(bool, u32, f32)> {
-    let Some(f) = v.meters else { return Vec::new() };
-    let mut out = Vec::new();
-    for s in p.slots.iter().filter_map(|id| v.slots.iter().find(|s| s.id == *id)) {
-        for c in s.first_input..s.first_input + s.inputs {
-            if let Some(m) = c.checked_sub(f.first_input).and_then(|i| f.inputs.get(i as usize)) {
-                out.push((true, c, byte_db(m[0])));
-            }
-        }
-        for c in s.first_output..s.first_output + s.outputs {
-            if let Some(m) = c.checked_sub(f.first_output).and_then(|i| f.outputs.get(i as usize)) {
-                out.push((false, c, byte_db(m[0])));
-            }
-        }
-    }
-    out
-}
-
 /// The palette index a position takes by default: fixed per position, so a
 /// device keeps its colour across sessions, and spread so a usual setup
 /// (VASIO A, ASIO 1, two Windows inputs, three outputs, an app) gets eight
@@ -374,6 +293,67 @@ pub fn device_color(p: &PositionState, palette: &[Color32]) -> Color32 {
     skins::palette_color(palette, position_palette(p.pos))
 }
 
+/// Card size, gaps and the bays' chrome.
+pub const CARD_W: f32 = 240.0;
+pub const CARD_H: f32 = 136.0;
+pub const GAP: f32 = 14.0;
+/// Between bays.
+pub const BAY_GAP: f32 = 18.0;
+/// A bay's padding and its header strip.
+pub const BAY_PAD: f32 = 12.0;
+pub const BAY_HEADER: f32 = 30.0;
+/// Content is centred and capped at this width on very wide windows.
+pub const CONTENT_MAX: f32 = 1760.0;
+
+/// A bay's size for `n` cards when at most `max_cols` fit across.
+pub fn bay_size(n: usize, max_cols: usize) -> Vec2 {
+    let cols = n.clamp(1, max_cols.max(1));
+    let rows = n.div_ceil(cols).max(1);
+    Vec2::new(
+        cols as f32 * CARD_W + (cols - 1) as f32 * GAP + 2.0 * BAY_PAD,
+        BAY_HEADER + rows as f32 * CARD_H + (rows - 1) as f32 * GAP + BAY_PAD,
+    )
+}
+
+/// The channels of position `p`'s slots as meter groups: one IN and one OUT
+/// group, each channel with its number, name (custom or the device's) and
+/// the latest levels from `v.meters`.
+pub fn device_groups(p: &PositionState, v: &Views) -> Vec<Group> {
+    let slots: Vec<&SlotState> = p.slots.iter().filter_map(|id| v.slots.iter().find(|s| s.id == *id)).collect();
+    let mut ins = Vec::new();
+    let mut outs = Vec::new();
+    for s in &slots {
+        for i in 0..s.inputs {
+            let c = s.first_input + i;
+            ins.push(chan(v, true, c, ins.len() as u32 + 1, crate::names::channel(s, true, i as usize)));
+        }
+        for i in 0..s.outputs {
+            let c = s.first_output + i;
+            outs.push(chan(v, false, c, outs.len() as u32 + 1, crate::names::channel(s, false, i as usize)));
+        }
+    }
+    let mut groups = Vec::new();
+    if !ins.is_empty() {
+        groups.push(Group { label: format!("IN {}", ins.len()), channels: ins });
+    }
+    if !outs.is_empty() {
+        groups.push(Group { label: format!("OUT {}", outs.len()), channels: outs });
+    }
+    groups
+}
+
+/// Global channel `c` (input or output) as a meter channel.
+fn chan(v: &Views, input: bool, c: u32, number: u32, name: String) -> Chan {
+    let silent = Chan { number, name, ..Chan::silent() };
+    let Some(f) = v.meters else { return silent };
+    let (first, list, clipped) =
+        if input { (f.first_input, &f.inputs, &f.clipped_in) } else { (f.first_output, &f.outputs, &f.clipped_out) };
+    match c.checked_sub(first).and_then(|i| list.get(i as usize)) {
+        Some(m) => Chan { peak_db: byte_db(m[0]), rms_db: byte_db(m[1]), clipped: clipped.contains(&c), ..silent },
+        None => silent,
+    }
+}
+
 /// Shows the screen; `palette` is the colours offered for a device.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -384,6 +364,7 @@ pub fn show(
     palette: &[Color32],
     st: &mut ScreenState,
     motion: &mut Motion,
+    prefs: &ViewPrefs,
     editable: bool,
 ) -> Vec<ScreenAction> {
     let mut actions = Vec::new();
@@ -422,22 +403,23 @@ pub fn show(
             let full = ui.available_width();
             let width = (full - 32.0).min(CONTENT_MAX);
             let left = ui.max_rect().left() + (full - width) / 2.0;
-            let (n, cw) = cards_across(width);
-            for gv in group_views(&state.positions, &st.expanded) {
-                group_header(ui, left, width, &gv, skin, st);
-                for line in gv.cards.chunks(n) {
-                    let (row, _) = ui.allocate_exact_size(Vec2::new(full, CARD_H + GAP), Sense::hover());
-                    for (k, p) in line.iter().enumerate() {
-                        let r = Rect::from_min_size(
-                            Pos2::new(left + k as f32 * (cw + GAP), row.min.y + 4.0),
-                            Vec2::new(cw, CARD_H),
-                        );
-                        card(ui, r, p, &v, skin, palette, st, motion, &mut actions);
-                    }
+            let max_cols = (((width - 2.0 * BAY_PAD + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
+            let views = crate::bays::bay_views(&state.positions, &st.expanded);
+            let sizes: Vec<Vec2> = views.iter().map(|b| bay_size(b.cards.len(), max_cols)).collect();
+            let widths: Vec<f32> = sizes.iter().map(|s| s.x).collect();
+            ui.add_space(8.0);
+            for row in crate::bays::pack_bays(&widths, width, BAY_GAP) {
+                let h = row.iter().map(|&i| sizes[i].y).fold(0.0, f32::max);
+                let (band, _) = ui.allocate_exact_size(Vec2::new(full, h + BAY_GAP), Sense::hover());
+                let mut x = left;
+                for i in row {
+                    let r = Rect::from_min_size(Pos2::new(x, band.top()), sizes[i]);
+                    bay(ui, r, &views[i], max_cols, &v, skin, palette, st, motion, prefs, &mut actions);
+                    x += sizes[i].x + BAY_GAP;
                 }
             }
             section_rule(ui, left, width, "Buses", skin);
-            bus_tray(ui, left, cw, skin, st, &mut actions);
+            bus_tray(ui, left, CARD_W, skin, st, &mut actions);
             ui.add_space(24.0);
         });
     });
@@ -468,29 +450,73 @@ fn section_rule(ui: &mut egui::Ui, left: f32, width: f32, title: &str, skin: &Ge
     r
 }
 
-fn group_header(ui: &mut egui::Ui, left: f32, width: f32, gv: &GroupView, skin: &GearSkin, st: &mut ScreenState) {
-    let r = section_rule(ui, left, width, row_title(gv.group), skin);
-    let expanded = st.expanded.contains(&gv.group);
-    if gv.hidden == 0 && !expanded {
-        return;
-    }
-    let title = row_title(gv.group);
-    let (label, accessible) = if expanded {
-        ("Show fewer".to_string(), format!("Show fewer {title} positions"))
-    } else {
-        (format!("+{} more", gv.hidden), format!("Show all {title} positions"))
-    };
-    let pill_w = 90.0;
-    let at =
-        Rect::from_min_size(Pos2::new(left + width - pill_w, r.center().y - 8.0), Vec2::new(pill_w, paint::PILL_H));
-    let mut child =
-        ui.new_child(egui::UiBuilder::new().max_rect(at).layout(egui::Layout::right_to_left(egui::Align::Center)));
-    if paint::pill_labeled(&mut child, &label, &accessible, skin).clicked() {
-        if expanded {
-            st.expanded.remove(&gv.group);
+/// One bay: a recessed zone with a coloured strip and its etched title, an
+/// expander when positions are folded away, and its cards.
+#[allow(clippy::too_many_arguments)]
+fn bay(
+    ui: &mut egui::Ui,
+    r: Rect,
+    bv: &BayView,
+    max_cols: usize,
+    v: &Views,
+    skin: &GearSkin,
+    palette: &[Color32],
+    st: &mut ScreenState,
+    motion: &mut Motion,
+    prefs: &ViewPrefs,
+    actions: &mut Vec<ScreenAction>,
+) {
+    let p = ui.painter_at(r.expand(4.0));
+    paint::recess(&p, r, skin, 16);
+    let colour = bv.bay.color();
+    let strip = Rect::from_min_size(r.min + Vec2::new(BAY_PAD + 2.0, 15.0), Vec2::new(20.0, 3.0));
+    p.rect_filled(strip, egui::CornerRadius::same(2), colour);
+    p.rect_filled(strip.expand(2.0), egui::CornerRadius::same(3), paint::alpha(colour, 0.18));
+    let title = bv.bay.title().to_uppercase();
+    let text = paint::etched_text(
+        &p,
+        Pos2::new(strip.right() + 8.0, strip.center().y),
+        Align2::LEFT_CENTER,
+        &title,
+        skin,
+        skin.ground_ink,
+        10.5,
+        true,
+        0.16,
+        0.82,
+    );
+    let (_, label) = ui.allocate_exact_size(Vec2::ZERO, Sense::hover());
+    label.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &title));
+    let _ = text;
+    // The expander: every position of the bay, or back to the devices.
+    let expanded = st.expanded.contains(&bv.bay);
+    if bv.hidden > 0 || expanded {
+        let name = match bv.bay {
+            Bay::Hardware => "ASIO",
+            other => other.title(),
+        };
+        let (shown, accessible) = if expanded {
+            ("Show fewer".to_string(), format!("Show fewer {name} positions"))
         } else {
-            st.expanded.insert(gv.group);
+            (format!("+{} more", bv.hidden), format!("Show all {name} positions"))
+        };
+        let at =
+            Rect::from_min_size(Pos2::new(r.right() - BAY_PAD - 96.0, r.top() + 4.0), Vec2::new(96.0, paint::PILL_H));
+        let mut child =
+            ui.new_child(egui::UiBuilder::new().max_rect(at).layout(egui::Layout::right_to_left(egui::Align::Center)));
+        if paint::pill_labeled(&mut child, &shown, &accessible, skin).clicked() {
+            if expanded {
+                st.expanded.remove(&bv.bay);
+            } else {
+                st.expanded.insert(bv.bay);
+            }
         }
+    }
+    let cols = bv.cards.len().clamp(1, max_cols.max(1));
+    for (k, pos) in bv.cards.iter().enumerate() {
+        let (row, col) = (k / cols, k % cols);
+        let at = r.min + Vec2::new(BAY_PAD + col as f32 * (CARD_W + GAP), BAY_HEADER + row as f32 * (CARD_H + GAP));
+        card(ui, Rect::from_min_size(at, Vec2::new(CARD_W, CARD_H)), pos, v, skin, palette, st, motion, prefs, actions);
     }
 }
 
@@ -517,11 +543,19 @@ fn card(
     palette: &[Color32],
     st: &mut ScreenState,
     motion: &mut Motion,
+    prefs: &ViewPrefs,
     actions: &mut Vec<ScreenAction>,
 ) {
     let colour = device_color(p, palette);
     let filling = st.filling.contains(&p.pos);
-    let f = face(p, v, filling);
+    let mut f = face(p, v, filling);
+    // The display name: a custom name first (spec: meter bridge §4.4).
+    let custom = p.slots.iter().find_map(|id| v.slots.iter().find(|s| s.id == *id)).and_then(|s| s.label.clone());
+    let (name, sub) = crate::names::display(custom.as_deref(), &f.name, prefs.only_custom_names);
+    if custom.is_some() {
+        f.sub = sub.unwrap_or_default();
+        f.name = name;
+    }
     let id = Id::new(("position-card", p.pos.to_string()));
     let empty = p.status == PositionStatus::Empty;
     let off = p.status == PositionStatus::Off;
@@ -534,33 +568,33 @@ fn card(
     resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &label));
     let painter = ui.painter_at(r.expand(40.0));
     if empty {
-        // A recess where a device would go.
-        paint::recess(&painter, r.shrink(2.0), base, 12);
+        // A recess where a device would go, with a "+".
         let hover = motion.spring(id.with("hover"), if resp.hovered() { 1.0 } else { 0.0 }, SETTLE);
+        paint::recess(&painter, r.shrink(1.0), base, 12);
         let ink = base.ground_ink;
         paint::etched_text(
             &painter,
-            r.center() - Vec2::new(0.0, 10.0),
+            r.center() - Vec2::new(0.0, 12.0),
+            Align2::CENTER_CENTER,
+            "+",
+            base,
+            ink,
+            26.0,
+            false,
+            0.0,
+            0.55 + 0.45 * hover,
+        );
+        paint::etched_text(
+            &painter,
+            r.center() + Vec2::new(0.0, 18.0),
             Align2::CENTER_CENTER,
             &f.tag,
             base,
             ink,
-            11.0,
+            10.5,
             true,
             0.14,
-            0.72 + 0.28 * hover,
-        );
-        paint::etched_text(
-            &painter,
-            r.center() + Vec2::new(0.0, 10.0),
-            Align2::CENTER_CENTER,
-            "click to choose a device",
-            base,
-            ink,
-            12.0,
-            false,
-            0.0,
-            0.72 + 0.28 * hover,
+            0.62 + 0.38 * hover,
         );
         if resp.clicked() {
             st.open_picker(p.pos, false, r);
@@ -580,7 +614,8 @@ fn card(
     let lit = base.for_device(Some(colour));
     let skin = if off { lit.powered_off() } else { lit };
     // Motion: a hover lift, a pop when the card appears, a crossfade between on and off.
-    let lift = motion.spring(id.with("lift"), if resp.hovered() && !off { 1.0 } else { 0.0 }, SETTLE);
+    let hovered = ui.rect_contains_pointer(r);
+    let lift = motion.spring(id.with("lift"), if hovered && !off { 1.0 } else { 0.0 }, SETTLE);
     let scale = if st.just_filled.contains(&p.pos) {
         motion.spring_from(id.with("pop"), 0.94, 1.0, POP)
     } else {
@@ -599,8 +634,8 @@ fn card(
         paint::panel_lifted(&lit_painter, r, &lit, None, lift, paint::PANEL_RADIUS);
     }
     let w = r.width();
-    // Row 1: the LED, the position tag, a master tag, the colour dot.
-    let led_at = r.min + Vec2::new(18.0, 22.0);
+    // Row 1: the LED, the position tag, a master tag; the controls on the right.
+    let led_at = r.min + Vec2::new(17.0, 19.0);
     let now = motion.now();
     let seen = st.led_seen.entry(p.pos).or_insert((f.led, now));
     if seen.0 != f.led {
@@ -623,120 +658,89 @@ fn card(
             actions.push(ScreenAction::Edit(Edit::ClearClip));
         }
     }
-    let tag_rect = paint::tag(&painter, led_at + Vec2::new(14.0, 0.0), Align2::LEFT_CENTER, &f.tag, &skin, 0.78);
+    let tag_rect = paint::tag(&painter, led_at + Vec2::new(13.0, 0.0), Align2::LEFT_CENTER, &f.tag, &skin, 0.78);
     if p.master {
         paint::etched_text(
             &painter,
-            Pos2::new(tag_rect.right() + 8.0, led_at.y),
+            Pos2::new(tag_rect.right() + 7.0, led_at.y),
             Align2::LEFT_CENTER,
             "MASTER",
             &skin,
             if skin.mould { skin.ink } else { skin.accent },
-            10.5,
+            10.0,
             true,
             0.12,
             1.0,
         );
     }
-    if !skin.mould && !off {
-        let dot = r.min + Vec2::new(w - 18.0, 22.0);
-        painter.circle_filled(dot + Vec2::new(0.0, 1.0), 5.0, Color32::from_black_alpha(90));
-        painter.circle_filled(dot, 4.5, colour);
-        painter.circle_filled(dot - Vec2::new(1.3, 1.5), 1.4, Color32::from_white_alpha(120));
-    }
-    // Row 2: the device name and its sub-line.
+    // Row 2: the name and its sub-line.
     let ctx = ui.ctx().clone();
     paint::truncated(
         &painter,
-        r.min + Vec2::new(16.0, 34.0),
+        r.min + Vec2::new(15.0, 33.0),
         Align2::LEFT_TOP,
         &f.name,
         paint::font(&ctx, "label-bold", 15.0),
         skin.ink,
-        w - 32.0,
+        w - 30.0,
     );
     if !f.sub.is_empty() {
         paint::truncated(
             &painter,
-            r.min + Vec2::new(16.0, 54.0),
+            r.min + Vec2::new(15.0, 51.0),
             Align2::LEFT_TOP,
             &f.sub,
-            paint::font(&ctx, "label", 11.0),
+            paint::font(&ctx, "label", 10.5),
             paint::alpha(skin.ink, 0.62),
-            w - 32.0,
+            w - 30.0,
         );
     }
-    // The OLED.
-    let oled = Rect::from_min_size(r.min + Vec2::new(14.0, 72.0), Vec2::new(w - 28.0, 44.0));
+    // The OLED: the state line on top, the meters below.
+    let well = Rect::from_min_size(r.min + Vec2::new(12.0, 68.0), Vec2::new(w - 24.0, 58.0));
+    paint::oled_well(&painter, well, &skin);
+    let inner = well.shrink2(Vec2::new(7.0, 5.0));
+    let state_text = if f.line2.is_empty() { f.line1.clone() } else { format!("{} {}", f.line1, f.line2) };
+    let state_text: String = state_text.replace('\u{b7}', " ").replace('\u{2026}', "...").to_uppercase();
+    let state_w = crate::gear::pixel_font::width(&state_text, 1.0);
+    let mut text_mesh = egui::epaint::Mesh::default();
+    let oled_c = paint::alpha(skin.oled, if off { 0.3 } else { 0.9 });
     if off {
-        paint::oled_well(&painter, oled, &skin);
-        paint::oled_text(
-            &painter,
-            Pos2::new(oled.left() + 10.0, oled.center().y),
-            "OFF",
-            paint::OLED_L,
-            paint::alpha(skin.oled, 0.25),
-        );
+        crate::gear::pixel_font::draw(&mut text_mesh, inner.left_top(), "OFF", 2.0, oled_c, false);
     } else {
-        let oled_colour =
-            if p.device.as_ref().is_some_and(|d| matches!(d.kind, DeviceKind::NetSend | DeviceKind::NetReceive)) {
-                skins::OLED_CYAN
-            } else {
-                skin.oled
-            };
-        let dim = motion.phosphor(id.with("oled"), if f.led == Some(RED) { 0.45 } else { 1.0 }, PHOSPHOR_TAU);
-        paint::oled(&painter, oled, &skin, &f.line1, &f.line2, paint::alpha(oled_colour, dim));
+        let x = (inner.right() - state_w).max(inner.left());
+        crate::gear::pixel_font::draw(&mut text_mesh, Pos2::new(x, inner.top()), &state_text, 1.0, oled_c, false);
     }
-    // The meters.
-    let tray = Rect::from_min_size(r.min + Vec2::new(14.0, 126.0), Vec2::new(w - 28.0, 26.0));
-    paint::tray(&painter, tray, &skin);
-    let lv = levels(p, v);
-    if !lv.is_empty() && !off {
-        let inner = tray.shrink2(Vec2::new(5.0, 4.0));
-        let n = lv.len();
-        if n <= 4 {
-            let tag_w = 24.0;
-            let h = ((inner.height() - (n as f32 - 1.0) * 2.0) / n as f32).max(2.0);
-            for (k, (input, ch, peak)) in lv.iter().enumerate() {
-                let (level, hold) = motion.ppm(id.with(("ppm", *input, *ch)), *peak);
-                let y = inner.top() + k as f32 * (h + 2.0);
-                let bar = Rect::from_min_size(Pos2::new(inner.left() + tag_w, y), Vec2::new(inner.width() - tag_w, h));
-                if k == 0 || lv[k - 1].0 != *input {
-                    paint::etched_text(
-                        &painter,
-                        Pos2::new(inner.left(), y + h / 2.0),
-                        Align2::LEFT_CENTER,
-                        if *input { "IN" } else { "OUT" },
-                        &skin,
-                        skin.ink,
-                        8.5,
-                        true,
-                        0.1,
-                        0.6,
-                    );
-                }
-                paint::meter(&painter, bar, level, hold, false);
+    painter.with_clip_rect(inner).add(egui::Shape::mesh(text_mesh));
+    if !off {
+        let groups = device_groups(p, v);
+        if !groups.is_empty() {
+            let mrect = Rect::from_min_max(Pos2::new(inner.left(), inner.top() + 2.0), inner.max);
+            let mut geom = Geom::card();
+            // Group labels share the top row with the state line: they win if both don't fit.
+            if crate::gear::oled_meter::meter_layout(&groups, mrect, &geom).overflow {
+                geom = Geom { bar_w: 2.0, gap: 1.0, ..geom };
             }
-        } else {
-            let bw = inner.width() / n as f32;
-            for (k, (input, ch, peak)) in lv.iter().enumerate() {
-                let (level, hold) = motion.ppm(id.with(("ppm", *input, *ch)), *peak);
-                let bar = Rect::from_min_size(
-                    inner.min + Vec2::new(k as f32 * bw, 0.0),
-                    Vec2::new((bw - 1.0).max(1.0), inner.height()),
-                );
-                paint::meter(&painter, bar, level, hold, true);
+            let m =
+                crate::gear::oled_meter::meter_widget(ui, id.with("meter"), mrect, &groups, &geom, prefs.meter, motion);
+            if m.response.double_clicked() {
+                actions.push(ScreenAction::Edit(Edit::ClearClip));
             }
         }
     }
-    // The controls.
-    let controls = Rect::from_min_size(r.min + Vec2::new(12.0, 160.0), Vec2::new(w - 24.0, paint::PILL_H));
+    // The controls, top right: faint until the card is hovered.
+    let quiet = motion.spring(id.with("controls"), if hovered || off { 1.0 } else { 0.38 }, SETTLE);
+    let controls = Rect::from_min_max(
+        Pos2::new(r.left() + 70.0, r.top() + 7.0),
+        Pos2::new(r.right() - 10.0, r.top() + 7.0 + paint::PILL_H),
+    );
     let mut row = ui
-        .new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::left_to_right(egui::Align::Center)));
-    row.spacing_mut().item_spacing.x = 6.0;
+        .new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    row.set_opacity(quiet);
+    row.spacing_mut().item_spacing.x = 5.0;
     let label = p.pos.label();
     let virt = p.pos.group.is_virtual();
     if let Some(c) = st.confirm.filter(|c| c.pos == p.pos) {
+        row.set_opacity(1.0);
         confirm_strip(&mut row, c, &skin, st, actions);
     } else if off {
         if paint::pill_labeled(&mut row, "Turn on", &format!("Turn on {label}"), &skin).clicked() {
@@ -744,26 +748,26 @@ fn card(
             actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: None }));
         }
     } else {
+        if let Some(&slot) = p.slots.first() {
+            colour_menu(&mut row, slot, &label, colour, palette, &skin, actions);
+        }
         if virt {
-            if paint::pill_labeled(&mut row, "Turn off", &format!("Turn off {label}"), &skin).clicked() {
-                st.confirm = Some(Confirm { pos: p.pos, clear: false, at: now });
-            }
             if p.pos.group == PosGroup::Vasio {
                 shape_menu(&mut row, p, &skin, actions);
             }
+            if paint::pill_labeled(&mut row, "Off", &format!("Turn off {label}"), &skin).clicked() {
+                st.confirm = Some(Confirm { pos: p.pos, clear: false, at: now });
+            }
         } else {
+            if paint::pill_labeled(&mut row, "Clear\u{2026}", &format!("Clear {label}"), &skin).clicked() {
+                st.confirm = Some(Confirm { pos: p.pos, clear: true, at: now });
+            }
             if p.pos.group == PosGroup::Asio
                 && !p.master
                 && paint::pill_labeled(&mut row, "Master", &format!("Make {label} master"), &skin).clicked()
             {
                 actions.push(ScreenAction::Edit(Edit::SetMaster { pos: Some(p.pos) }));
             }
-            if paint::pill_labeled(&mut row, "Clear\u{2026}", &format!("Clear {label}"), &skin).clicked() {
-                st.confirm = Some(Confirm { pos: p.pos, clear: true, at: now });
-            }
-        }
-        if let Some(&slot) = p.slots.first() {
-            colour_menu(&mut row, slot, &label, colour, palette, &skin, actions);
         }
     }
     if resp.clicked() && !off {
@@ -1183,7 +1187,7 @@ fn picker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use confluence_api::{all_positions, PositionDevice, PositionState, PositionStatus};
+    use confluence_api::{PositionDevice, PositionState, PositionStatus};
     fn st(pos: &str, status: PositionStatus) -> PositionState {
         PositionState {
             pos: pos.parse().unwrap(),
@@ -1196,70 +1200,6 @@ mod tests {
             slots: vec![],
         }
     }
-    fn all() -> Vec<PositionState> {
-        let mut ps: Vec<PositionState> =
-            all_positions().into_iter().map(|p| st(&p.to_string(), PositionStatus::Empty)).collect();
-        for p in ps.iter_mut().filter(|p| p.pos.group.is_virtual()) {
-            p.status = PositionStatus::Off;
-        }
-        ps
-    }
-    #[test]
-    fn rows_come_in_group_order_with_off_vasios_last() {
-        let mut ps = all();
-        ps.iter_mut().find(|p| p.pos.to_string() == "vasio:C").unwrap().status = PositionStatus::On { online: false };
-        let rows = card_rows(&ps);
-        let groups: Vec<_> = rows.iter().map(|(g, _)| *g).collect();
-        assert_eq!(
-            groups,
-            vec![
-                PosGroup::Vasio,
-                PosGroup::Asio,
-                PosGroup::WinIn,
-                PosGroup::WinOut,
-                PosGroup::App,
-                PosGroup::NetIn,
-                PosGroup::NetOut
-            ]
-        );
-        let virt: Vec<String> = rows[0].1.iter().map(|p| p.pos.to_string()).collect();
-        assert_eq!(virt[0], "vasio:C", "on first");
-        assert!(virt.contains(&"vaio:A".to_string()));
-    }
-
-    #[test]
-    fn a_collapsed_group_shows_its_devices_and_the_next_free_position() {
-        let mut ps = all();
-        ps.iter_mut().find(|p| p.pos.to_string() == "vasio:A").unwrap().status = PositionStatus::On { online: true };
-        ps.iter_mut().find(|p| p.pos.to_string() == "asio:3").unwrap().status = PositionStatus::Filled { online: true };
-        let views = group_views(&ps, &HashSet::new());
-        let asio = views.iter().find(|g| g.group == PosGroup::Asio).unwrap();
-        let shown: Vec<String> = asio.cards.iter().map(|p| p.pos.to_string()).collect();
-        assert_eq!(shown, vec!["asio:3", "asio:1"], "the device, then the first empty tray");
-        assert_eq!(asio.hidden, 6);
-        let virt = &views[0];
-        let shown: Vec<String> = virt.cards.iter().map(|p| p.pos.to_string()).collect();
-        assert_eq!(shown, vec!["vasio:A", "vasio:B"], "the on one, then the next off one");
-        assert_eq!(virt.hidden, 7, "six VASIOs and the VAIO");
-        let mut expanded = HashSet::new();
-        expanded.insert(PosGroup::Asio);
-        let views = group_views(&ps, &expanded);
-        let asio = views.iter().find(|g| g.group == PosGroup::Asio).unwrap();
-        assert_eq!(asio.cards.len(), 8);
-        assert_eq!(asio.hidden, 0);
-    }
-
-    #[test]
-    fn cards_fill_the_width() {
-        let (n, w) = cards_across(100.0);
-        assert_eq!((n, w), (1, CARD_W_MIN));
-        let (n, w) = cards_across(CARD_W_MIN * 3.0 + GAP * 2.0 + 30.0);
-        assert_eq!(n, 3);
-        assert!(w > CARD_W_MIN && w <= CARD_W_MAX, "{w}");
-        let (n, w) = cards_across(CARD_W_MAX * 2.0 + GAP + 100.0);
-        assert_eq!((n, w), (2, CARD_W_MAX), "never wider than the cap");
-    }
-
     #[test]
     fn device_names_are_split_from_their_vendor_noise() {
         assert_eq!(

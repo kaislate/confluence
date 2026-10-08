@@ -804,3 +804,17 @@ fn the_meter_style_is_chosen_in_settings() {
     assert!(p.meter.double_peak && p.only_custom_names);
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn devices_sit_in_bays_by_type() {
+    let d = EngineDir::new("bays");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "the bays", LONG, |h| h.query_by_label("HARDWARE").is_some());
+    for bay in ["WINDOWS", "VIRTUAL", "NETWORK", "APPS"] {
+        assert!(h.query_by_label(bay).is_some(), "{bay}");
+    }
+    client(&d).call(Command::Shutdown).unwrap();
+}

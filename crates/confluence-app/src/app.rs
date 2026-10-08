@@ -731,14 +731,24 @@ impl ConfluenceApp {
         let skin = self.skin();
         let palette = self.look.skin.slot_colors.clone();
         let list = view.state.as_ref().map(|s| s.devices.clone()).unwrap_or_default();
-        let (screen_state, motion) = (&mut self.screen_state, &mut self.motion);
+        let (screen_state, motion, prefs) = (&mut self.screen_state, &mut self.motion, &self.prefs);
         let actions = egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 paint::ground(ui.painter(), ui.max_rect(), &skin);
                 let inner = ui.max_rect().shrink2(Vec2::new(0.0, 0.0));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
-                crate::devices_screen::show(&mut child, view, &list, &skin, &palette, screen_state, motion, editable)
+                crate::devices_screen::show(
+                    &mut child,
+                    view,
+                    &list,
+                    &skin,
+                    &palette,
+                    screen_state,
+                    motion,
+                    prefs,
+                    editable,
+                )
             })
             .inner;
         for a in actions {
