@@ -21,15 +21,15 @@ pub mod ring;
 mod win;
 
 #[cfg(windows)]
-pub use win::{Client, Server};
+pub use win::{Client, HeaderView, Server};
 
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use ring::RingCounters;
 
 /// "CNFLSHM1".
 pub const MAGIC: u64 = 0x314D_4853_4C46_4E43;
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Shape of a stream, fixed for the life of one generation.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -88,9 +88,35 @@ pub struct Header {
     pub client_alive: AtomicU64,
     pub to_client: RingCounters,
     pub from_client: RingCounters,
+    /// The program streaming (e.g. "Ableton Live 12 Suite"): NUL-padded
+    /// UTF-8, written by the client when it claims the stream.
+    pub client_name: [AtomicU8; CLIENT_NAME_BYTES],
 }
 
+/// Room for the client's name, its terminating NUL included.
+pub const CLIENT_NAME_BYTES: usize = 64;
+
 impl Header {
+    /// Records the client's name (cut to fit on a character boundary; empty
+    /// clears it).
+    pub fn set_client_name(&self, name: &str) {
+        let mut end = name.len().min(CLIENT_NAME_BYTES - 1);
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        let bytes = &name.as_bytes()[..end];
+        for (i, cell) in self.client_name.iter().enumerate() {
+            cell.store(bytes.get(i).copied().unwrap_or(0), Ordering::Relaxed);
+        }
+    }
+
+    /// The client's name, if it gave one.
+    pub fn client_name(&self) -> Option<String> {
+        let bytes: Vec<u8> =
+            self.client_name.iter().map(|c| c.load(Ordering::Relaxed)).take_while(|&b| b != 0).collect();
+        (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     pub fn layout(&self) -> Layout {
         Layout {
             sample_rate: self.sample_rate,

@@ -5,7 +5,9 @@
 pub mod app;
 pub mod commands;
 pub mod devices;
+pub mod devices_screen;
 pub mod engine_launch;
+pub mod gear;
 pub mod graph;
 pub mod grid_view;
 pub mod inspector;
@@ -15,5 +17,6 @@ pub mod pending;
 pub mod plugins;
 pub mod scenes;
 pub mod scripts;
+pub mod settings;
 pub mod skin;
 pub mod theme;

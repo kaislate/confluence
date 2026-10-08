@@ -31,8 +31,9 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 /// concurrently from connection threads.
 pub trait Service: Send + Sync {
     fn handle(&self, cmd: &Command) -> Response;
-    /// A snapshot and its event stream, or `None` if this server has none.
-    fn subscribe(&self) -> Option<(State, Receiver<Event>)>;
+    /// A snapshot and its event stream (with meter frames if `meters`), or
+    /// `None` if this server has none.
+    fn subscribe(&self, meters: bool) -> Option<(State, Receiver<Event>)>;
 }
 
 pub type Handler = Arc<dyn Service>;
@@ -44,7 +45,7 @@ impl<F: Fn(&Command) -> Response + Send + Sync> Service for FnService<F> {
         (self.0)(cmd)
     }
 
-    fn subscribe(&self) -> Option<(State, Receiver<Event>)> {
+    fn subscribe(&self, _meters: bool) -> Option<(State, Receiver<Event>)> {
         None
     }
 }
@@ -260,8 +261,8 @@ fn accept_loop(path: &str, first: OwnedPipe, security: UserOnlySecurity, stop: &
 fn serve(mut file: File, handler: Handler) {
     loop {
         match read_envelope::<_, Command>(&mut file) {
-            Ok(Some(env)) if env.body == Command::Subscribe => {
-                stream(file, env.id, handler);
+            Ok(Some(env)) if matches!(env.body, Command::Subscribe | Command::SubscribeMeters) => {
+                stream(file, env.id, handler, env.body == Command::SubscribeMeters);
                 return;
             }
             Ok(Some(env)) => {
@@ -282,8 +283,8 @@ fn serve(mut file: File, handler: Handler) {
 
 /// Writes the snapshot, then every event, until the client or the engine goes
 /// away. After `Subscribe` nothing more is read from the connection.
-fn stream(mut file: File, id: u32, handler: Handler) {
-    let subscription = handler.subscribe();
+fn stream(mut file: File, id: u32, handler: Handler, meters: bool) {
+    let subscription = handler.subscribe(meters);
     // A subscriber that stops reading can block a write here for good: it
     // must not keep the service (and the engine's state) alive meanwhile.
     drop(handler);
@@ -380,8 +381,8 @@ mod tests {
             }
         }
 
-        fn subscribe(&self) -> Option<(State, Receiver<Event>)> {
-            Some(self.publisher.lock().unwrap().subscribe())
+        fn subscribe(&self, meters: bool) -> Option<(State, Receiver<Event>)> {
+            Some(self.publisher.lock().unwrap().subscribe(meters))
         }
     }
 
@@ -411,6 +412,7 @@ mod tests {
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         }
     }
 

@@ -30,6 +30,15 @@ fn key(b: &MidiBinding) -> Control {
     (b.device.clone(), b.channel, b.cc)
 }
 
+impl Midi {
+    /// A slot moved to other channels: bindings on them follow it.
+    pub(super) fn remap(&mut self, mv: &super::ChannelMove) {
+        for b in &mut self.bindings {
+            (b.input, b.output) = (mv.input(b.input), mv.output(b.output));
+        }
+    }
+}
+
 impl Engine {
     /// Arms MIDI Learn: the next CC that arrives binds to this route's gain.
     pub fn learn_midi(&mut self, input: u32, output: u32) -> Result<(), EngineError> {

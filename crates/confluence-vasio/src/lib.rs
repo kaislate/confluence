@@ -1,5 +1,5 @@
 //! `confluence-vasio.dll`: the virtual ASIO driver (spec §7.4). An in-proc
-//! COM server with eight driver classes, "Confluence VASIO 1" … "8". A DAW
+//! COM server with eight driver classes, "Confluence VASIO A" … "H". A DAW
 //! that loads one exchanges audio with the engine through `confluence-shm`.
 //!
 //! The DAW must never hang or crash because of Confluence: every entry point
@@ -10,6 +10,7 @@
 
 mod driver;
 mod factory;
+mod host;
 pub mod register;
 mod stream;
 
@@ -42,6 +43,13 @@ pub fn instance_of(id: &GUID) -> Option<u32> {
 
 /// Driver name shown in DAWs.
 pub fn driver_name(instance: u32) -> String {
+    let letter = char::from(b'A' + (instance.clamp(1, 26) - 1) as u8);
+    format!("Confluence VASIO {letter}")
+}
+
+/// The name instance `instance` was registered under before the drivers
+/// were lettered (its registry key is removed on registration).
+pub fn legacy_driver_name(instance: u32) -> String {
     format!("Confluence VASIO {instance}")
 }
 
@@ -105,6 +113,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn drivers_are_lettered() {
+        assert_eq!(driver_name(1), "Confluence VASIO A");
+        assert_eq!(driver_name(8), "Confluence VASIO H");
+        assert_eq!(legacy_driver_name(3), "Confluence VASIO 3");
+    }
+
+    #[test]
     fn eight_distinct_classes_that_map_back_to_their_instance() {
         let ids: Vec<GUID> = (1..=INSTANCES).map(clsid).collect();
         for (i, id) in ids.iter().enumerate() {
@@ -112,7 +127,7 @@ mod tests {
             assert_eq!(ids.iter().filter(|x| *x == id).count(), 1);
         }
         assert_eq!(instance_of(&clsid(9)), None);
-        assert_eq!(driver_name(3), "Confluence VASIO 3");
+        assert_eq!(driver_name(3), "Confluence VASIO C");
     }
 
     #[test]

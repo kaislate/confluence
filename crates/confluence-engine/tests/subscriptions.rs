@@ -23,6 +23,10 @@ impl Drop for Engine {
 /// The engine with this test's own pipe, journal and devices file.
 fn spawn(pipe: &str, dir: &std::path::Path) -> Engine {
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
+    cmd.env(confluence_provider_vasio::NAMESPACE_VAR, format!("test-{}", std::process::id())).env(
+        confluence_provider_vasio::config::ROOT_VAR,
+        format!(r"Software\ConfluenceTest\VASIO.{}", std::process::id()),
+    );
     cmd.args(["--pipe", pipe, "--journal"]).arg(dir.join("journal.bin")).arg("--devices").arg(dir.join("devices.json"));
     // Never this PC's MIDI devices or plugins.
     let no_plugins = dir.join("no-plugins");
@@ -37,7 +41,7 @@ fn next_change(sub: &mut Subscription) -> (u64, Vec<Change>) {
     loop {
         match sub.recv().unwrap() {
             Event::Changed { version, changes } => return (version, changes),
-            Event::Telemetry { .. } => {}
+            Event::Telemetry { .. } | Event::Meters(_) => {}
         }
     }
 }
@@ -248,6 +252,10 @@ fn open_connections_do_not_hold_up_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let pipe = format!("confluence-sub-g-{}", std::process::id());
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
+    cmd.env(confluence_provider_vasio::NAMESPACE_VAR, format!("test-{}", std::process::id())).env(
+        confluence_provider_vasio::config::ROOT_VAR,
+        format!(r"Software\ConfluenceTest\VASIO.{}", std::process::id()),
+    );
     cmd.args(["--pipe", &pipe, "--journal"])
         .arg(dir.path().join("journal.bin"))
         .arg("--devices")
@@ -293,5 +301,44 @@ fn a_store_says_what_kind_of_update_it_made() {
         let s = seen.lock().unwrap();
         s.contains(&Update::State) && s.contains(&Update::Telemetry)
     });
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn meter_frames_arrive_about_twenty_times_a_second_only_when_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = format!("confluence-meters-{}", std::process::id());
+    let _engine = spawn(&pipe, dir.path());
+    let (_, mut plain) = Subscription::connect(&pipe, Duration::from_secs(10)).unwrap();
+    let (state, mut metered) = Subscription::connect_with_meters(&pipe, Duration::from_secs(10)).unwrap();
+    assert!(state.positions.iter().any(|p| p.pos.to_string() == "vasio:A"), "positions are in the state");
+    let start = std::time::Instant::now();
+    let mut frames = 0;
+    while start.elapsed() < Duration::from_secs(1) {
+        if let Event::Meters(_) = metered.recv().unwrap() {
+            frames += 1;
+        }
+    }
+    assert!((12..=30).contains(&frames), "{frames} meter frames in a second");
+    // The plain subscriber got telemetry, never meters.
+    let t = std::time::Instant::now();
+    while t.elapsed() < Duration::from_millis(300) {
+        assert!(!matches!(plain.recv().unwrap(), Event::Meters(_)));
+    }
+    let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_meter_subscriber_that_never_reads_does_not_stall_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = format!("confluence-meters-slow-{}", std::process::id());
+    let _engine = spawn(&pipe, dir.path());
+    let (_s, _never_read) = Subscription::connect_with_meters(&pipe, Duration::from_secs(10)).unwrap();
+    std::thread::sleep(Duration::from_secs(3)); // its queue fills
+    let mut c = Client::connect(&pipe, Duration::from_secs(5)).unwrap();
+    let t = std::time::Instant::now();
+    assert!(matches!(c.call(Command::Status).unwrap(), Response::Status(_)));
+    assert!(t.elapsed() < Duration::from_millis(500), "control stays responsive");
     c.call(Command::Shutdown).unwrap();
 }

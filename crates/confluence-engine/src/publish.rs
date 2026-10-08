@@ -5,7 +5,9 @@
 
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
-use confluence_api::{diff, Command, DeviceInfo, EngineStatus, Event, Response, SlotHealth, State};
+use std::sync::mpsc::TrySendError;
+
+use confluence_api::{diff, Command, DeviceInfo, EngineStatus, Event, MeterFrame, Response, SlotHealth, State};
 
 use crate::devices::DeviceManager;
 use crate::Engine;
@@ -16,7 +18,8 @@ pub const SUBSCRIBER_QUEUE: usize = 256;
 pub struct Publisher {
     last: State,
     version: u64,
-    subscribers: Vec<SyncSender<Event>>,
+    /// Each subscriber's queue, and whether it asked for meters.
+    subscribers: Vec<(SyncSender<Event>, bool)>,
 }
 
 impl Publisher {
@@ -43,11 +46,26 @@ impl Publisher {
         self.version
     }
 
-    /// The current state and a queue that receives every event after it.
-    pub fn subscribe(&mut self) -> (State, Receiver<Event>) {
+    /// The current state and a queue that receives every event after it
+    /// (with meter frames if `meters`).
+    pub fn subscribe(&mut self, meters: bool) -> (State, Receiver<Event>) {
         let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE);
-        self.subscribers.push(tx);
+        self.subscribers.push((tx, meters));
         (self.last.clone(), rx)
+    }
+
+    /// Whether anyone asked for meters (only then are they measured out).
+    pub fn has_meter_subscribers(&self) -> bool {
+        self.subscribers.iter().any(|(_, m)| *m)
+    }
+
+    /// Sends a meter frame to the subscribers that asked for meters. A full
+    /// queue skips this frame for that subscriber; it is not dropped for it.
+    pub fn meters(&mut self, frame: MeterFrame) {
+        let event = Event::Meters(frame);
+        self.subscribers.retain(|(tx, meters)| {
+            !*meters || !matches!(tx.try_send(event.clone()), Err(TrySendError::Disconnected(_)))
+        });
     }
 
     /// Ends every subscription (at shutdown).
@@ -61,7 +79,7 @@ impl Publisher {
 
     /// Sends to every subscriber; a full queue or a vanished receiver drops it.
     fn send(&mut self, event: &Event) {
-        self.subscribers.retain(|tx| tx.try_send(event.clone()).is_ok());
+        self.subscribers.retain(|(tx, _)| tx.try_send(event.clone()).is_ok());
     }
 }
 
@@ -97,6 +115,7 @@ pub fn published_state(
         midi_learning: None,
         scripts: Vec::new(),
         peers: devices.peers(),
+        positions: devices.positions(engine),
     }
 }
 
@@ -138,13 +157,14 @@ mod tests {
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         }
     }
 
     #[test]
     fn a_subscriber_gets_the_snapshot_then_contiguous_versions() {
         let mut p = Publisher::new(state(vec![]));
-        let (snap, rx) = p.subscribe();
+        let (snap, rx) = p.subscribe(false);
         assert_eq!(snap.version, 0);
         assert_eq!(p.publish(state(vec![(0, 0, 0.0)])), 1);
         assert_eq!(p.publish(state(vec![(0, 0, -6.0), (1, 1, 0.0)])), 2);
@@ -152,7 +172,7 @@ mod tests {
             .try_iter()
             .filter_map(|e| match e {
                 Event::Changed { version, .. } => Some(version),
-                Event::Telemetry { .. } => None,
+                Event::Telemetry { .. } | Event::Meters(_) => None,
             })
             .collect();
         assert_eq!(versions, vec![1, 2]);
@@ -161,7 +181,7 @@ mod tests {
     #[test]
     fn one_publish_is_one_event_however_many_changes() {
         let mut p = Publisher::new(state(vec![]));
-        let (_, rx) = p.subscribe();
+        let (_, rx) = p.subscribe(false);
         p.publish(state(vec![(0, 0, 0.0), (1, 1, 0.0), (2, 2, 0.0)]));
         let events: Vec<Event> = rx.try_iter().collect();
         assert_eq!(events.len(), 1);
@@ -171,7 +191,7 @@ mod tests {
     #[test]
     fn a_no_op_command_publishes_nothing() {
         let mut p = Publisher::new(state(vec![(0, 0, 0.0)]));
-        let (_, rx) = p.subscribe();
+        let (_, rx) = p.subscribe(false);
         assert_eq!(p.publish(state(vec![(0, 0, 0.0)])), 0, "nothing changed: same version");
         assert!(rx.try_iter().next().is_none());
     }
@@ -180,7 +200,7 @@ mod tests {
     fn a_late_subscriber_snapshot_includes_everything_so_far() {
         let mut p = Publisher::new(state(vec![]));
         p.publish(state(vec![(3, 4, -1.0)]));
-        let (snap, _rx) = p.subscribe();
+        let (snap, _rx) = p.subscribe(false);
         assert_eq!(snap.version, 1);
         assert_eq!(snap.points.len(), 1);
     }
@@ -188,8 +208,8 @@ mod tests {
     #[test]
     fn a_full_queue_drops_only_that_subscriber() {
         let mut p = Publisher::new(state(vec![]));
-        let (_, stalled) = p.subscribe(); // never read
-        let (_, live) = p.subscribe();
+        let (_, stalled) = p.subscribe(false); // never read
+        let (_, live) = p.subscribe(false);
         for i in 0..(SUBSCRIBER_QUEUE as u32 + 10) {
             p.publish(state(vec![(i, 0, 0.0)]));
             while live.try_recv().is_ok() {}
@@ -203,7 +223,7 @@ mod tests {
     #[test]
     fn closing_ends_every_subscription() {
         let mut p = Publisher::new(state(vec![]));
-        let (_, rx) = p.subscribe();
+        let (_, rx) = p.subscribe(false);
         p.close();
         assert_eq!(p.subscriber_count(), 0);
         assert!(rx.recv().is_err(), "the stream ended");
@@ -213,10 +233,10 @@ mod tests {
     fn vanished_subscribers_are_removed() {
         let mut p = Publisher::new(state(vec![]));
         for _ in 0..20 {
-            let (_, rx) = p.subscribe();
+            let (_, rx) = p.subscribe(false);
             drop(rx);
         }
-        let (_, keep) = p.subscribe();
+        let (_, keep) = p.subscribe(false);
         p.telemetry(status(), Vec::new());
         assert_eq!(p.subscriber_count(), 1);
         assert!(matches!(keep.try_recv(), Ok(Event::Telemetry { .. })));

@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use confluence_api::{BusRef, Change, Command, DeviceKind, EngineStatus, Event, Response};
+use confluence_api::{BusRef, Change, Command, DeviceKind, EngineStatus, Event, PosId, PositionStatus, Response};
 
 #[derive(Parser)]
 #[command(version, about = "Control a running Confluence engine")]
@@ -110,6 +110,70 @@ enum Cmd {
     Status,
     /// Follow every change to routes, slots and devices live, with a status line each second.
     Watch,
+    /// List the fixed positions (VASIO A-H, ASIO 1-8, ...) and what each holds.
+    Positions,
+    /// Put device NAME of KIND in position POS (`fill asio:2 asio "MOTU Gen 5"`); a filled one is swapped.
+    Fill {
+        #[arg(value_parser = parse_pos)]
+        pos: PosId,
+        kind: Kind,
+        name: String,
+    },
+    /// Empty position POS: its device is closed and its routes removed.
+    Clear {
+        #[arg(value_parser = parse_pos)]
+        pos: PosId,
+    },
+    /// Turn VASIO LETTER on (with the DAW's inputs x outputs, e.g. 16x4) or off.
+    Vasio {
+        #[arg(value_parser = parse_vasio_letter)]
+        letter: PosId,
+        state: OnOff,
+        #[arg(value_parser = parse_shape)]
+        shape: Option<(u32, u32)>,
+    },
+    /// The master clock from the next start: an ASIO position (`asio:1`) or `internal`.
+    Master {
+        #[arg(value_parser = parse_master)]
+        pos: MasterArg,
+    },
+    /// Show every slot channel's level once.
+    Meters,
+    /// Reset the latched clip indicators.
+    ClearClip,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
+/// `master` argument: an ASIO position, or `None` for the internal clock.
+#[derive(Clone, Copy, Debug)]
+struct MasterArg(Option<PosId>);
+
+fn parse_pos(s: &str) -> Result<PosId, String> {
+    s.parse::<PosId>().map_err(|e| format!("{s}: {e}"))
+}
+
+fn parse_vasio_letter(s: &str) -> Result<PosId, String> {
+    parse_pos(&format!("vasio:{}", s.trim().to_ascii_uppercase()))
+}
+
+/// `IxO` as the DAW sees it (16x4: 16 inputs, 4 outputs), as the engine's
+/// (inputs, outputs): the DAW's outputs are the engine's inputs.
+fn parse_shape(s: &str) -> Result<(u32, u32), String> {
+    let (i, o) = s.split_once(['x', 'X']).ok_or_else(|| format!("{s}: expected INxOUT, e.g. 8x8"))?;
+    let n = |t: &str| t.trim().parse::<u32>().map_err(|e| format!("{s}: {e}"));
+    Ok((n(o)?, n(i)?))
+}
+
+fn parse_master(s: &str) -> Result<MasterArg, String> {
+    if s.eq_ignore_ascii_case("internal") {
+        return Ok(MasterArg(None));
+    }
+    parse_pos(s).map(|p| MasterArg(Some(p)))
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -182,7 +246,16 @@ impl Cmd {
             Cmd::HideEditor { bus } => Command::HideEditor { bus: BusRef::Id(bus) },
             Cmd::SetParam { bus, param, value } => Command::SetParam { bus: BusRef::Id(bus), param, value },
             Cmd::Status => Command::Status,
-            Cmd::Watch => Command::Subscribe,
+            Cmd::Watch | Cmd::Positions => Command::Subscribe,
+            Cmd::Fill { pos, kind, ref name } => Command::FillPosition { pos, kind: kind.into(), name: name.clone() },
+            Cmd::Clear { pos } => Command::ClearPosition { pos },
+            Cmd::Vasio { letter, state, shape } => {
+                let on = matches!(state, OnOff::On);
+                Command::SetVirtual { pos: letter, on, shape: shape.filter(|_| on) }
+            }
+            Cmd::Master { pos } => Command::SetMaster { pos: pos.0 },
+            Cmd::Meters => Command::SubscribeMeters,
+            Cmd::ClearClip => Command::ClearClip,
         }
     }
 }
@@ -195,6 +268,100 @@ fn script_command(cmd: &Cmd) -> Result<Command, String> {
             Ok(Command::SetScript { name: name.clone(), source, enabled: !disabled })
         }
         other => Ok(other.to_command()),
+    }
+}
+
+/// One line per position, from a state snapshot.
+fn render_positions(positions: &[confluence_api::PositionState]) -> String {
+    if positions.is_empty() {
+        return "no positions (an engine older than API 10?)".into();
+    }
+    positions
+        .iter()
+        .map(|p| {
+            let status = match p.status {
+                PositionStatus::Empty => "Empty".to_string(),
+                PositionStatus::Filled { online: true } => "Filled".into(),
+                PositionStatus::Filled { online: false } => "Filled (offline)".into(),
+                PositionStatus::Off => "Off".into(),
+                PositionStatus::On { online } => match (&p.daw, online) {
+                    (Some(daw), _) => format!("On (DAW: {daw})"),
+                    (None, true) => "On (connected)".into(),
+                    (None, false) => "On".into(),
+                },
+            };
+            let mut line = format!("{:<10} {status}", p.pos.to_string());
+            if let Some(d) = p.device.as_ref().filter(|_| !p.pos.group.is_virtual()) {
+                line.push_str(&format!("  {}", d.name));
+            }
+            if let Some((i, o)) = p.shape {
+                line.push_str(&format!("  {o}x{i}")); // as the DAW sees it
+            }
+            if !p.slots.is_empty() {
+                line.push_str(&format!("  slots {:?}", p.slots));
+            }
+            if p.master {
+                line.push_str("  MASTER");
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every slot channel's level as a text bar (-60 to 0 dB), from one meter frame.
+fn render_meters(s: &confluence_api::State, f: &confluence_api::MeterFrame) -> String {
+    let bar = |b: u8| {
+        let db = confluence_api::byte_db(b);
+        let filled = if db.is_finite() { (((db + 60.0) / 6.0).round().clamp(0.0, 10.0)) as usize } else { 0 };
+        let text = if db.is_finite() { format!("{db:6.1}") } else { "  -inf".into() };
+        format!("{}{} {text}", "\u{2588}".repeat(filled), "\u{2591}".repeat(10 - filled))
+    };
+    let mut lines = Vec::new();
+    for slot in &s.slots {
+        for k in 0..slot.inputs {
+            let i = (slot.first_input + k).checked_sub(f.first_input).map(|i| i as usize);
+            let peak = i.and_then(|i| f.inputs.get(i)).map_or(0, |m| m[0]);
+            lines.push(format!("#{} in {} {}", slot.id, k + 1, bar(peak)));
+        }
+        for k in 0..slot.outputs {
+            let o = (slot.first_output + k).checked_sub(f.first_output).map(|o| o as usize);
+            let peak = o.and_then(|o| f.outputs.get(o)).map_or(0, |m| m[0]);
+            lines.push(format!("#{} out {} {}", slot.id, k + 1, bar(peak)));
+        }
+    }
+    if lines.is_empty() {
+        return "no slots".into();
+    }
+    lines.join("\n")
+}
+
+/// Subscribes with meters and prints the first frame.
+#[cfg(windows)]
+fn meters(pipe: &str) -> ExitCode {
+    use std::time::Duration;
+
+    use confluence_client::Subscription;
+
+    let (state, mut sub) = match Subscription::connect_with_meters(pipe, Duration::from_secs(2)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot subscribe to engine on pipe '{pipe}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    loop {
+        match sub.recv() {
+            Ok(Event::Meters(f)) => {
+                println!("{}", render_meters(&state, &f));
+                return ExitCode::SUCCESS;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("engine stream ended: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 }
 
@@ -381,6 +548,9 @@ fn main() -> ExitCode {
     if matches!(cli.command, Cmd::Watch) {
         return watch(&pipe);
     }
+    if matches!(cli.command, Cmd::Meters) {
+        return meters(&pipe);
+    }
     let mut client = match Client::connect(&pipe, Duration::from_secs(2)) {
         Ok(c) => c,
         Err(e) => {
@@ -402,6 +572,10 @@ fn main() -> ExitCode {
         }
         Ok(Response::Snapshot(s)) if matches!(cli.command, Cmd::Scripts) => {
             println!("{}", render_scripts(&s));
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Snapshot(s)) if matches!(cli.command, Cmd::Positions) => {
+            println!("{}", render_positions(&s.positions));
             ExitCode::SUCCESS
         }
         Ok(Response::Snapshot(s)) if matches!(cli.command, Cmd::Peers) => {
@@ -437,6 +611,7 @@ fn render_status(s: &EngineStatus) -> String {
 
 fn render_change(c: &Change) -> String {
     match c {
+        Change::PositionsChanged(p) => format!("positions changed ({} positions)", p.len()),
         Change::PointSet(p) => format!(
             "route {} -> {} {:+.1} dB{}{}",
             p.input,
@@ -478,6 +653,7 @@ fn render_change(c: &Change) -> String {
 /// One line per change; telemetry is shown separately (once a second).
 fn render_event(e: &Event) -> Option<String> {
     match e {
+        Event::Meters(_) => None,
         Event::Changed { version, changes } => {
             Some(changes.iter().map(|c| format!("v{version}  {}", render_change(c))).collect::<Vec<_>>().join("\n"))
         }
@@ -533,6 +709,67 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use confluence_api::{Change, EngineStatus, Event, PointState, SlotHealth};
+
+    #[test]
+    fn positions_render_one_line_each() {
+        use confluence_api::{PositionDevice, PositionState};
+        let positions = vec![
+            PositionState {
+                pos: "vasio:A".parse().unwrap(),
+                status: PositionStatus::On { online: true },
+                device: Some(PositionDevice { kind: DeviceKind::Vasio, name: "1:8x8".into() }),
+                shape: Some((2, 8)),
+                daw: Some("Ableton Live 12 Suite".into()),
+                master: false,
+                color: None,
+                slots: vec![3],
+            },
+            PositionState {
+                pos: "asio:1".parse().unwrap(),
+                status: PositionStatus::Filled { online: true },
+                device: Some(PositionDevice { kind: DeviceKind::Asio, name: "GoXLR ASIO Driver".into() }),
+                shape: None,
+                daw: None,
+                master: true,
+                color: None,
+                slots: vec![1, 2],
+            },
+        ];
+        assert_eq!(
+            render_positions(&positions),
+            "vasio:A    On (DAW: Ableton Live 12 Suite)  8x2  slots [3]
+asio:1     Filled  GoXLR ASIO Driver  slots [1, 2]  MASTER"
+        );
+    }
+
+    #[test]
+    fn position_commands_parse() {
+        let parse = |a: &[&str]| {
+            let mut v = vec!["confluence-cli"];
+            v.extend_from_slice(a);
+            Cli::try_parse_from(v).map(|c| c.command.to_command())
+        };
+        assert_eq!(
+            parse(&["fill", "asio:2", "asio", "MOTU Gen 5"]).unwrap(),
+            Command::FillPosition { pos: "asio:2".parse().unwrap(), kind: DeviceKind::Asio, name: "MOTU Gen 5".into() }
+        );
+        assert_eq!(
+            parse(&["clear", "win-out:1"]).unwrap(),
+            Command::ClearPosition { pos: "win-out:1".parse().unwrap() }
+        );
+        assert_eq!(
+            parse(&["vasio", "B", "on", "16x4"]).unwrap(),
+            Command::SetVirtual { pos: "vasio:B".parse().unwrap(), on: true, shape: Some((4, 16)) }
+        );
+        assert_eq!(
+            parse(&["vasio", "B", "off"]).unwrap(),
+            Command::SetVirtual { pos: "vasio:B".parse().unwrap(), on: false, shape: None }
+        );
+        assert_eq!(parse(&["master", "asio:1"]).unwrap(), Command::SetMaster { pos: Some("asio:1".parse().unwrap()) });
+        assert_eq!(parse(&["master", "internal"]).unwrap(), Command::SetMaster { pos: None });
+        assert_eq!(parse(&["clear-clip"]).unwrap(), Command::ClearClip);
+        assert!(parse(&["clear", "asio:9"]).is_err());
+    }
 
     #[test]
     fn status_and_events_render_readably() {
@@ -635,6 +872,7 @@ v7  slot #3 removed"
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         };
         let text = render_midi(&st);
         assert!(text.contains("nanoKONTROL2"), "{text}");

@@ -66,9 +66,10 @@ fn hardware_to_a_daw_and_back_through_vasio() {
     devices.add(&mut engine, DeviceKind::Asio, "fake:io").unwrap();
     let ids = devices.add(&mut engine, DeviceKind::Vasio, "1:2x2").unwrap();
     assert_eq!(ids.len(), 1, "one strict slot carries both directions");
-    for again in ["1", "1:8", " 1:2x2"] {
-        let err = devices.add(&mut engine, DeviceKind::Vasio, again).unwrap_err();
-        assert!(err.contains("already open"), "{again}: {err}");
+    // VASIO 1 is a position (VASIO A) that is on: adding it again with the
+    // same shape gives the same slot back (spec: slot model, AddDevice compatibility).
+    for again in ["1", " 1:2x2"] {
+        assert_eq!(devices.add(&mut engine, DeviceKind::Vasio, again).unwrap(), ids, "{again}");
     }
     let slots = engine.slots();
     let hw_in = slots.iter().find(|s| s.name == "fake:io in").unwrap().first_input;
@@ -113,6 +114,45 @@ fn hardware_to_a_daw_and_back_through_vasio() {
         engine.tick();
     }
     assert!(daw.is_running());
+    daw.stop();
+    clock.stop();
+}
+
+#[test]
+fn the_position_shows_the_program_using_vasio() {
+    confluence_provider_vasio::isolate_for_tests();
+    let root = format!(r"Software\ConfluenceTest\VASIO.daw-name.{}", std::process::id());
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            confluence_provider_vasio::config::delete_root(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_vasio_config_root(Some(root.clone()));
+    let vasio_b: confluence_api::PosId = "vasio:B".parse().unwrap();
+    let on = Command::SetVirtual { pos: vasio_b, on: true, shape: Some((2, 2)) };
+    assert_eq!(devices.handle(&mut engine, &on), Some(Response::Ok));
+    let position = |devices: &DeviceManager, engine: &Engine| {
+        devices.positions(engine).into_iter().find(|s| s.pos == vasio_b).unwrap()
+    };
+    assert_eq!(position(&devices, &engine).daw, None, "no DAW yet");
+    let clock = InternalClock::start(audio, 48_000.0).unwrap();
+    let mut daw = daw(2);
+    let mut seen = None;
+    for _ in 0..300 {
+        std::thread::sleep(Duration::from_millis(10));
+        engine.tick();
+        seen = position(&devices, &engine).daw;
+        if seen.is_some() {
+            break;
+        }
+    }
+    // The test binary has no version resource: the DLL names it by its file.
+    let exe = std::env::current_exe().unwrap().file_stem().unwrap().to_string_lossy().into_owned();
+    assert_eq!(seen, Some(exe));
+    assert_eq!(position(&devices, &engine).status, confluence_api::PositionStatus::On { online: true });
     daw.stop();
     clock.stop();
 }

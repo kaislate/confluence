@@ -32,6 +32,11 @@ impl Drop for Engine {
 /// (Never this PC's MIDI devices.)
 fn engine_command(pipe: &str, journal: &std::path::Path) -> Process {
     let mut cmd = Process::new(env!("CARGO_BIN_EXE_confluence-engine"));
+    // Never the real VASIO streams or saved shapes (a fresh setup opens VASIO A).
+    cmd.env(confluence_provider_vasio::NAMESPACE_VAR, format!("test-{}", std::process::id())).env(
+        confluence_provider_vasio::config::ROOT_VAR,
+        format!(r"Software\ConfluenceTest\VASIO.{}", std::process::id()),
+    );
     cmd.args(["--pipe", pipe, "--journal"]).arg(journal).arg("--devices").arg(journal.with_file_name("devices.json"));
     cmd.arg("--no-midi");
     // Loopback only, any free port, never advertised: no test touches the LAN.
@@ -721,4 +726,91 @@ fn a_devices_colour_survives_a_killed_engine_and_a_restart() {
     let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     assert_eq!(colour_now(&mut c), None, "back to the default for good");
     shutdown(child, &mut c);
+}
+
+#[test]
+fn a_version_1_setup_migrates_once_with_backups() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let devices = dir.path().join("devices.json");
+    // Nine Windows outputs (one too many) and a VASIO; no VAIO driver in tests.
+    let fixture =
+        std::fs::read_to_string(format!("{}/tests/fixtures/devices-v1-overflow.json", env!("CARGO_MANIFEST_DIR")))
+            .unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+    v["devices"].as_array_mut().unwrap().retain(|d| d["kind"] != "Vaio");
+    std::fs::write(&devices, serde_json::to_string(&v).unwrap()).unwrap();
+    {
+        let (mut j, _) = confluence_engine::journal::Journal::open(&journal).unwrap();
+        j.append(&Command::SetColor { key: "wasapi-out:Out 1".into(), color: Some([1, 2, 3]) }).unwrap();
+    }
+    let pipe = format!("confluence-migrate-{}", std::process::id());
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    // A served request means start-up (and the migration) has finished.
+    let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+    assert!(dir.path().join("devices.v1.json").exists(), "devices backed up");
+    assert!(dir.path().join("journal.v1.bin").exists(), "journal backed up");
+    assert!(std::fs::read_to_string(&devices).unwrap().contains("\"version\": 2"));
+    let state = scenes_now(&pipe);
+    assert!(state.notices.iter().any(|n| n.contains("Out 9")), "{:?}", state.notices);
+    let mut firsts: Vec<u32> =
+        slots.iter().filter(|s| s.device.starts_with("wasapi-out:")).map(|s| s.first_output).collect();
+    firsts.sort();
+    // The outputs are offline here (no such endpoints), but keep their channels.
+    assert_eq!(firsts, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+    let out1 = slots.iter().find(|s| s.device == "wasapi-out:Out 1").unwrap();
+    assert_eq!(out1.color, Some([1, 2, 3]), "the colour moved to its position");
+    let backup_len = std::fs::metadata(dir.path().join("devices.v1.json")).unwrap().len();
+    shutdown(child, &mut c);
+
+    let child = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    c.call(Command::ListSlots).unwrap();
+    assert_eq!(std::fs::metadata(dir.path().join("devices.v1.json")).unwrap().len(), backup_len, "not migrated twice");
+    let state = scenes_now(&pipe);
+    assert!(!state.notices.iter().any(|n| n.contains("Out 9")), "the note was a one-time one");
+    shutdown(child, &mut c);
+}
+
+#[test]
+fn routes_moved_by_a_swap_survive_an_engine_that_is_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.bin");
+    let pipe = format!("confluence-swap-kill-{}", std::process::id());
+    let pos = |s: &str| -> confluence_api::PosId { s.parse().unwrap() };
+    let fill = |p: &str, name: &str| Command::FillPosition {
+        pos: pos(p),
+        kind: confluence_api::DeviceKind::NetSend,
+        name: name.into(),
+    };
+    let first_output = |c: &mut Client, stream: &str| {
+        let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
+        let device = format!("net-out:127.0.0.1:9/{stream}");
+        slots.iter().find(|s| s.device.starts_with(&device)).unwrap().first_output
+    };
+    let points = |c: &mut Client| {
+        let Response::Points(p) = c.call(Command::ListPoints).unwrap() else { panic!() };
+        p.into_iter().map(|p| (p.input, p.output)).collect::<Vec<_>>()
+    };
+    let mut engine = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert!(matches!(c.call(fill("net-out:1", "127.0.0.1:9/A:2")).unwrap(), Response::Added { .. }));
+    assert!(matches!(c.call(fill("net-out:2", "127.0.0.1:9/B:2")).unwrap(), Response::Added { .. }));
+    let before = first_output(&mut c, "A");
+    let set = Command::SetPoint { input: 0, output: before + 1, gain_db: -6.0, mute: false, invert: false };
+    assert!(matches!(c.call(set).unwrap(), Response::Applied { .. }));
+    // Another stream, of eight channels, does not fit where it is (net-out:2 follows it): it moves, its route with it.
+    let r = c.call(fill("net-out:1", "127.0.0.1:9/C:8")).unwrap();
+    assert!(matches!(r, Response::Added { .. }), "{r:?}");
+    let after = first_output(&mut c, "C");
+    assert_ne!(after, before, "moved to a free block");
+    assert_eq!(points(&mut c), vec![(0, after + 1)]);
+    engine.kill(); // no clean shutdown: only what was saved counts
+    let _engine = spawn(&pipe, &journal);
+    let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
+    assert_eq!(first_output(&mut c, "C"), after);
+    assert_eq!(points(&mut c), vec![(0, after + 1)], "the route is where the swap moved it");
+    c.call(Command::Shutdown).unwrap();
 }

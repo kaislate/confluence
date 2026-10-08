@@ -8,6 +8,7 @@ pub mod clock;
 pub mod gain;
 pub mod mailbox;
 pub mod matrix;
+pub mod meter;
 pub mod params;
 pub mod plan;
 pub mod processor;

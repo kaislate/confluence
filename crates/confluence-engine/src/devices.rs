@@ -7,7 +7,12 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use confluence_api::{ClockRole, Command, DeviceInfo, DeviceKind, Response};
+use std::collections::BTreeMap;
+
+use confluence_api::{
+    all_positions, ClockRole, Command, DeviceInfo, DeviceKind, PosGroup, PosId, PositionDevice, PositionState,
+    PositionStatus, Response,
+};
 use confluence_core::asrc::AsrcQuality;
 use confluence_core::bridge::{InputDeviceSide, OutputDeviceSide};
 use confluence_provider_asio::registry::installed_drivers;
@@ -20,8 +25,9 @@ use serde::{Deserialize, Serialize};
 use crate::audio::AudioEngine;
 use crate::audio::StrictSide;
 use crate::engine::{
-    Engine, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec, StrictSlotSpec, StrictStats,
+    ChannelMove, Engine, MasterChannels, MasterSlotSpec, OfflineSlotSpec, SoftSlotSpec, StrictSlotSpec, StrictStats,
 };
+use crate::positions::{is_own_vasio_driver, next_free, vasio_device_name, PositionTable, VirtualState};
 use confluence_core::buffer::PlanarBuffer;
 use confluence_provider_vaio::{VaioSlot, VaioStats};
 use confluence_provider_vasio::config::InstanceConfig;
@@ -69,6 +75,8 @@ enum Handle {
 
 struct Bound {
     binding: Binding,
+    /// The fixed position this device fills (spec: slot model).
+    pos: Option<PosId>,
     slots: Vec<u32>,
     /// Empty while the device is missing (offline).
     handles: Vec<Handle>,
@@ -81,6 +89,34 @@ pub struct Saved {
     pub master: Option<Binding>,
     #[serde(default)]
     pub devices: Vec<Binding>,
+}
+
+/// `devices.json` version 2: devices by position (spec: slot model §3).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SavedV2 {
+    version: u32,
+    #[serde(default)]
+    master: Option<PosId>,
+    /// The ASIO master's channel placement.
+    #[serde(default)]
+    master_binding: Option<Binding>,
+    #[serde(default)]
+    positions: Vec<SavedPosition>,
+    #[serde(default)]
+    unplaced: Vec<Binding>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SavedPosition {
+    pos: PosId,
+    /// Virtual positions only: switched on, and their (inputs, outputs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shape: Option<(u32, u32)>,
+    /// The device and its channel placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<Binding>,
 }
 
 /// Opens an ASIO driver by name (injectable so tests can use fake drivers).
@@ -98,6 +134,52 @@ enum Loaded {
     /// A network stream (the slot opens it), and its peer's address if the
     /// name had to be looked up (discovery is asked again when it is attached).
     Net(NetName, Option<std::net::SocketAddr>),
+}
+
+/// One direction of a placement: its first channel, and the move its routes make.
+type DirectionPlace = (Option<u32>, Option<(u32, u32, u32)>);
+
+/// A loaded device's (inputs, outputs), where known before it is attached.
+fn loaded_shape(kind: DeviceKind, name: &str, loaded: &Loaded) -> Option<(u32, u32)> {
+    match loaded {
+        Loaded::Asio(dev) => Some((dev.info().inputs() as u32, dev.info().outputs() as u32)),
+        Loaded::Wasapi(stream, _) => {
+            let f = stream.format();
+            let ch = f.channels as u32;
+            Some(if f.direction == Direction::Render { (0, ch) } else { (ch, 0) })
+        }
+        Loaded::Vasio => parse_vasio(name).ok().map(|(_, daw_in, daw_out)| (daw_out as u32, daw_in as u32)),
+        // A stream named with its channel count (a receive learns it only when heard).
+        Loaded::Net(n, _) => {
+            n.channels.map(|c| if kind == DeviceKind::NetSend { (0, c as u32) } else { (c as u32, 0) })
+        }
+        Loaded::Vaio => None,
+    }
+}
+
+/// VASIO instance `n` (1..=8) as its position (A..=H).
+fn vasio_pos(n: u32) -> Result<PosId, String> {
+    if !(1..=confluence_provider_vasio::INSTANCES).contains(&n) {
+        return Err(format!("there is no VASIO instance {n} (1 to {})", confluence_provider_vasio::INSTANCES));
+    }
+    Ok(PosId { group: PosGroup::Vasio, index: (n - 1) as u8 })
+}
+
+/// The program on a VASIO instance, if its driver named it.
+fn handle_client(h: &Handle) -> Option<String> {
+    match h {
+        Handle::Vasio(s) => s.client_name(),
+        _ => None,
+    }
+}
+
+/// A virtual device's program is connected (a DAW on VASIO, an app on VAIO).
+fn handle_connected(h: &Handle) -> bool {
+    match h {
+        Handle::Vasio(s) => s.connected.load(Ordering::Relaxed),
+        Handle::Vaio(s) => s.streaming.load(Ordering::Relaxed),
+        _ => false,
+    }
 }
 
 /// Finds a WASAPI endpoint by its saved id, else by name.
@@ -159,6 +241,7 @@ fn load(
 pub struct PendingAdd {
     kind: DeviceKind,
     name: String,
+    pos: Option<PosId>,
     /// An offline device's saved endpoint id, tried before its name.
     endpoint_id: Option<String>,
     opener: Arc<AsioOpener>,
@@ -174,7 +257,7 @@ impl PendingAdd {
         }));
         let device = format!("{}:{}", self.kind.prefix(), self.name);
         let loaded = opened.unwrap_or_else(|_| Err(format!("opening {device} panicked")));
-        LoadedAdd { kind: self.kind, name: self.name, loaded }
+        LoadedAdd { kind: self.kind, name: self.name, pos: self.pos, loaded }
     }
 }
 
@@ -191,6 +274,7 @@ struct PendingStart {
 pub struct AttachedAdd {
     kind: DeviceKind,
     name: String,
+    pos: Option<PosId>,
     offline: Option<Binding>,
     bound: Bound,
     start: Option<PendingStart>,
@@ -219,7 +303,7 @@ impl AttachedAdd {
                 }
             }
         };
-        StartedAdd { kind: self.kind, name: self.name, offline: self.offline, bound: self.bound, result }
+        StartedAdd { kind: self.kind, name: self.name, pos: self.pos, offline: self.offline, bound: self.bound, result }
     }
 }
 
@@ -227,6 +311,7 @@ impl AttachedAdd {
 pub struct StartedAdd {
     kind: DeviceKind,
     name: String,
+    pos: Option<PosId>,
     offline: Option<Binding>,
     bound: Bound,
     result: Result<(), String>,
@@ -236,6 +321,7 @@ pub struct StartedAdd {
 pub struct LoadedAdd {
     kind: DeviceKind,
     name: String,
+    pos: Option<PosId>,
     loaded: Result<Loaded, String>,
 }
 
@@ -319,6 +405,21 @@ pub struct DeviceManager {
     master_health: Option<(u32, Arc<AsioHealth>)>,
     /// Offline network streams that failed to come back, and when to try again.
     net_retry_failed: Vec<(String, Instant)>,
+    /// Virtual positions' on/off and shape, and the master flag.
+    table: PositionTable,
+    /// Devices read at startup with their positions, not yet restored.
+    restore_list: Vec<(Option<PosId>, Binding)>,
+    /// The last channel placement of each virtual position (kept while off).
+    virtual_at: BTreeMap<PosId, Binding>,
+    /// Positions held for devices being opened.
+    reserved: Vec<(DeviceKind, String, PosId)>,
+    /// What a migration from a version-1 file moved (shown for this run).
+    migration_notes: Vec<String>,
+    /// Colour keys a migration changed (old, new), for the engine's colours.
+    color_rekeys: Vec<(String, String)>,
+    /// The position of the master running now (the flag may name another
+    /// for the next start).
+    master_now: Option<PosId>,
 }
 
 impl DeviceManager {
@@ -340,7 +441,22 @@ impl DeviceManager {
             save_blocked: None,
             master_health: None,
             net_retry_failed: Vec::new(),
+            table: Self::all_off(),
+            restore_list: Vec::new(),
+            virtual_at: BTreeMap::new(),
+            reserved: Vec::new(),
+            migration_notes: Vec::new(),
+            color_rekeys: Vec::new(),
+            master_now: None,
         }
+    }
+
+    /// A table with every virtual position off: a manager that does not
+    /// persist (tests) never opens VASIO by surprise.
+    fn all_off() -> PositionTable {
+        let mut t = PositionTable::new_default();
+        let _ = t.set_virtual(PosId { group: PosGroup::Vasio, index: 0 }, false, None);
+        t
     }
 
     /// Reads saved bindings from `path`. A corrupt file is renamed to `.bad`
@@ -350,6 +466,8 @@ impl DeviceManager {
     pub fn open_file(path: PathBuf) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let mut save_blocked = None;
+        let mut v2: Option<SavedV2> = None;
+        let mut v1_file = false;
         let saved = match std::fs::read_to_string(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
             Err(e) => {
@@ -360,7 +478,28 @@ impl DeviceManager {
                 save_blocked = Some("could not be read at start-up");
                 Saved::default()
             }
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            Ok(text)
+                if serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("version").and_then(|n| n.as_u64()))
+                    == Some(2) =>
+            {
+                match serde_json::from_str::<SavedV2>(&text) {
+                    Ok(v) => {
+                        v2 = Some(v);
+                        Saved::default()
+                    }
+                    Err(e) => {
+                        warnings.push(format!(
+                            "{} is not valid ({e}): it is left untouched and device changes will not be saved",
+                            path.display()
+                        ));
+                        save_blocked = Some("is not valid");
+                        Saved::default()
+                    }
+                }
+            }
+            Ok(text) => serde_json::from_str(&text).inspect(|_| v1_file = true).unwrap_or_else(|e| {
                 let bad = path.with_extension("bad");
                 match std::fs::rename(&path, &bad) {
                     Ok(()) => warnings.push(format!(
@@ -381,14 +520,93 @@ impl DeviceManager {
             }),
         };
         let mut m = Self::new(Some(path));
+        // A persisted setup starts with VASIO A on (unless the file says otherwise).
+        m.table = PositionTable::new_default();
+        m.restore_list = saved.devices.iter().cloned().map(|b| (None, b)).collect();
         m.saved = saved;
+        if let Some(v) = v2 {
+            let _ = m.table.set_master(v.master);
+            m.saved.master = v.master_binding;
+            m.unplaced = v.unplaced;
+            for sp in v.positions {
+                if sp.pos.group.is_virtual() {
+                    let on = sp.on.unwrap_or(false);
+                    let _ = m.table.set_virtual(sp.pos, on, sp.shape);
+                    if let Some(b) = sp.binding {
+                        m.virtual_at.insert(sp.pos, b.clone());
+                        if on {
+                            m.restore_list.push((Some(sp.pos), b));
+                        }
+                    }
+                } else if let Some(b) = sp.binding {
+                    m.restore_list.push((Some(sp.pos), b));
+                }
+            }
+        }
         m.save_blocked = save_blocked;
+        if v1_file && m.save_blocked.is_none() {
+            m.migrate(&mut warnings);
+        }
         (m, warnings)
+    }
+
+    /// Moves a version-1 setup into positions (spec: slot model §3), after
+    /// backing the file up; a setup that cannot be backed up is not touched.
+    fn migrate(&mut self, warnings: &mut Vec<String>) {
+        let Some(path) = self.path.clone() else { return };
+        if let Err(e) = crate::migrate::backup(&path) {
+            warnings.push(format!("{} could not be backed up ({e}): it was not migrated", path.display()));
+            self.save_blocked = Some("could not be backed up, so it was not migrated");
+            return;
+        }
+        let master = self.saved.master.clone();
+        let devices = std::mem::take(&mut self.restore_list).into_iter().map(|(_, b)| b).collect();
+        let m = crate::migrate::migrate_v1(master, devices);
+        let _ = self.table.set_master(m.saved.master);
+        self.saved.master = m.saved.master_binding;
+        for (pos, virt, binding) in m.saved.positions {
+            match virt {
+                Some((on, shape)) => {
+                    let _ = self.table.set_virtual(pos, on, Some(shape));
+                    if let Some(b) = binding {
+                        self.virtual_at.insert(pos, b.clone());
+                        if on {
+                            self.restore_list.push((Some(pos), b));
+                        }
+                    }
+                }
+                None => {
+                    if let Some(b) = binding {
+                        self.restore_list.push((Some(pos), b));
+                    }
+                }
+            }
+        }
+        self.unplaced.extend(m.saved.unplaced);
+        self.migration_notes = m.notes;
+        self.color_rekeys = m.color_keys;
+        if let Err(e) = self.save() {
+            warnings.push(format!("the migrated setup could not be saved: {e}"));
+        }
+    }
+
+    /// Colour keys the migration changed (taken once, by the engine's start-up).
+    pub fn take_color_rekeys(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.color_rekeys)
     }
 
     /// Saved channel placement (first input, first output) of the master `name`, if any.
     pub fn saved_master(&self, name: &str) -> Option<(u32, u32)> {
-        self.saved.master.as_ref().filter(|b| b.name == name).map(|b| (b.first_input, b.first_output))
+        let saved = self.saved.master.as_ref().filter(|b| b.name == name);
+        // A device made master since: its binding at the master position.
+        let made = || {
+            let p = self.table.master()?;
+            self.restore_list
+                .iter()
+                .find(|(q, b)| *q == Some(p) && b.kind == DeviceKind::Asio && b.name == name)
+                .map(|(_, b)| b)
+        };
+        saved.or_else(made).map(|b| (b.first_input, b.first_output))
     }
 
     /// Declares which ASIO driver is the master, before [`restore`](Self::restore):
@@ -401,6 +619,14 @@ impl DeviceManager {
     /// Records the running master's placement so it is reused next time.
     pub fn set_master(&mut self, name: &str, ch: MasterChannels) -> Result<(), String> {
         self.master_name = Some(name.to_string());
+        if self.table.master().is_none() {
+            // A master given on the command line takes the first free ASIO position.
+            let _ = self.table.set_master(next_free(PosGroup::Asio, &self.taken()));
+        }
+        self.master_now = self.table.master();
+        // Its binding as an ordinary device (from when it was not master) is done with.
+        let at = self.master_now;
+        self.restore_list.retain(|(q, b)| !(*q == at && b.kind == DeviceKind::Asio && b.name == name));
         self.master = Some(Binding {
             kind: DeviceKind::Asio,
             name: name.to_string(),
@@ -471,6 +697,7 @@ impl DeviceManager {
         let mut out: Vec<DeviceInfo> = installed_drivers()
             .map_err(|e| e.to_string())?
             .into_iter()
+            .filter(|d| is_own_vasio_driver(&d.name).is_none())
             .map(|d| DeviceInfo { kind: DeviceKind::Asio, name: d.name, inputs: 0, outputs: 0 })
             .collect();
         for (dir, kind) in
@@ -482,12 +709,7 @@ impl DeviceManager {
                 out.push(DeviceInfo { kind, name: ep.name, inputs, outputs });
             }
         }
-        for n in 1..=confluence_provider_vasio::INSTANCES {
-            out.push(DeviceInfo { kind: DeviceKind::Vasio, name: n.to_string(), inputs: 0, outputs: 0 });
-        }
-        if confluence_provider_vaio::installed() {
-            out.push(DeviceInfo { kind: DeviceKind::Vaio, name: "1".into(), inputs: 2, outputs: 0 });
-        }
+        // VASIO and VAIO are positions switched on and off, not devices to pick.
         Ok(out)
     }
 
@@ -495,25 +717,79 @@ impl DeviceManager {
     /// already open (or is the master) is refused: many drivers misbehave when
     /// loaded twice. An offline device comes back on its saved channels.
     pub fn add(&mut self, engine: &mut Engine, kind: DeviceKind, name: &str) -> Result<Vec<u32>, String> {
-        let loaded = self.begin_add(kind, name)?.load();
-        self.finish_add(engine, loaded)
+        match kind {
+            // Virtual devices are positions that are switched on.
+            DeviceKind::Vasio => {
+                let (n, daw_in, daw_out) = parse_vasio(name)?;
+                let pos = vasio_pos(n)?;
+                self.set_virtual(engine, pos, true, Some((daw_out as u32, daw_in as u32)))
+            }
+            DeviceKind::Vaio => {
+                parse_vaio(name)?;
+                self.set_virtual(engine, PosId { group: PosGroup::Vaio, index: 0 }, true, None)
+            }
+            _ => {
+                let loaded = self.begin_fill(None, kind, name)?.load();
+                self.finish_add(engine, loaded)
+            }
+        }
     }
 
     /// First step of adding a device: refuses one that is the master, already
     /// open or already being opened, and reserves it. Always follow with
     /// [`PendingAdd::load`] (without the engine lock) and [`finish_add`](Self::finish_add).
     pub fn begin_add(&mut self, kind: DeviceKind, name: &str) -> Result<PendingAdd, String> {
+        self.begin_fill(None, kind, name)
+    }
+
+    /// As [`begin_add`](Self::begin_add), into position `pos` (`None`: the
+    /// next free position of the kind). Virtual devices are switched on with
+    /// [`set_virtual`](Self::set_virtual) instead.
+    pub fn begin_fill(&mut self, pos: Option<PosId>, kind: DeviceKind, name: &str) -> Result<PendingAdd, String> {
         self.check_addable(kind, name)?;
         if self.loading.iter().any(|(k, n)| same_device(&binding_of(*k, n), kind, name)) {
             return Err(format!("{}:{name} is being opened", kind.prefix()));
         }
+        let group = PosGroup::for_kind(kind);
+        if group.is_virtual() {
+            return Err(format!("{}:{name} is a virtual device: turn it on instead", kind.prefix()));
+        }
+        // An offline device comes back in its own position.
+        let own = self.bound.iter().find(|b| same_device(&b.binding, kind, name)).and_then(|b| b.pos);
+        let taken = self.taken();
+        let pos = match (pos, own) {
+            (Some(p), _) => {
+                if p.group != group {
+                    return Err(format!("{} cannot hold a {} device", p.label(), kind.prefix()));
+                }
+                if Some(p) != own {
+                    // A filled position is swapped (see `swap`); anything else in use is refused.
+                    if let Some(q) = own {
+                        return Err(format!("{}:{name} is in {}: clear it first", kind.prefix(), q.label()));
+                    }
+                    if self.reserved.iter().any(|(_, _, r)| *r == p) {
+                        return Err(format!("{} is being filled", p.label()));
+                    }
+                    if taken.contains(&p) && !self.bound.iter().any(|b| b.pos == Some(p)) {
+                        return Err(format!("{} holds the master clock device", p.label()));
+                    }
+                }
+                p
+            }
+            (None, Some(p)) => p,
+            (None, None) => {
+                next_free(group, &taken).ok_or_else(|| format!("all {} positions are in use", group.label()))?
+            }
+        };
         self.loading.push((kind, name.to_string()));
+        self.reserved.push((kind, name.to_string(), pos));
+        let pos = Some(pos);
         let endpoint_id =
             self.bound.iter().find(|b| same_device(&b.binding, kind, name)).and_then(|b| b.binding.endpoint_id.clone());
         let net = matches!(kind, DeviceKind::NetSend | DeviceKind::NetReceive)
             .then(|| self.net.as_ref().map(NetCtx::snapshot))
             .flatten();
-        Ok(PendingAdd { kind, name: name.to_string(), endpoint_id, opener: self.asio_open.clone(), net })
+        Ok(PendingAdd { kind, name: name.to_string(), pos, endpoint_id, opener: self.asio_open.clone(), net })
     }
 
     /// Last step of adding a device: attaches what was loaded to the engine
@@ -540,15 +816,41 @@ impl DeviceManager {
 
     fn end_loading(&mut self, kind: DeviceKind, name: &str) {
         self.loading.retain(|(k, n)| !(*k == kind && n == name));
+        self.reserved.retain(|(k, n, _)| !(*k == kind && n == name));
+    }
+
+    /// Positions in use: filled, held for a device being opened, or the master's.
+    fn taken(&self) -> Vec<PosId> {
+        let mut t: Vec<PosId> = self.bound.iter().filter_map(|b| b.pos).collect();
+        t.extend(self.restore_list.iter().filter_map(|(p, _)| *p));
+        t.extend(self.master_now.filter(|_| self.master.is_some()));
+        t.extend(self.reserved.iter().map(|(_, _, p)| *p));
+        t.extend(self.table.master().filter(|_| self.master.is_some() || self.saved.master.is_some()));
+        t
+    }
+
+    /// Keys a device's slot colours by its position.
+    fn key_colours(engine: &mut Engine, bound: &Bound) {
+        for id in &bound.slots {
+            engine.set_color_key(*id, bound.pos.map(|p| format!("pos:{p}")));
+        }
     }
 
     fn attach_loaded(&mut self, engine: &mut Engine, loaded: LoadedAdd) -> Result<AttachedAdd, String> {
-        let LoadedAdd { kind, name, loaded } = loaded;
+        let LoadedAdd { kind, name, pos, loaded } = loaded;
         let name = name.as_str();
         self.check_addable(kind, name)?;
         let existing = self.bound.iter().position(|b| same_device(&b.binding, kind, name));
         // A device that failed to load: an offline slot keeps holding its channels.
         let loaded = loaded?;
+        // Into a filled position: the device there is swapped out.
+        let held =
+            pos.and_then(|p| self.bound.iter().position(|b| b.pos == Some(p) && !same_device(&b.binding, kind, name)));
+        if let Some(i) = held {
+            let bound = self.swap(engine, i, kind, name, loaded)?;
+            self.attaching.extend(bound.slots.iter().copied());
+            return Ok(AttachedAdd { kind, name: name.to_string(), pos, offline: None, bound, start: None });
+        }
         let offline = match existing {
             Some(i) => {
                 // Offline: hand its channels back to the device, routes and all.
@@ -572,14 +874,14 @@ impl DeviceManager {
             }
         };
         self.attaching.extend(bound.slots.iter().copied());
-        Ok(AttachedAdd { kind, name: name.to_string(), offline, bound, start })
+        Ok(AttachedAdd { kind, name: name.to_string(), pos, offline, bound, start })
     }
 
     /// Last step of adding a device: records a started device and saves the
     /// binding, or undoes the slots of one that failed to start (an offline
     /// device gets its channels and routes back).
     pub fn commit_add(&mut self, engine: &mut Engine, started: StartedAdd) -> Result<Vec<u32>, String> {
-        let StartedAdd { kind, name, offline, bound, result } = started;
+        let StartedAdd { kind, name, pos, offline, mut bound, result } = started;
         self.attaching.retain(|id| !bound.slots.contains(id));
         self.end_loading(kind, &name);
         if let Err(e) = result {
@@ -595,6 +897,8 @@ impl DeviceManager {
             }
             return Err(e);
         }
+        bound.pos = pos;
+        Self::key_colours(engine, &bound);
         let ids = bound.slots.clone();
         self.bound.push(bound);
         // It is open now: an old unplaceable binding of it must not come back.
@@ -603,9 +907,103 @@ impl DeviceManager {
         Ok(ids)
     }
 
+    /// Replaces the device in `self.bound[i]` with `loaded` (already loaded),
+    /// started at once. Routes stay on the channels that remain, and follow
+    /// the device if it needs a new place (spec: slot model §4). On failure
+    /// the old device is reopened where it was, or parked offline there.
+    fn swap(
+        &mut self,
+        engine: &mut Engine,
+        i: usize,
+        kind: DeviceKind,
+        name: &str,
+        loaded: Loaded,
+    ) -> Result<Bound, String> {
+        let shape = loaded_shape(kind, name, &loaded);
+        let Bound { binding: old, slots, handles, pos } = self.bound.remove(i);
+        drop(handles); // stop callbacks before the slots are detached
+        for id in &slots {
+            engine.detach_slot(*id).map_err(|e| e.to_string())?;
+        }
+        let placed = match shape {
+            Some((ins, outs)) => self.place_like(engine, &old, ins, outs),
+            None => Ok((Some(old.first_input), Some(old.first_output), ChannelMove::default())),
+        };
+        let attempt = placed.and_then(|(fi, fo, mv)| {
+            let at = Binding { first_input: fi.unwrap_or(0), first_output: fo.unwrap_or(0), ..old.clone() };
+            let (bound, start) = self.attach(engine, kind, name, Some(&at), loaded)?;
+            Ok((start_now(engine, bound, start)?, mv))
+        });
+        match attempt {
+            Ok((mut bound, mv)) => {
+                // Routes on channels the new device does not have go first, then
+                // the rest follow it if it moved.
+                let lost = |first: u32, was: u32, now: u32| (was > now).then_some((first, was, now));
+                engine.drop_points_outside(
+                    lost(old.first_input, old.inputs, bound.binding.inputs),
+                    lost(old.first_output, old.outputs, bound.binding.outputs),
+                );
+                if mv != ChannelMove::default() {
+                    engine.remap_channels(&mv);
+                }
+                bound.pos = pos;
+                Self::key_colours(engine, &bound);
+                Ok(bound)
+            }
+            Err(e) => {
+                let net = self.net.as_ref().map(NetCtx::snapshot);
+                let back = load(&self.asio_open, old.kind, &old.name, old.endpoint_id.as_deref(), net.as_ref())
+                    .and_then(|l| self.attach(engine, old.kind, &old.name, Some(&old), l))
+                    .and_then(|(b, start)| start_now(engine, b, start));
+                let mut b = match back {
+                    Ok(b) => b,
+                    Err(_) => Self::park_offline(engine, old).map_err(|pe| format!("{e}; {pe}"))?,
+                };
+                b.pos = pos;
+                Self::key_colours(engine, &b);
+                self.bound.push(b);
+                Err(e)
+            }
+        }
+    }
+
+    /// Where a device of `inputs` x `outputs` replacing `old` goes, per
+    /// direction: on `old`'s first channel if it fits there (the old device's
+    /// channels are free by now), else the first free block, with the move
+    /// its routes make. `None` for a direction it has no channels in.
+    pub fn place_like(
+        &self,
+        engine: &Engine,
+        old: &Binding,
+        inputs: u32,
+        outputs: u32,
+    ) -> Result<(Option<u32>, Option<u32>, ChannelMove), String> {
+        let one = |is_in: bool, first: u32, was: u32, now: u32| -> Result<DirectionPlace, String> {
+            let what = if is_in { "inputs" } else { "outputs" };
+            if now == 0 {
+                return Ok((None, None));
+            }
+            if was > 0 && engine.channels_free(is_in, first, now) {
+                return Ok((Some(first), None));
+            }
+            let at = engine
+                .free_block(is_in, now)
+                .ok_or_else(|| format!("no room for {now} {what}: remove something first"))?;
+            Ok((Some(at), (was > 0 && at != first).then_some((first, at, was.min(now)))))
+        };
+        let (fi, mi) = one(true, old.first_input, old.inputs, inputs)?;
+        let (fo, mo) = one(false, old.first_output, old.outputs, outputs)?;
+        Ok((fi, fo, ChannelMove { inputs: mi, outputs: mo }))
+    }
+
     /// Refuses a device that is the master or already open (an offline one may be re-added).
     fn check_addable(&self, kind: DeviceKind, name: &str) -> Result<(), String> {
         let device = format!("{}:{}", kind.prefix(), name);
+        if kind == DeviceKind::Asio {
+            if let Some(i) = is_own_vasio_driver(name) {
+                return Err(format!("{name} is a virtual device: turn on VASIO {} instead", (b'A' + i) as char));
+            }
+        }
         if kind == DeviceKind::Asio && self.master_name.as_deref() == Some(name) {
             return Err(format!("{device} is the master clock device"));
         }
@@ -621,6 +1019,9 @@ impl DeviceManager {
         let Some(i) = self.bound.iter().position(|b| b.slots.contains(&slot)) else { return Ok(false) };
         let b = self.bound.remove(i);
         self.unplaced.retain(|u| !same_device(u, b.binding.kind, &b.binding.name));
+        if let Some(p) = b.pos.filter(|p| p.group.is_virtual()) {
+            let _ = self.table.set_virtual(p, false, None);
+        }
         drop(b.handles); // stop callbacks before the bridge sides are detached
         for id in b.slots {
             engine.remove_slot(id).map_err(|e| e.to_string())?;
@@ -633,27 +1034,44 @@ impl DeviceManager {
     /// saved channels. A device that cannot be opened keeps its channels as an
     /// offline slot. Returns one warning per offline device.
     pub fn restore(&mut self, engine: &mut Engine) -> Vec<String> {
-        let bindings = std::mem::take(&mut self.saved.devices);
+        self.saved.devices.clear();
+        let bindings = std::mem::take(&mut self.restore_list);
         let mut warnings = Vec::new();
-        for b in bindings {
+        for (pos, b) in bindings {
             if self.bound.iter().any(|x| same_device(&x.binding, b.kind, &b.name)) {
                 warnings.push(format!("{} duplicates an open device; its binding was dropped", b.device()));
                 continue;
             }
             if b.kind == DeviceKind::Asio && self.master_name.as_deref() == Some(b.name.as_str()) {
-                warnings.push(format!("{} is now the master clock device; its device binding was dropped", b.device()));
+                // Made master at its own position: expected, nothing to say.
+                if pos.is_none() || pos != self.table.master() {
+                    warnings
+                        .push(format!("{} is now the master clock device; its device binding was dropped", b.device()));
+                }
                 continue;
             }
+            let pos = pos.or_else(|| self.default_pos(&b));
             let net = self.net.as_ref().map(NetCtx::snapshot);
             let opened = load(&self.asio_open, b.kind, &b.name, b.endpoint_id.as_deref(), net.as_ref())
                 .and_then(|loaded| self.attach(engine, b.kind, &b.name, Some(&b), loaded))
                 .and_then(|(bound, start)| start_now(engine, bound, start));
             match opened {
-                Ok(bound) => self.bound.push(bound),
+                Ok(mut bound) => {
+                    bound.pos = pos;
+                    Self::key_colours(engine, &bound);
+                    if let Some(p) = pos.filter(|p| p.group.is_virtual()) {
+                        self.virtual_at.insert(p, bound.binding.clone());
+                    }
+                    self.bound.push(bound);
+                }
                 Err(e) => {
                     warnings.push(format!("{} is offline: {e}", b.device()));
                     match Self::park_offline(engine, b.clone()) {
-                        Ok(parked) => self.bound.push(parked),
+                        Ok(mut parked) => {
+                            parked.pos = pos;
+                            Self::key_colours(engine, &parked);
+                            self.bound.push(parked);
+                        }
                         Err(e) => {
                             warnings.push(e);
                             self.unplaced.push(b);
@@ -662,7 +1080,184 @@ impl DeviceManager {
                 }
             }
         }
+        let on: Vec<(PosId, VirtualState)> = self.table.virtuals().filter(|(_, v)| v.on).collect();
+        for (pos, v) in on {
+            if self.bound.iter().any(|b| b.pos == Some(pos)) {
+                continue;
+            }
+            if let Err(e) = self.open_virtual(engine, pos, v.shape) {
+                warnings.push(format!("{} is offline: {e}", pos.label()));
+            }
+        }
         warnings
+    }
+
+    /// The position a device read without one belongs in.
+    fn default_pos(&self, b: &Binding) -> Option<PosId> {
+        match b.kind {
+            DeviceKind::Vasio => parse_vasio(&b.name).ok().and_then(|(n, _, _)| vasio_pos(n).ok()),
+            DeviceKind::Vaio => Some(PosId { group: PosGroup::Vaio, index: 0 }),
+            k => next_free(PosGroup::for_kind(k), &self.taken()),
+        }
+    }
+
+    /// Opens virtual position `pos` (switched on) with `shape`: at its last
+    /// placement if that still fits, else wherever there is room.
+    fn open_virtual(&mut self, engine: &mut Engine, pos: PosId, shape: (u32, u32)) -> Result<Vec<u32>, String> {
+        let (kind, name) = match pos.group {
+            PosGroup::Vasio => (DeviceKind::Vasio, vasio_device_name(pos, shape)),
+            _ => (DeviceKind::Vaio, "1".to_string()),
+        };
+        let at = self.virtual_at.get(&pos).cloned();
+        let loaded = load(&self.asio_open, kind, &name, None, None)?;
+        let attached = match self.attach(engine, kind, &name, at.as_ref(), loaded) {
+            Ok(a) => a,
+            Err(_) if at.is_some() => {
+                let loaded = load(&self.asio_open, kind, &name, None, None)?;
+                self.attach(engine, kind, &name, None, loaded)?
+            }
+            Err(e) => return Err(e),
+        };
+        let (bound, start) = attached;
+        let mut bound = start_now(engine, bound, start)?;
+        bound.pos = Some(pos);
+        Self::key_colours(engine, &bound);
+        let ids = bound.slots.clone();
+        self.virtual_at.insert(pos, bound.binding.clone());
+        self.bound.push(bound);
+        Ok(ids)
+    }
+
+    /// Turns virtual position `pos` on (opening it, or reshaping it) or off
+    /// (closing it; its routes are removed). Returns its slots.
+    pub fn set_virtual(
+        &mut self,
+        engine: &mut Engine,
+        pos: PosId,
+        on: bool,
+        shape: Option<(u32, u32)>,
+    ) -> Result<Vec<u32>, String> {
+        let before = self.table.virtual_state(pos);
+        let v = self.table.set_virtual(pos, on, shape)?;
+        if let Some(i) = self.bound.iter().position(|b| b.pos == Some(pos)) {
+            let b = &self.bound[i];
+            let same = (b.binding.inputs, b.binding.outputs) == v.shape || pos.group == PosGroup::Vaio;
+            if on && same && !b.handles.is_empty() {
+                self.save()?;
+                return Ok(b.slots.clone());
+            }
+            if on && !b.handles.is_empty() {
+                // A reshape: the routes on the channels that remain are kept.
+                let name = vasio_device_name(pos, v.shape);
+                let swapped = load(&self.asio_open, DeviceKind::Vasio, &name, None, None)
+                    .and_then(|l| self.swap(engine, i, DeviceKind::Vasio, &name, l));
+                return match swapped {
+                    Ok(bound) => {
+                        let ids = bound.slots.clone();
+                        self.virtual_at.insert(pos, bound.binding.clone());
+                        self.bound.push(bound);
+                        self.save()?;
+                        Ok(ids)
+                    }
+                    Err(e) => {
+                        if let Some(b) = before {
+                            let _ = self.table.set_virtual(pos, b.on, Some(b.shape));
+                        }
+                        Err(e)
+                    }
+                };
+            }
+            let b = self.bound.remove(i);
+            drop(b.handles);
+            for id in b.slots {
+                engine.remove_slot(id).map_err(|e| e.to_string())?;
+            }
+        }
+        let ids = if on {
+            match self.open_virtual(engine, pos, v.shape) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    if let Some(b) = before {
+                        let _ = self.table.set_virtual(pos, b.on, Some(b.shape));
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        self.save()?;
+        Ok(ids)
+    }
+
+    /// Empties position `pos`: its device is closed and its routes removed.
+    pub fn clear_position(&mut self, engine: &mut Engine, pos: PosId) -> Result<(), String> {
+        if pos.group.is_virtual() {
+            return self.set_virtual(engine, pos, false, None).map(|_| ());
+        }
+        let Some(slot) = self.bound.iter().find(|b| b.pos == Some(pos)).and_then(|b| b.slots.first().copied()) else {
+            return Err(format!("{} is empty", pos.label()));
+        };
+        self.remove(engine, slot).map(|_| ())
+    }
+
+    /// The ASIO position to use as master from the next start.
+    pub fn set_master_pos(&mut self, pos: Option<PosId>) -> Result<(), String> {
+        self.table.set_master(pos)?;
+        // The master running now stays in the setup: from the next start it is
+        // an ordinary device in its own position (unless it is chosen again).
+        if let (Some(now), Some(m)) = (self.master_now, self.master.clone()) {
+            self.restore_list.retain(|(q, b)| !(*q == Some(now) && b.name == m.name));
+            if pos != Some(now) {
+                self.restore_list.push((Some(now), m));
+            }
+        }
+        self.save()
+    }
+
+    /// The ASIO driver to start as master: the device at the master position.
+    pub fn saved_master_name(&self) -> Option<String> {
+        let p = self.table.master()?;
+        if let Some(b) = self.bound.iter().find(|b| b.pos == Some(p)) {
+            return Some(b.binding.name.clone());
+        }
+        if let Some((_, b)) = self.restore_list.iter().find(|(q, _)| *q == Some(p)) {
+            return Some(b.name.clone());
+        }
+        self.master.as_ref().or(self.saved.master.as_ref()).map(|b| b.name.clone())
+    }
+
+    /// Every fixed position and what it holds, for the published state.
+    pub fn positions(&self, engine: &Engine) -> Vec<PositionState> {
+        let slots = engine.slots();
+        let colour = |ids: &[u32]| ids.first().and_then(|id| slots.iter().find(|s| s.id == *id)).and_then(|s| s.color);
+        all_positions()
+            .into_iter()
+            .map(|pos| {
+                let b = self.bound.iter().find(|b| b.pos == Some(pos));
+                let ids = b.map(|b| b.slots.clone()).unwrap_or_default();
+                let device = b.map(|b| PositionDevice { kind: b.binding.kind, name: b.binding.name.clone() });
+                let master = self.table.master() == Some(pos);
+                let daw = b.and_then(|b| b.handles.iter().find_map(handle_client));
+                let (status, shape, device, ids) = if pos.group.is_virtual() {
+                    let v = self.table.virtual_state(pos);
+                    let on = v.is_some_and(|v| v.on);
+                    let online = b.is_some_and(|b| b.handles.iter().any(handle_connected));
+                    let status = if on { PositionStatus::On { online } } else { PositionStatus::Off };
+                    (status, v.map(|v| v.shape), device, ids)
+                } else if let Some(b) = b {
+                    (PositionStatus::Filled { online: !b.handles.is_empty() }, None, device, ids)
+                } else if Some(pos) == self.master_now && self.master.is_some() {
+                    let m =
+                        self.master.as_ref().map(|m| PositionDevice { kind: DeviceKind::Asio, name: m.name.clone() });
+                    let ids = self.master_health.as_ref().map(|(id, _)| vec![*id]).unwrap_or_default();
+                    (PositionStatus::Filled { online: true }, None, m, ids)
+                } else {
+                    (PositionStatus::Empty, None, None, ids)
+                };
+                PositionState { pos, status, device, shape, daw, master, color: colour(&ids), slots: ids }
+            })
+            .collect()
     }
 
     /// Re-adds offline network streams whose engine discovery has now found
@@ -707,7 +1302,7 @@ impl DeviceManager {
             outputs: b.outputs,
         };
         match engine.add_offline_slot(&spec) {
-            Ok(id) => Ok(Bound { binding: b, slots: vec![id], handles: Vec::new() }),
+            Ok(id) => Ok(Bound { binding: b, slots: vec![id], handles: Vec::new(), pos: None }),
             Err(e) => Err(format!("{}: channels could not be reserved: {e}", b.device())),
         }
     }
@@ -731,6 +1326,32 @@ impl DeviceManager {
                 Ok(false) => return None,
                 Err(e) => Response::Error(e),
             },
+            Command::FillPosition { pos, kind, name } => {
+                let done = if pos.group.is_virtual() {
+                    Err(format!("{} is a virtual position: turn it on instead", pos.label()))
+                } else {
+                    self.begin_fill(Some(*pos), *kind, name).and_then(|p| {
+                        let loaded = p.load();
+                        self.finish_add(engine, loaded)
+                    })
+                };
+                match done {
+                    Ok(_) => Response::Ok,
+                    Err(e) => Response::Error(e),
+                }
+            }
+            Command::ClearPosition { pos } => match self.clear_position(engine, *pos) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e),
+            },
+            Command::SetVirtual { pos, on, shape } => match self.set_virtual(engine, *pos, *on, *shape) {
+                Ok(_) => Response::Ok,
+                Err(e) => Response::Error(e),
+            },
+            Command::SetMaster { pos } => match self.set_master_pos(*pos) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e),
+            },
             _ => return None,
         })
     }
@@ -743,7 +1364,7 @@ impl DeviceManager {
 
     /// Engine-wide conditions a user should know about (also in Health).
     pub fn notices(&self) -> Vec<String> {
-        let mut out = Vec::new();
+        let mut out = self.migration_notes.clone();
         if let Some(why) = self.save_blocked {
             out.push(match &self.path {
                 Some(p) => format!("device changes are not being saved: {} {why}", p.display()),
@@ -807,9 +1428,46 @@ impl DeviceManager {
         if self.save_blocked.is_some() {
             return Ok(());
         }
-        let mut devices = self.bindings();
-        devices.extend(self.unplaced.iter().cloned());
-        let saved = Saved { master: self.master.clone(), devices };
+        let mut positions: Vec<SavedPosition> = Vec::new();
+        let mut unplaced = self.unplaced.clone();
+        for b in &self.bound {
+            match b.pos {
+                Some(pos) => {
+                    let v = self.table.virtual_state(pos);
+                    positions.push(SavedPosition {
+                        pos,
+                        on: v.map(|v| v.on),
+                        shape: v.map(|v| v.shape),
+                        binding: Some(b.binding.clone()),
+                    });
+                }
+                None => unplaced.push(b.binding.clone()),
+            }
+        }
+        // Devices read but not restored yet (e.g. saved before restore ran).
+        for (pos, b) in &self.restore_list {
+            if let Some(pos) = pos.filter(|p| !positions.iter().any(|q| q.pos == *p)) {
+                positions.push(SavedPosition { pos, on: None, shape: None, binding: Some(b.clone()) });
+            }
+        }
+        for (pos, v) in self.table.virtuals() {
+            if !positions.iter().any(|q| q.pos == pos) {
+                positions.push(SavedPosition {
+                    pos,
+                    on: Some(v.on),
+                    shape: Some(v.shape),
+                    binding: self.virtual_at.get(&pos).cloned(),
+                });
+            }
+        }
+        positions.sort_by_key(|p| p.pos);
+        let saved = SavedV2 {
+            version: 2,
+            master: self.table.master(),
+            master_binding: self.master.clone().or_else(|| self.saved.master.clone()),
+            positions,
+            unplaced,
+        };
         let json = serde_json::to_string_pretty(&saved).map_err(|e| e.to_string())?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -900,7 +1558,7 @@ impl DeviceManager {
                 if let Some(s) = slot {
                     (binding.first_input, binding.first_output) = (s.first_input, s.first_output);
                 }
-                Ok((Bound { binding, slots: vec![id], handles: vec![Handle::Wasapi(stream)] }, None))
+                Ok((Bound { binding, slots: vec![id], handles: vec![Handle::Wasapi(stream)], pos: None }, None))
             }
         }
     }
@@ -954,7 +1612,7 @@ impl DeviceManager {
             let binding =
                 Binding { first_output: ch.first_output as u32, outputs: ch.outputs as u32, ..binding_of(kind, name) };
             let handles = handle.map(Handle::NetSend).into_iter().collect();
-            return Ok(Bound { binding, slots: vec![id], handles });
+            return Ok(Bound { binding, slots: vec![id], handles, pos: None });
         }
         let from = addr.ip();
         let heard = net.host.heard().into_iter().find(|h| h.from == from && h.stream == n.stream);
@@ -981,7 +1639,7 @@ impl DeviceManager {
             rate: Some(stream_rate as u32),
             ..binding_of(kind, name)
         };
-        Ok(Bound { binding, slots: vec![id], handles: vec![Handle::NetReceive(h)] })
+        Ok(Bound { binding, slots: vec![id], handles: vec![Handle::NetReceive(h)], pos: None })
     }
 
     fn open_vasio(
@@ -1033,7 +1691,7 @@ impl DeviceManager {
             rate: None,
         };
         let handles = stats.map(Handle::Vasio).into_iter().collect();
-        Ok(Bound { binding, slots: vec![id], handles })
+        Ok(Bound { binding, slots: vec![id], handles, pos: None })
     }
 
     fn open_vaio(
@@ -1077,7 +1735,7 @@ impl DeviceManager {
             rate: None,
         };
         let handles = stats.map(Handle::Vaio).into_iter().collect();
-        Ok(Bound { binding, slots: vec![id], handles })
+        Ok(Bound { binding, slots: vec![id], handles, pos: None })
     }
 
     fn open_asio(
@@ -1162,7 +1820,10 @@ impl DeviceManager {
             }
         }
         // Started later (possibly without the engine lock): see AttachedAdd::start.
-        Ok((Bound { binding, slots, handles: Vec::new() }, PendingStart { dev, callback: Box::new(callback), block }))
+        Ok((
+            Bound { binding, slots, handles: Vec::new(), pos: None },
+            PendingStart { dev, callback: Box::new(callback), block },
+        ))
     }
 }
 

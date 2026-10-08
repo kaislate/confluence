@@ -1,0 +1,11 @@
+{
+  "master": {"kind": "Asio", "name": "GoXLR ASIO Driver", "first_input": 25, "inputs": 23, "first_output": 6, "outputs": 10},
+  "devices": [
+    {"kind": "WasapiRender", "name": "Game (4- TC-HELICON GoXLR)", "first_input": 0, "inputs": 0, "first_output": 0, "outputs": 2},
+    {"kind": "WasapiRender", "name": "Chat (4- TC-HELICON GoXLR)", "first_input": 0, "inputs": 0, "first_output": 2, "outputs": 2},
+    {"kind": "WasapiRender", "name": "Music (4- TC-HELICON GoXLR)", "first_input": 0, "inputs": 0, "first_output": 4, "outputs": 2},
+    {"kind": "Asio", "name": "Confluence VASIO 1", "first_input": 23, "inputs": 2, "first_output": 16, "outputs": 2},
+    {"kind": "WasapiCapture", "name": "Broadcast Stream Mix (4- TC-HELICON GoXLR)", "first_input": 0, "inputs": 2, "first_output": 0, "outputs": 0},
+    {"kind": "NetReceive", "name": "Lilith/Back", "first_input": 2, "inputs": 2, "first_output": 0, "outputs": 0, "rate": 48000}
+  ]
+}

@@ -39,9 +39,16 @@ impl Colours {
         Ok(())
     }
 
-    /// The colour chosen for slot `s`, if any.
-    pub fn of(&self, s: &SlotState) -> Option<Rgb> {
-        self.0.get(&key(s)).copied()
+    /// Moves the colour kept under `old` to `new` (a migration re-keying it).
+    pub fn rename(&mut self, old: &str, new: &str) {
+        if let Some(c) = self.0.remove(old) {
+            self.0.insert(new.to_string(), c);
+        }
+    }
+
+    /// The colour kept under `key`, if any.
+    pub fn of_key(&self, key: &str) -> Option<Rgb> {
+        self.0.get(key).copied()
     }
 
     /// The commands that recreate every colour (for the journal).

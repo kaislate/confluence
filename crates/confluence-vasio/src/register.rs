@@ -9,7 +9,7 @@ use windows::Win32::System::LibraryLoader::{
 };
 use windows::Win32::System::Registry::{RegDeleteTreeW, RegSetKeyValueW, HKEY, HKEY_LOCAL_MACHINE, REG_SZ};
 
-use crate::{clsid, driver_name, INSTANCES};
+use crate::{clsid, driver_name, legacy_driver_name, INSTANCES};
 
 /// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` for instance `n`.
 pub fn clsid_string(instance: u32) -> String {
@@ -60,19 +60,29 @@ pub fn register_at(hive: HKEY, prefix: &str, dll_path: &str) -> std::io::Result<
         set(hive, &format!("{class_key}\\InprocServer32"), "ThreadingModel", "Apartment")?;
         set(hive, &asio_key, "CLSID", &clsid_string(n))?;
         set(hive, &asio_key, "Description", &name)?;
+        delete(hive, &legacy_key(prefix, n));
     }
     Ok(())
+}
+
+/// The ASIO key instance `n` had before the drivers were lettered.
+fn legacy_key(prefix: &str, instance: u32) -> String {
+    format!("{prefix}SOFTWARE\\ASIO\\{}", legacy_driver_name(instance))
+}
+
+fn delete(hive: HKEY, key: &str) {
+    // SAFETY: valid wide string. A missing key is fine.
+    unsafe {
+        let _ = RegDeleteTreeW(hive, &HSTRING::from(key));
+    }
 }
 
 /// Removes every key `register_at` wrote.
 pub fn unregister_at(hive: HKEY, prefix: &str) -> std::io::Result<()> {
     for n in 1..=INSTANCES {
         let (class_key, asio_key) = keys(prefix, n);
-        for key in [class_key, asio_key] {
-            // SAFETY: valid wide string. A missing key is fine.
-            unsafe {
-                let _ = RegDeleteTreeW(hive, &HSTRING::from(key));
-            }
+        for key in [class_key, asio_key, legacy_key(prefix, n)] {
+            delete(hive, &key);
         }
     }
     Ok(())
@@ -127,6 +137,21 @@ mod tests {
             )
         };
         (r == ERROR_SUCCESS).then(|| String::from_utf16_lossy(&buf[..(bytes as usize / 2).saturating_sub(1)]))
+    }
+
+    #[test]
+    fn register_writes_lettered_names_and_removes_old_ones() {
+        let prefix = format!("Software\\ConfluenceTest\\reg-letters.{}\\", std::process::id());
+        let old = format!("{prefix}SOFTWARE\\ASIO\\{}", crate::legacy_driver_name(2));
+        set(HKEY_CURRENT_USER, &old, "CLSID", &clsid_string(2)).unwrap();
+        register_at(HKEY_CURRENT_USER, &prefix, "C:\\x\\confluence_vasio.dll").unwrap();
+        assert_eq!(get(&format!("{prefix}SOFTWARE\\ASIO\\Confluence VASIO B"), "CLSID"), Some(clsid_string(2)));
+        assert_eq!(get(&old, "CLSID"), None, "the numbered key is gone");
+        unregister_at(HKEY_CURRENT_USER, &prefix).unwrap();
+        // SAFETY: valid wide string.
+        unsafe {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(prefix.trim_end_matches('\\')));
+        }
     }
 
     #[test]

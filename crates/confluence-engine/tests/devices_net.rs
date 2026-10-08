@@ -22,6 +22,7 @@ fn loopback(port: u16) -> SocketAddr {
 
 /// Names are never looked up on the real network in tests.
 fn net(host: NetHost, peers: &Arc<Mutex<Vec<Peer>>>) -> NetCtx {
+    confluence_provider_vasio::isolate_for_tests();
     NetCtx::new(host, Box::new(FakeDiscovery(peers.clone()))).with_lookup(Arc::new(|_: &str, _: u16| None))
 }
 
@@ -97,15 +98,17 @@ fn a_stream_added_by_engine_name_comes_back_with_its_channels_and_rate_once_the_
     let mut devices = devices.with_net(net(NetHost::start(loopback(port), 1).unwrap(), &peers));
     let warnings = devices.restore(&mut engine);
     assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(!engine.slots()[0].online);
+    let net_slot = |e: &Engine| e.slots().into_iter().find(|s| s.device.starts_with("net-in:")).unwrap();
+    assert!(!net_slot(&engine).online);
     assert!(!devices.retry_offline_net(&mut engine), "still not found");
     // Found: it comes back by itself, as it was.
     peers.lock().unwrap().push(Peer { name: "Other".into(), address: "127.0.0.1".into(), port: sender.port });
     assert!(devices.retry_offline_net(&mut engine));
-    let slot = &engine.slots()[0];
+    let slot = net_slot(&engine);
     assert!(slot.online, "{slot:?}");
     assert_eq!((slot.first_input, slot.inputs), (0, 4));
-    assert_eq!(devices.bindings()[0].rate, Some(44_100));
+    let binding = devices.bindings().into_iter().find(|b| b.kind == DeviceKind::NetReceive).unwrap();
+    assert_eq!(binding.rate, Some(44_100));
     assert!(!devices.retry_offline_net(&mut engine), "nothing left to retry");
 }
 

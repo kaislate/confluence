@@ -137,7 +137,7 @@ fn without_the_engine_the_daw_keeps_running_on_silence() {
     let _cleanup = Cleanup;
     config::save(5, &saved).unwrap();
     let mut dev = open(5);
-    assert_eq!(dev.info().name, "Confluence VASIO 5");
+    assert_eq!(dev.info().name, "Confluence VASIO E");
     assert_eq!((dev.info().inputs(), dev.info().outputs(), dev.info().preferred_block), (4, 3, 192));
     let seen = Arc::new(Seen::default());
     let stream = dev.start(StreamConfig::default(), loopback_daw(seen.clone())).unwrap();
@@ -224,7 +224,7 @@ fn the_built_dll_streams_like_the_linked_code() {
         name: "dll".into(),
     })
     .unwrap();
-    assert_eq!(dev.info().name, "Confluence VASIO 2");
+    assert_eq!(dev.info().name, "Confluence VASIO B");
     let seen = Arc::new(Seen::default());
     dev.start(StreamConfig::default(), loopback_daw(seen.clone())).unwrap();
     wait_until("the DAW to hear the engine", Duration::from_secs(3), || *seen.last_input.lock().unwrap() == 0.25);

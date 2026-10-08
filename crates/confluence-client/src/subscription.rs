@@ -15,8 +15,18 @@ pub struct Subscription {
 impl Subscription {
     /// Connects and subscribes: returns the snapshot and the stream.
     pub fn connect(name: &str, timeout: Duration) -> Result<(State, Subscription), ClientError> {
+        Self::start(name, timeout, Command::Subscribe)
+    }
+
+    /// As [`connect`](Self::connect), with meter frames (`Event::Meters`)
+    /// about 20 times a second among the events.
+    pub fn connect_with_meters(name: &str, timeout: Duration) -> Result<(State, Subscription), ClientError> {
+        Self::start(name, timeout, Command::SubscribeMeters)
+    }
+
+    fn start(name: &str, timeout: Duration, subscribe: Command) -> Result<(State, Subscription), ClientError> {
         let mut file = open(name, timeout)?;
-        write_frame(&mut file, &Envelope::new(1, Command::Subscribe))?;
+        write_frame(&mut file, &Envelope::new(1, subscribe))?;
         match read_envelope::<_, Response>(&mut file)?.map(|e| e.body) {
             Some(Response::Snapshot(state)) => Ok((state, Subscription { file })),
             Some(Response::Error(e)) => Err(ClientError::Refused(e)),

@@ -68,6 +68,20 @@ impl ChannelAllocator {
         }
     }
 
+    /// Where `alloc(len)` would place `len` channels, without reserving them.
+    pub fn first_fit(&self, len: u32) -> Option<u32> {
+        if len == 0 {
+            return None;
+        }
+        self.free.iter().find(|&&(_, n)| n >= len).map(|&(s, _)| s)
+    }
+
+    /// Whether `[start, start + len)` is entirely free.
+    pub fn is_free(&self, start: u32, len: u32) -> bool {
+        let Some(end) = start.checked_add(len) else { return false };
+        len == 0 || self.free.iter().any(|&(s, n)| s <= start && end <= s + n)
+    }
+
     /// Total free channels (for diagnostics and tests).
     pub fn available(&self) -> u32 {
         self.free.iter().map(|&(_, n)| n).sum()
@@ -77,6 +91,18 @@ impl ChannelAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_fit_and_is_free_look_without_reserving() {
+        let mut a = ChannelAllocator::new(16);
+        assert_eq!(a.alloc(2), Some(0));
+        assert_eq!(a.alloc(2), Some(2));
+        a.free(0, 2);
+        assert_eq!(a.first_fit(2), Some(0));
+        assert_eq!(a.first_fit(4), Some(4));
+        assert_eq!(a.first_fit(4), Some(4), "nothing was reserved");
+        assert!(a.is_free(0, 2) && !a.is_free(1, 2) && a.is_free(4, 12) && !a.is_free(4, 13));
+    }
 
     #[test]
     fn allocates_contiguously_from_the_bottom() {

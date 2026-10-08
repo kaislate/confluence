@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use confluence_api::{Change, EngineStatus, Event, SlotHealth, State};
+use confluence_api::{Change, EngineStatus, Event, MeterFrame, SlotHealth, State};
 
 use crate::Subscription;
 
@@ -57,6 +57,8 @@ pub enum Update {
     State,
     /// Only telemetry (status, health, history): it may be drawn less often.
     Telemetry,
+    /// Only meter levels (about 20 times a second).
+    Meters,
 }
 
 /// How a subscription ended.
@@ -109,6 +111,8 @@ pub struct StoreView {
     pub last_event: Option<Instant>,
     /// Snapshots taken so far: a new one replaced the state wholesale.
     pub snapshots: u64,
+    /// The latest meter levels (only when following with meters).
+    pub meters: Option<MeterFrame>,
 }
 
 /// A versioned event that did not follow the last version.
@@ -141,6 +145,7 @@ impl Store {
                 health: Vec::new(),
                 last_event: None,
                 snapshots: 0,
+                meters: None,
             },
             history: Arc::default(),
             gap_pending: false,
@@ -185,6 +190,7 @@ impl Store {
                     });
                 }
             }
+            Event::Meters(frame) => self.view.meters = Some(frame),
             Event::Telemetry { status, health } => {
                 let gap_pending = self.gap_pending;
                 self.with_history(|history| {
@@ -273,6 +279,15 @@ pub struct StateStore {
 impl StateStore {
     /// Starts following the engine on `pipe`; `on_change` runs after every update.
     pub fn spawn(pipe: String, on_change: Box<dyn Fn(Update) + Send + Sync>) -> StateStore {
+        Self::start(pipe, false, on_change)
+    }
+
+    /// As [`spawn`](Self::spawn), also following the meters (see [`StoreView::meters`]).
+    pub fn spawn_with_meters(pipe: String, on_change: Box<dyn Fn(Update) + Send + Sync>) -> StateStore {
+        Self::start(pipe, true, on_change)
+    }
+
+    fn start(pipe: String, meters: bool, on_change: Box<dyn Fn(Update) + Send + Sync>) -> StateStore {
         let shared = Arc::new(Mutex::new(Arc::new(Store::new().view())));
         let stop = Arc::new(AtomicBool::new(false));
         let store = Store::new();
@@ -290,7 +305,12 @@ impl StateStore {
             };
             while !stopping.load(Ordering::SeqCst) {
                 let mut how = SessionEnd::Lost;
-                if let Ok((snapshot, mut sub)) = Subscription::connect(&pipe, CONNECT_TIMEOUT) {
+                let connected = if meters {
+                    Subscription::connect_with_meters(&pipe, CONNECT_TIMEOUT)
+                } else {
+                    Subscription::connect(&pipe, CONNECT_TIMEOUT)
+                };
+                if let Ok((snapshot, mut sub)) = connected {
                     let began = Instant::now();
                     store.snapshot(snapshot, began);
                     update(&store, Update::State);
@@ -301,6 +321,7 @@ impl StateStore {
                         let what = match e {
                             Event::Telemetry { .. } => Update::Telemetry,
                             Event::Changed { .. } => Update::State,
+                            Event::Meters(_) => Update::Meters,
                         };
                         if store.event(e, Instant::now()).is_err() {
                             how = SessionEnd::Gap; // resubscribe for a fresh snapshot
@@ -391,6 +412,7 @@ mod tests {
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         }
     }
 
@@ -431,6 +453,25 @@ mod tests {
         assert!(matches!(v.conn, ConnState::Live));
         assert_eq!(v.state.as_ref().unwrap().version, 5);
         assert_eq!(v.state.unwrap().points.len(), 1);
+    }
+
+    #[test]
+    fn meters_are_kept_for_drawing_but_are_not_state() {
+        let mut s = Store::new();
+        let now = Instant::now();
+        s.snapshot(state(4, &[]), now);
+        let frame = confluence_api::MeterFrame {
+            inputs: vec![[200, 180]],
+            outputs: vec![],
+            first_input: 3,
+            first_output: 0,
+            clipped_in: vec![],
+            clipped_out: vec![],
+        };
+        s.event(Event::Meters(frame.clone()), now).unwrap();
+        let v = s.view();
+        assert_eq!(v.meters, Some(frame));
+        assert_eq!((v.state.unwrap().version, v.snapshots), (4, 1), "no new version, no new snapshot");
     }
 
     #[test]

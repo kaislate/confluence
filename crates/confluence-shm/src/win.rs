@@ -205,6 +205,35 @@ pub struct Server {
     directory: Mapping,
     stream: Stream,
     generation: u64,
+    map_name: HSTRING,
+}
+
+/// A view of a stream's header with its own mapping, so it can be read from
+/// another thread and outlive the [`Server`] (e.g. the engine's control side
+/// asking which program is streaming, while the audio thread owns the server).
+pub struct HeaderView(Mapping);
+
+// SAFETY: every field the view reads is either written once before the
+// stream is published or is an atomic.
+unsafe impl Sync for HeaderView {}
+
+impl std::fmt::Debug for HeaderView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeaderView").field("client_name", &self.client_name()).finish()
+    }
+}
+
+impl HeaderView {
+    fn header(&self) -> &Header {
+        // SAFETY: the mapping is page-aligned and at least a Header long (it
+        // is the same mapping the server created).
+        unsafe { &*self.0.ptr().cast::<Header>() }
+    }
+
+    /// The program using the stream, if its client named it.
+    pub fn client_name(&self) -> Option<String> {
+        self.header().client_name()
+    }
 }
 
 impl Server {
@@ -243,7 +272,7 @@ impl Server {
         dir.magic.store(DIRECTORY_MAGIC, Ordering::Relaxed);
         dir.generation.store(generation, Ordering::Release);
         dir.state.store(STATE_READY, Ordering::Release);
-        Ok(Server { directory, stream: Stream { map, event, layout }, generation })
+        Ok(Server { directory, stream: Stream { map, event, layout }, generation, map_name })
     }
 
     pub fn header(&self) -> &Header {
@@ -252,6 +281,16 @@ impl Server {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The program using the stream, if its client named it.
+    pub fn client_name(&self) -> Option<String> {
+        self.header().client_name()
+    }
+
+    /// A second view of this stream's header (see [`HeaderView`]).
+    pub fn header_view(&self) -> Result<HeaderView, ShmError> {
+        Mapping::open(&self.map_name).map(HeaderView)
     }
 
     /// The layout this stream was created with.
@@ -324,6 +363,11 @@ impl Client {
         Ok(Some(Client { directory, stream, generation }))
     }
 
+    /// Tells the server which program is using the stream ("" clears it).
+    pub fn set_name(&self, name: &str) {
+        self.header().set_client_name(name);
+    }
+
     pub fn header(&self) -> &Header {
         self.stream.header()
     }
@@ -394,6 +438,36 @@ mod tests {
         assert!(reader.read_frames(64, |ch, f, s| assert_eq!(s, ch as f32 + f as f32 / 100.0)));
         assert!(writer.write_frames(64, |ch, _| -(ch as f32)));
         assert!(from_client.read_frames(64, |ch, _, s| assert_eq!(s, -(ch as f32))));
+    }
+
+    #[test]
+    fn a_client_can_say_who_it_is() {
+        let name = base("client-name");
+        let server = Server::create(&name, layout()).unwrap();
+        assert_eq!(server.client_name(), None);
+        let client = Client::connect(&name).unwrap().unwrap();
+        client.set_name("Ableton Live 12 Suite");
+        assert_eq!(server.client_name().as_deref(), Some("Ableton Live 12 Suite"));
+        client.set_name(&"x".repeat(200));
+        assert_eq!(server.client_name().unwrap().len(), 63, "truncated to fit");
+        client.set_name(&"é".repeat(40));
+        assert_eq!(server.client_name().unwrap(), "é".repeat(31), "cut on a character boundary");
+        client.set_name("");
+        assert_eq!(server.client_name(), None);
+    }
+
+    #[test]
+    fn a_header_view_reads_the_name_on_its_own_and_outlives_the_server() {
+        let name = base("header-view");
+        let server = Server::create(&name, layout()).unwrap();
+        let view = server.header_view().unwrap();
+        let client = Client::connect(&name).unwrap().unwrap();
+        client.set_name("Reaper");
+        let shared = std::sync::Arc::new(view);
+        let reader = std::sync::Arc::clone(&shared);
+        assert_eq!(std::thread::spawn(move || reader.client_name()).join().unwrap().as_deref(), Some("Reaper"));
+        drop(server);
+        assert_eq!(shared.client_name().as_deref(), Some("Reaper"), "its own view of the mapping");
     }
 
     #[test]

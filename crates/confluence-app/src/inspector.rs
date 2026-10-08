@@ -465,6 +465,7 @@ mod tests {
             midi_learning: None,
             scripts: Vec::new(),
             peers: Vec::new(),
+            positions: Vec::new(),
         };
         assert_eq!(routes_of(&state, &a), 2, "0→2 (its input) and 1→1 (both)");
         assert_eq!(routes_of(&state, &b), 2, "0→2 (its output) and 3→3");
@@ -518,12 +519,14 @@ mod display_tests {
                 midi_learning: None,
                 scripts: Vec::new(),
                 peers: Vec::new(),
+                positions: Vec::new(),
             }),
             conn: ConnState::Live,
             status: None,
             health: Vec::new(),
             last_event: None,
             snapshots: 1,
+            meters: None,
         }
     }
 

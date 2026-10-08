@@ -19,6 +19,7 @@ use confluence_provider_asio::{AsioDevice, AsioHostError, DriverSource, MAX_DRIV
 /// Opens `fake:<name>` as a fake driver (2 in / 2 out, input 0.25) whose probe
 /// is shared with the test; anything else is "not installed".
 fn opener(probes: Vec<(&'static str, Arc<FakeProbe>)>) -> AsioOpener {
+    confluence_provider_vasio::isolate_for_tests();
     Box::new(move |name: &str| {
         let (_, probe) = probes.iter().find(|(n, _)| *n == name).ok_or(AsioHostError::NotInstalled(name.into()))?;
         let mut cfg = FakeConfig::new(name);
@@ -44,12 +45,18 @@ impl Drop for DriverBudget {
 
 /// Waits until this test's drivers are sure to fit; hold it for the whole test.
 fn driver_budget() -> DriverBudget {
+    confluence_provider_vasio::isolate_for_tests();
     let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     while *running >= MAX_DRIVERS / 3 {
         running = FINISHED.wait(running).unwrap_or_else(|e| e.into_inner());
     }
     *running += 1;
     DriverBudget
+}
+
+/// Bindings other than the VASIO A a persisted setup opens by default.
+fn hardware(devices: &DeviceManager) -> usize {
+    devices.bindings().iter().filter(|b| b.kind != DeviceKind::Vasio).count()
 }
 
 fn points(engine: &mut Engine) -> Vec<(u32, u32)> {
@@ -148,7 +155,7 @@ fn bindings_persist_and_missing_devices_keep_their_channels() {
     assert_eq!(b_in.first_input, 2, "channels did not shift");
     // Removing the offline slot through the Control API frees its channels.
     assert_eq!(devices.handle(&mut engine, &Command::RemoveSlot { id: offline.id }), Some(Response::Ok));
-    assert_eq!(devices.bindings().len(), 1);
+    assert_eq!(hardware(&devices), 1);
 }
 
 #[test]
@@ -236,7 +243,7 @@ fn a_device_cannot_be_opened_twice_and_the_master_is_not_a_soft_slot() {
     devices.set_master("fake:m", MasterChannels { first_input: 2, inputs: 2, first_output: 2, outputs: 2 }).unwrap();
     let err = devices.add(&mut engine, DeviceKind::Asio, "fake:m").unwrap_err();
     assert!(err.contains("master"), "{err}");
-    assert_eq!(devices.bindings().len(), 1);
+    assert_eq!(hardware(&devices), 1);
 }
 
 #[test]
@@ -284,7 +291,7 @@ fn adding_an_offline_device_brings_it_back_on_its_saved_channels() {
     let a_out = slots.iter().find(|s| s.name == "fake:a out").unwrap();
     assert_eq!((a_in.first_input, a_out.first_output), (0, 0), "routes to it keep working");
     assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)], "coming back online keeps the routes");
-    assert_eq!(devices.bindings().len(), 2);
+    assert_eq!(hardware(&devices), 2);
 }
 
 #[test]
@@ -316,8 +323,8 @@ fn a_soft_device_that_becomes_the_master_is_not_opened_twice() {
     assert_eq!(opens.load(Ordering::SeqCst), 0, "the master's driver is not loaded again");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("master"), "{warnings:?}");
-    assert!(engine.slots().is_empty());
-    assert!(devices.bindings().is_empty(), "the stale soft binding is dropped");
+    assert!(engine.slots().iter().all(|s| s.name.starts_with("VASIO")), "only the default VASIO A");
+    assert_eq!(hardware(&devices), 0, "the stale soft binding is dropped");
 }
 
 #[test]
@@ -563,7 +570,7 @@ fn a_slow_driver_start_does_not_hold_up_the_manager() {
     assert!(matches!(&resp, Some(Response::Error(e)) if e.contains("starting")), "{resp:?}");
     let started = starting.join().unwrap();
     assert_eq!(devices.commit_add(&mut engine, started).unwrap(), slots);
-    assert_eq!(devices.bindings().len(), 2);
+    assert_eq!(hardware(&devices), 2);
 }
 
 /// Opens `fake:<name>` as a fake driver whose `start` takes `delay` and fails
@@ -593,7 +600,7 @@ fn a_device_that_is_still_starting_cannot_be_added_again() {
     devices.commit_add(&mut engine, started).unwrap();
     let err = devices.begin_add(DeviceKind::Asio, "fake:slow").err().expect("refused once open");
     assert!(err.contains("already open"), "{err}");
-    assert_eq!(devices.bindings().len(), 1);
+    assert_eq!(hardware(&devices), 1);
 }
 
 #[test]
@@ -643,7 +650,7 @@ fn an_offline_device_that_fails_to_start_keeps_its_channels_and_routes() {
     assert!(!a.online);
     assert_eq!((a.first_input, a.first_output), (0, 0));
     assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)], "a failed start keeps the routes");
-    assert_eq!(devices.bindings().len(), 2, "and the binding");
+    assert_eq!(hardware(&devices), 2, "and the binding");
     broken.store(false, Ordering::Release);
     devices.add(&mut engine, DeviceKind::Asio, "fake:a").unwrap();
     assert_eq!(points(&mut engine), vec![(0, 2), (2, 1)]);
@@ -710,4 +717,89 @@ fn an_offline_slot_coming_back_shows_in_the_published_diff() {
     assert!(changes.contains(&confluence_api::Change::SlotRemoved { id: offline }), "{changes:?}");
     let added = changes.iter().filter(|c| matches!(c, confluence_api::Change::SlotAdded(s) if s.online)).count();
     assert_eq!(added, 2, "{changes:?}");
+}
+
+#[test]
+fn meters_read_the_fake_drivers_quarter_scale_input_and_its_routed_output() {
+    let _budget = driver_budget();
+    confluence_provider_vasio::isolate_for_tests();
+    let probe = Arc::new(FakeProbe::default());
+    let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut devices = DeviceManager::new(None).with_asio_opener(opener(vec![("fake:loop", probe.clone())]));
+    devices.add(&mut engine, DeviceKind::Asio, "fake:loop").unwrap();
+    let slots = engine.slots();
+    let (inp, out) = (slots[0].first_input, slots[1].first_output);
+    route(&mut engine, inp, out);
+    let clock = InternalClock::start(audio, 48_000.0).unwrap();
+    for _ in 0..150 {
+        std::thread::sleep(Duration::from_millis(10));
+        engine.tick();
+    }
+    // Peaks are held until read: the first read takes the start-up transient
+    // (the resampler's overshoot on the step to 0.25).
+    engine.meter_frame();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(10));
+        engine.tick();
+    }
+    let f = engine.meter_frame();
+    let db = |b: u8| confluence_api::byte_db(b);
+    let i = (inp - f.first_input) as usize;
+    let o = (out - f.first_output) as usize;
+    assert!((db(f.inputs[i][0]) - -12.04).abs() < 0.5, "input peak {}", db(f.inputs[i][0]));
+    assert!((db(f.outputs[o][1]) - -12.04).abs() < 0.8, "routed output rms {}", db(f.outputs[o][1]));
+    assert!(f.clipped_in.is_empty());
+    clock.stop();
+}
+
+#[test]
+fn making_another_device_the_master_keeps_both_on_their_channels() {
+    let _budget = driver_budget();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("devices.json");
+    let (m, soft) = (Arc::new(FakeProbe::default()), Arc::new(FakeProbe::default()));
+    let open = || opener(vec![("fake:m", m.clone()), ("fake:soft", soft.clone())]);
+    let asio = |n: &str| -> confluence_api::PosId { n.parse().unwrap() };
+    {
+        // First run: fake:m is the master (ASIO 1), fake:soft fills ASIO 2; then ASIO 2 is made master.
+        let (devices, _) = DeviceManager::open_file(path.clone());
+        let mut devices = devices.with_asio_opener(open());
+        let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 128));
+        let mut master = open()("fake:m").unwrap();
+        let (_, _, ch) = start_asio_master(&mut master, &mut engine, audio, "fake:m", None).unwrap();
+        devices.set_master("fake:m", ch).unwrap();
+        devices.add(&mut engine, DeviceKind::Asio, "fake:soft").unwrap();
+        let soft_in = engine.slots().into_iter().find(|s| s.name == "fake:soft in").unwrap().first_input;
+        assert_eq!(soft_in, 2);
+        let r = devices.handle(&mut engine, &Command::SetMaster { pos: Some(asio("asio:2")) });
+        assert_eq!(r, Some(Response::Ok));
+        let ps = devices.positions(&engine);
+        let at = |p: &str| ps.iter().find(|s| s.pos == asio(p)).unwrap().clone();
+        assert_eq!(at("asio:1").device.unwrap().name, "fake:m", "the running master still shows in its position");
+        assert!(at("asio:2").master, "ASIO 2 is master from the next start");
+        master.stop();
+    }
+    // Second run: fake:soft is the master on its own channels; fake:m is an ordinary device on its own.
+    let (devices, _) = DeviceManager::open_file(path.clone());
+    let mut devices = devices.with_asio_opener(open());
+    assert_eq!(devices.saved_master_name().as_deref(), Some("fake:soft"));
+    let placement = devices.saved_master("fake:soft");
+    assert_eq!(placement, Some((2, 2)), "the new master keeps its channels");
+    devices.claim_master("fake:soft");
+    let (mut engine, audio) = Engine::new(EngineConfig::new(48_000.0, 128));
+    let mut master = open()("fake:soft").unwrap();
+    let (_, _, ch) = start_asio_master(&mut master, &mut engine, audio, "fake:soft", placement).unwrap();
+    assert_eq!((ch.first_input, ch.first_output), (2, 2));
+    let warnings = devices.restore(&mut engine);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    devices.set_master("fake:soft", ch).unwrap();
+    let old = engine.slots().into_iter().find(|s| s.name == "fake:m in").expect("the old master is kept");
+    assert_eq!(old.first_input, 0, "on its own channels: {warnings:?}");
+    let ps = devices.positions(&engine);
+    let at = |p: &str| ps.iter().find(|s| s.pos == asio(p)).unwrap().clone();
+    assert_eq!(at("asio:1").device.unwrap().name, "fake:m");
+    assert!(at("asio:2").master);
+    assert_eq!(at("asio:2").device.unwrap().name, "fake:soft");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("fake:m"), "the old master stays in the setup");
+    master.stop();
 }

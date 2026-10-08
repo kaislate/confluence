@@ -26,9 +26,14 @@ mod midi_map;
 mod scenes;
 mod scripts;
 use crate::audio::{
-    AudioEngine, AudioMsg, BusEntry, InputEntry, LoadMeter, OutputEntry, Returned, StrictEntry, StrictSide, MAX_BUSES,
-    MAX_SLOTS,
+    AudioEngine, AudioMsg, BusEntry, InputEntry, LoadMeter, MeterRanges, Metering, OutputEntry, Returned, StrictEntry,
+    StrictSide, MAX_BUSES, MAX_SLOTS,
 };
+use confluence_api::{meter_byte, MeterFrame};
+use confluence_core::meter::{rms_coeff, MeterBank};
+
+/// Time constant of the RMS meters, in seconds.
+const RMS_TIME_CONSTANT_S: f64 = 0.3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
@@ -223,6 +228,32 @@ pub struct OfflineSlotSpec {
     pub outputs: u32,
 }
 
+/// A slot moving to other channels: (old first, new first, count) per direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelMove {
+    pub inputs: Option<(u32, u32, u32)>,
+    pub outputs: Option<(u32, u32, u32)>,
+}
+
+impl ChannelMove {
+    fn map(range: Option<(u32, u32, u32)>, c: u32) -> u32 {
+        match range {
+            Some((old, new, len)) if c >= old && c < old + len => new + (c - old),
+            _ => c,
+        }
+    }
+
+    /// Where input channel `c` goes (unchanged if it does not move).
+    pub fn input(&self, c: u32) -> u32 {
+        Self::map(self.inputs, c)
+    }
+
+    /// Where output channel `c` goes (unchanged if it does not move).
+    pub fn output(&self, c: u32) -> u32 {
+        Self::map(self.outputs, c)
+    }
+}
+
 /// Counters a strict slot's device exposes to the control side.
 pub trait StrictStats: Send + Sync {
     /// (blocks the device delivered late, blocks it did not take).
@@ -262,6 +293,8 @@ enum SlotStats {
 struct SlotRecord {
     state: SlotState,
     stats: SlotStats,
+    /// Overrides the colour key (a device slot's position, `pos:asio:3`).
+    color_key: Option<String>,
 }
 
 pub struct Engine {
@@ -301,6 +334,10 @@ pub struct Engine {
     blocks: Arc<AtomicU64>,
     master_ppm: Arc<AtomicU64>,
     dsp_load: Arc<AtomicU32>,
+    meters_in: Arc<MeterBank>,
+    meters_out: Arc<MeterBank>,
+    /// The ranges the audio thread was last told to meter.
+    meter_ranges: MeterRanges,
 }
 
 impl Engine {
@@ -317,6 +354,8 @@ impl Engine {
         let mut outputs = PlanarBuffer::new(cfg.max_outputs, cfg.block);
         inputs.set_frames(cfg.block);
         outputs.set_frames(cfg.block);
+        let meters_in = MeterBank::new(cfg.max_inputs);
+        let meters_out = MeterBank::new(cfg.max_outputs);
         let audio = AudioEngine {
             router,
             inputs,
@@ -333,6 +372,14 @@ impl Engine {
             master_est: None,
             master_ppm: master_ppm.clone(),
             load: LoadMeter::new(dsp_load.clone()),
+            meters: Metering {
+                inputs: meters_in.clone(),
+                outputs: meters_out.clone(),
+                ms_in: vec![0.0; cfg.max_inputs].into_boxed_slice(),
+                ms_out: vec![0.0; cfg.max_outputs].into_boxed_slice(),
+                coeff: rms_coeff(cfg.block, cfg.sample_rate, RMS_TIME_CONSTANT_S),
+                ranges: None,
+            },
         };
         let engine = Engine {
             cfg,
@@ -361,6 +408,9 @@ impl Engine {
             blocks,
             master_ppm,
             dsp_load,
+            meters_in,
+            meters_out,
+            meter_ranges: MeterRanges::default(),
         };
         (engine, audio)
     }
@@ -408,7 +458,7 @@ impl Engine {
         self.next_id += 1;
         self.soft_inputs += 1;
         let state = self.state(id, &spec.name, &spec.device, ClockRole::Soft, (first, spec.channels as u32), (0, 0));
-        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats) });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats), color_key: None });
         Ok((id, device))
     }
 
@@ -435,7 +485,7 @@ impl Engine {
         self.next_id += 1;
         self.soft_outputs += 1;
         let state = self.state(id, &spec.name, &spec.device, ClockRole::Soft, (0, 0), (first, spec.channels as u32));
-        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats) });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Bridge(stats), color_key: None });
         Ok((id, device))
     }
 
@@ -466,7 +516,7 @@ impl Engine {
             (first_input, spec.inputs as u32),
             (first_output, spec.outputs as u32),
         );
-        self.slots.push(SlotRecord { state, stats: SlotStats::Master });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Master, color_key: None });
         let ch = MasterChannels {
             first_input: first_input as usize,
             inputs: spec.inputs,
@@ -526,7 +576,7 @@ impl Engine {
             (first_input, spec.inputs as u32),
             (first_output, spec.outputs as u32),
         );
-        self.slots.push(SlotRecord { state, stats: SlotStats::Strict(stats) });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Strict(stats), color_key: None });
         Ok((id, ch))
     }
 
@@ -584,7 +634,7 @@ impl Engine {
         self.buses += 1;
         self.plan_dirty = true;
         let state = self.state(id, &spec.name, BUS_DEVICE, ClockRole::Strict, (first_input, ch), (first_output, ch));
-        self.slots.push(SlotRecord { state, stats: SlotStats::Bus(faults) });
+        self.slots.push(SlotRecord { state, stats: SlotStats::Bus(faults), color_key: None });
         Ok(id)
     }
 
@@ -934,6 +984,58 @@ impl Engine {
         Ok(())
     }
 
+    /// The first free block of `count` input (or output) channels.
+    pub fn free_block(&self, inputs: bool, count: u32) -> Option<u32> {
+        if inputs {
+            self.inputs.first_fit(count)
+        } else {
+            self.outputs.first_fit(count)
+        }
+    }
+
+    /// Whether input (or output) channels `first .. first + count` are free.
+    pub fn channels_free(&self, inputs: bool, first: u32, count: u32) -> bool {
+        if inputs {
+            self.inputs.is_free(first, count)
+        } else {
+            self.outputs.is_free(first, count)
+        }
+    }
+
+    /// Moves every route, scene point and MIDI binding on a slot's old channels
+    /// to its new ones (a swap or reshape that needed a new place).
+    pub fn remap_channels(&mut self, mv: &ChannelMove) {
+        let moved: Vec<(u32, u32, PointParams)> =
+            self.matrix.points().into_iter().filter(|&(i, o, _)| mv.input(i) != i || mv.output(o) != o).collect();
+        for &(i, o, _) in &moved {
+            let _ = self.matrix.remove_point_now(i, o);
+        }
+        for &(i, o, p) in &moved {
+            let _ = self.matrix.set_point(mv.input(i), mv.output(o), p);
+        }
+        self.scenes.remap(mv);
+        self.midi.remap(mv);
+        self.plan_dirty |= self.buses > 0;
+    }
+
+    /// Routes with an input or output in the given (first, count) ranges.
+    pub fn points_in(&self, inputs: Option<(u32, u32)>, outputs: Option<(u32, u32)>) -> Vec<PointState> {
+        let within = |r: Option<(u32, u32)>, c: u32| r.is_some_and(|(f, n)| c >= f && c < f + n);
+        self.settled_points().into_iter().filter(|p| within(inputs, p.input) || within(outputs, p.output)).collect()
+    }
+
+    /// Removes the routes on channels `first + keep .. first + len` of each
+    /// (first, len, keep) range: what a slot loses when it shrinks.
+    pub fn drop_points_outside(&mut self, inputs: Option<(u32, u32, u32)>, outputs: Option<(u32, u32, u32)>) {
+        let lost = |r: Option<(u32, u32, u32)>, c: u32| r.is_some_and(|(f, n, keep)| c >= f + keep && c < f + n);
+        for p in self.settled_points() {
+            if lost(inputs, p.input) || lost(outputs, p.output) {
+                let _ = self.matrix.remove_point(p.input, p.output);
+                self.scenes.route_changed(p.input, p.output);
+            }
+        }
+    }
+
     /// Compiles the plan for the current buses and routes.
     fn replan(&mut self) {
         let spans = self.bus_spans();
@@ -962,7 +1064,7 @@ impl Engine {
             (spec.first_output, spec.outputs),
         );
         state.online = false;
-        self.slots.push(SlotRecord { state, stats: SlotStats::None });
+        self.slots.push(SlotRecord { state, stats: SlotStats::None, color_key: None });
         Ok(id)
     }
 
@@ -1046,6 +1148,7 @@ impl Engine {
         self.plan.tick();
         self.advance_morph(std::time::Instant::now());
         self.matrix.tick();
+        self.send_meter_ranges();
         while let Some(r) = self.returns.try_recv() {
             match r {
                 Returned::Input(entry) => drop(entry),
@@ -1057,18 +1160,79 @@ impl Engine {
                     }
                 }
                 Returned::Processor(p) => self.returned_processors.push(p),
+                Returned::MeterRanges(r) => drop(r),
             }
         }
     }
 
+    /// Tells the audio thread which channels to meter, when the slots changed.
+    fn send_meter_ranges(&mut self) {
+        let mut r = MeterRanges::default();
+        for s in &self.slots {
+            if s.state.inputs > 0 {
+                r.inputs.push((s.state.first_input as usize, s.state.inputs as usize));
+            }
+            if s.state.outputs > 0 {
+                r.outputs.push((s.state.first_output as usize, s.state.outputs as usize));
+            }
+        }
+        if r != self.meter_ranges && self.to_audio.try_send(AudioMsg::SetMeterRanges(Box::new(r.clone()))).is_ok() {
+            self.meter_ranges = r;
+        }
+    }
+
+    /// Every slot channel's level since the last call (peak) and now (RMS),
+    /// with the clipped channels (spec: slot model §4).
+    pub fn meter_frame(&self) -> MeterFrame {
+        let span = |dir: fn(&SlotState) -> (u32, u32)| {
+            let ranges: Vec<(u32, u32)> = self.slots.iter().map(|s| dir(&s.state)).filter(|r| r.1 > 0).collect();
+            let first = ranges.iter().map(|r| r.0).min().unwrap_or(0);
+            let end = ranges.iter().map(|r| r.0 + r.1).max().unwrap_or(0);
+            (first, end, ranges)
+        };
+        let read = |bank: &MeterBank, (first, end, ranges): (u32, u32, Vec<(u32, u32)>)| {
+            let live = |c: u32| ranges.iter().any(|&(f, n)| c >= f && c < f + n);
+            let db = |x: f32| meter_byte(20.0 * x.max(1e-9).log10());
+            let levels = (first..end)
+                .map(|c| if live(c) { [db(bank.take_peak(c as usize)), db(bank.rms(c as usize))] } else { [0, 0] })
+                .collect();
+            let clipped = (first..end).filter(|&c| live(c) && bank.clipped(c as usize)).collect();
+            (first, levels, clipped)
+        };
+        let (first_input, inputs, clipped_in) = read(&self.meters_in, span(|s| (s.first_input, s.inputs)));
+        let (first_output, outputs, clipped_out) = read(&self.meters_out, span(|s| (s.first_output, s.outputs)));
+        MeterFrame { inputs, outputs, first_input, first_output, clipped_in, clipped_out }
+    }
+
     /// Current slot list (same data as `Command::ListSlots`).
     pub fn slots(&self) -> Vec<SlotState> {
-        self.slots.iter().map(|s| SlotState { color: self.colours.of(&s.state), ..s.state.clone() }).collect()
+        self.slots
+            .iter()
+            .map(|s| SlotState { color: self.colours.of_key(&Self::key_of(s)), ..s.state.clone() })
+            .collect()
+    }
+
+    fn key_of(s: &SlotRecord) -> String {
+        s.color_key.clone().unwrap_or_else(|| colours::key(&s.state))
     }
 
     /// The key slot `id`'s colour is kept under (see [`Command::SetColor`]).
     pub fn color_key(&self, id: u32) -> Option<String> {
-        self.slots.iter().find(|s| s.state.id == id).map(|s| colours::key(&s.state))
+        self.slots.iter().find(|s| s.state.id == id).map(Self::key_of)
+    }
+
+    /// Moves colours from old keys to new ones (a migration re-keying them).
+    pub fn rekey_colors(&mut self, map: &[(String, String)]) {
+        for (old, new) in map {
+            self.colours.rename(old, new);
+        }
+    }
+
+    /// Keys slot `id`'s colour by `key` (its position) instead of its device.
+    pub fn set_color_key(&mut self, id: u32, key: Option<String>) {
+        if let Some(s) = self.slots.iter_mut().find(|s| s.state.id == id) {
+            s.color_key = key;
+        }
     }
 
     /// The commands that recreate every colour chosen (for the journal).
@@ -1132,6 +1296,16 @@ impl Engine {
             }
             Command::Shutdown => Response::Ok,
             Command::SetScript { .. } | Command::DeleteScript { .. } => self.script_command(cmd),
+            Command::FillPosition { .. }
+            | Command::ClearPosition { .. }
+            | Command::SetVirtual { .. }
+            | Command::SetMaster { .. } => Response::Error("positions are handled by the engine process".into()),
+            Command::SubscribeMeters => Response::Error("subscriptions are served by the engine process".into()),
+            Command::ClearClip => {
+                self.meters_in.clear_clips();
+                self.meters_out.clear_clips();
+                Response::Ok
+            }
             Command::SetSlotColor { id, color } => match self.color_key(id) {
                 Some(key) => self.colours.set(&key, color).map_or_else(Response::Error, |()| Response::Ok),
                 None => Response::Error(format!("there is no slot {id}")),
@@ -2845,5 +3019,46 @@ mod tests {
         assert_eq!(colour_of(&e, bus.id), Some([5, 5, 5]));
         let key = format!("bus:{}", bus.first_output);
         assert_eq!(e.color_commands(), vec![Command::SetColor { key, color: Some([5, 5, 5]) }]);
+    }
+    #[test]
+    fn remapping_moves_routes_scenes_and_midi_with_a_slot() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let set = |e: &mut Engine, i, o, g| {
+            assert_eq!(
+                e.handle(&Command::SetPoint { input: i, output: o, gain_db: g, mute: false, invert: true }),
+                Response::Ok
+            )
+        };
+        set(&mut e, 4, 10, -6.0); // in the moved input range (4..6)
+        set(&mut e, 0, 20, -3.0); // output in the moved output range (20..22)
+        set(&mut e, 1, 1, 0.0); // untouched
+        assert_eq!(e.handle(&Command::SaveScene { name: "Verse".into(), morph_ms: 0 }), Response::Ok);
+        let bind = confluence_api::MidiBinding { device: "Pad".into(), channel: 1, cc: 7, input: 5, output: 21 };
+        assert_eq!(e.handle(&Command::SetMidiBinding { binding: bind }), Response::Ok);
+
+        e.remap_channels(&ChannelMove { inputs: Some((4, 40, 2)), outputs: Some((20, 60, 2)) });
+
+        let mut pts: Vec<_> = e.settled_points().iter().map(|p| (p.input, p.output, p.gain_db, p.invert)).collect();
+        pts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(pts, vec![(0, 60, -3.0, true), (1, 1, 0.0, true), (40, 10, -6.0, true)]);
+        let scene = e.scene("Verse").unwrap();
+        let mut sp: Vec<_> = scene.points.iter().map(|p| (p.input, p.output)).collect();
+        sp.sort();
+        assert_eq!(sp, vec![(0, 60), (1, 1), (40, 10)], "scene points move too");
+        let Command::SetMidiBinding { binding } = e.midi_commands().into_iter().next().unwrap() else { panic!() };
+        assert_eq!((binding.input, binding.output), (41, 61), "MIDI bindings move too");
+    }
+
+    #[test]
+    fn a_shrunk_slot_loses_only_the_routes_on_its_lost_channels() {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        for o in [8u32, 9, 10, 11] {
+            e.handle(&Command::SetPoint { input: 0, output: o, gain_db: 0.0, mute: false, invert: false });
+        }
+        assert_eq!(e.points_in(None, Some((8, 4))).len(), 4);
+        e.drop_points_outside(None, Some((8, 4, 2)));
+        let mut outs: Vec<u32> = e.settled_points().iter().map(|p| p.output).collect();
+        outs.sort();
+        assert_eq!(outs, vec![8, 9]);
     }
 }
