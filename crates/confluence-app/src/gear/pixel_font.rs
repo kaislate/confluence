@@ -59,6 +59,11 @@ pub fn glyph(c: char) -> Option<[u8; H]> {
     Some(g)
 }
 
+/// True if every character of `text` has a glyph (or is a space).
+pub fn supports(text: &str) -> bool {
+    text.chars().all(|c| c == ' ' || glyph(c).is_some())
+}
+
 /// Width of `text` in screen points at `px` points per pixel.
 pub fn width(text: &str, px: f32) -> f32 {
     let n = text.chars().count();
@@ -94,6 +99,15 @@ pub fn draw(mesh: &mut Mesh, pos: Pos2, text: &str, px: f32, color: Color32, dot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn it_knows_which_text_it_can_draw() {
+        assert!(supports("VASIO A: OUT 1/2"));
+        assert!(supports("ableton"));
+        for t in ["Kick (L)", "Bob's mic", "Mic #2", "G\u{e4}ste", "\u{30de}\u{30a4}\u{30af}"] {
+            assert!(!supports(t), "{t}");
+        }
+    }
 
     #[test]
     fn the_meter_characters_are_all_there() {

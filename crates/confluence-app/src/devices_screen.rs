@@ -66,7 +66,8 @@ pub struct ScreenState {
     /// The position whose channel list is open.
     pub channels_of: Option<PosId>,
     /// Channel names being typed, by (input?, channel index).
-    pub channel_drafts: HashMap<(bool, u32), String>,
+    /// Per channel: the text in its field, and whether it was typed in.
+    pub channel_drafts: HashMap<(bool, u32), (String, bool)>,
     /// Each card's LED colour and when it last changed (for the bloom).
     pub led_seen: HashMap<PosId, (Option<Color32>, f64)>,
     pub adding_bus: bool,
@@ -514,19 +515,29 @@ fn channel_editor(
                                 let labels = if input { &s.input_labels } else { &s.output_labels };
                                 let current = labels.get(i as usize).cloned().flatten().unwrap_or_default();
                                 ui.label(format!("{}", i + 1));
-                                let draft = st.channel_drafts.entry((input, i)).or_insert(current.clone());
-                                let field =
-                                    ui.add(TextEdit::singleline(draft).hint_text(device_name).desired_width(220.0));
+                                let (draft, edited) =
+                                    st.channel_drafts.entry((input, i)).or_insert((current.clone(), false));
+                                if !*edited {
+                                    // Untouched fields follow the engine (a name set elsewhere).
+                                    draft.clone_from(&current);
+                                }
+                                let field = ui.add(
+                                    TextEdit::singleline(draft)
+                                        .hint_text(device_name)
+                                        .char_limit(confluence_api::MAX_LABEL)
+                                        .desired_width(220.0),
+                                );
+                                *edited |= field.changed();
                                 let enter = ui.input(|k| k.key_pressed(Key::Enter));
                                 if field.lost_focus() || (enter && field.has_focus()) {
-                                    let typed = draft.trim().to_string();
-                                    if typed != current {
+                                    if let Some(name) = name_to_send(draft, &current, *edited) {
                                         actions.push(ScreenAction::Edit(Edit::SetSlotLabel {
                                             id: s.id,
                                             channel: Some(confluence_api::ChannelRef { input, index: i }),
-                                            name: Some(typed),
+                                            name: Some(name),
                                         }));
                                     }
+                                    *edited = false;
                                 }
                                 ui.end_row();
                             }
@@ -1354,9 +1365,30 @@ fn picker(
     }
 }
 
+/// The name a channel field sends when it is committed: nothing unless the
+/// user typed in it and the cleaned text differs from the current name ("" clears).
+fn name_to_send(draft: &str, current: &str, edited: bool) -> Option<String> {
+    if !edited {
+        return None;
+    }
+    let name = confluence_api::clean_label(Some(draft)).unwrap_or_default();
+    (name != current).then_some(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_channel_name_is_sent_only_when_edited_and_changed() {
+        assert_eq!(name_to_send("Kick", "Snare", false), None, "an untouched draft never overwrites");
+        assert_eq!(name_to_send(" Snare ", "Snare", true), None, "unchanged after trimming");
+        assert_eq!(name_to_send("Kick", "Snare", true), Some("Kick".to_string()));
+        assert_eq!(name_to_send("  ", "Snare", true), Some(String::new()), "cleared");
+        let long = "x".repeat(100);
+        let cut = "x".repeat(confluence_api::MAX_LABEL);
+        assert_eq!(name_to_send(&long, &cut, true), None, "the engine's cut is the same name");
+    }
     use confluence_api::{PositionDevice, PositionState, PositionStatus};
     fn st(pos: &str, status: PositionStatus) -> PositionState {
         PositionState {

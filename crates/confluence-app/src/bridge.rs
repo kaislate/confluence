@@ -173,7 +173,7 @@ pub fn show_bridge(
             let g = Geom { scale: false, ..Geom::bridge() };
             let w = oled_meter::meter_layout(&d.groups, Rect::from_min_size(Pos2::ZERO, Vec2::new(1.0e6, 60.0)), &g)
                 .width_used;
-            w.max(pixel_font::width(&d.name.to_uppercase(), NAME_PX)) + if i == 0 { 16.0 } else { 0.0 }
+            w.max(name_width(&p, &d.name)) + if i == 0 { 16.0 } else { 0.0 }
         })
         .collect();
     let mut lines: Vec<Vec<usize>> = vec![Vec::new()];
@@ -201,14 +201,12 @@ pub fn show_bridge(
             let scale_w = if k == 0 { 16.0 } else { 0.0 };
             let meter_w = widths[i] - if i == 0 { 16.0 } else { 0.0 } + scale_w;
             let dev = Rect::from_min_size(Pos2::new(x, top), Vec2::new(meter_w.max(20.0), line_h));
-            pixel_font::draw(
-                &mut names,
-                Pos2::new(x + scale_w, top),
-                &d.name.to_uppercase(),
-                NAME_PX,
-                d.bay.color(),
-                false,
-            );
+            let at = Pos2::new(x + scale_w, top);
+            if pixel_font::supports(&d.name) {
+                pixel_font::draw(&mut names, at, &d.name.to_uppercase(), NAME_PX, d.bay.color(), false);
+            } else {
+                p.text(at, Align2::LEFT_TOP, &d.name, name_font(), d.bay.color());
+            }
             let mrect = Rect::from_min_max(Pos2::new(dev.left(), top + NAME_ROW), dev.max);
             let m = oled_meter::meter_widget(ui, id.with(&d.key), mrect, &d.groups, &geom, look, motion);
             // "Bridge: VASIO A, Ableton" (unlike the card's "VASIO A · Ableton").
@@ -237,8 +235,21 @@ pub fn show_bridge(
             prefs.height_frac = (prefs.height_frac + drag.drag_delta().y / space).clamp(0.05, 0.5);
         }
     }
-    let _ = Align2::LEFT_TOP;
     out
+}
+
+/// The font for names the pixel font cannot draw ("Kick (L)", non-Latin).
+fn name_font() -> egui::FontId {
+    egui::FontId::proportional(11.0)
+}
+
+/// A device name's width on the bridge, in whichever font draws it.
+fn name_width(p: &egui::Painter, name: &str) -> f32 {
+    if pixel_font::supports(name) {
+        pixel_font::width(&name.to_uppercase(), NAME_PX)
+    } else {
+        p.layout_no_wrap(name.to_string(), name_font(), egui::Color32::WHITE).size().x
+    }
 }
 
 /// The collapsed bridge: a thin strip with a pill to bring it back.
@@ -252,18 +263,33 @@ pub fn collapsed_strip(ui: &mut egui::Ui, r: Rect, skin: &GearSkin, prefs: &mut 
     }
 }
 
-/// The pop-out window: its title, its last place and size, and whether it
-/// stays on top.
-pub fn viewport_builder(prefs: &BridgePrefs) -> egui::ViewportBuilder {
+/// The pop-out window: its title and whether it stays on top, and, when it
+/// `opens`, its last place and size. After that its place is the user's: egui
+/// would move the window back to any position passed again while it is
+/// being dragged.
+pub fn viewport_builder(prefs: &BridgePrefs, opens: bool) -> egui::ViewportBuilder {
     let level = if prefs.pinned { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
     let b = egui::ViewportBuilder::default()
         .with_title("Confluence meters")
         .with_min_inner_size([360.0, 140.0])
         .with_window_level(level);
+    if !opens {
+        return b;
+    }
     match prefs.window {
         Some([x, y, w, h]) => b.with_position([x, y]).with_inner_size([w, h]),
         None => b.with_inner_size([960.0, 280.0]),
     }
+}
+
+/// Set while the pop-out window is open (it has been placed).
+fn placed_id() -> Id {
+    Id::new("confluence-meters-placed")
+}
+
+/// Call on frames the bridge is docked: the next pop-out opens at its saved place.
+pub fn docked(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<bool>(placed_id()));
 }
 
 /// The bridge in its own window (an embedded one where the platform cannot
@@ -287,7 +313,9 @@ pub fn popout(
     let shown = bridge_devices(&state.positions, &v, &prefs.bridge, only);
     let look = prefs.meter;
     let id = egui::ViewportId::from_hash_of("confluence-meters");
-    ctx.show_viewport_immediate(id, viewport_builder(&prefs.bridge), |ui, class| {
+    let opens = !ctx.data(|d| d.get_temp::<bool>(placed_id()).unwrap_or(false));
+    ctx.data_mut(|d| d.insert_temp(placed_id(), true));
+    ctx.show_viewport_immediate(id, viewport_builder(&prefs.bridge, opens), |ui, class| {
         let area = ui.max_rect();
         paint::ground(ui.painter(), area, skin);
         // The pin, top left.
@@ -406,16 +434,26 @@ mod tests {
     #[test]
     fn the_pop_out_window_is_titled_remembers_its_place_and_can_stay_on_top() {
         let mut prefs = BridgePrefs::default();
-        let b = viewport_builder(&prefs);
+        let b = viewport_builder(&prefs, true);
         assert_eq!(b.title.as_deref(), Some("Confluence meters"));
         assert_eq!(b.window_level, Some(egui::WindowLevel::Normal));
         assert_eq!(b.inner_size, Some(Vec2::new(960.0, 280.0)));
         prefs.pinned = true;
         prefs.window = Some([100.0, 50.0, 700.0, 240.0]);
-        let b = viewport_builder(&prefs);
+        let b = viewport_builder(&prefs, true);
         assert_eq!(b.window_level, Some(egui::WindowLevel::AlwaysOnTop));
         assert_eq!(b.position, Some(Pos2::new(100.0, 50.0)));
         assert_eq!(b.inner_size, Some(Vec2::new(700.0, 240.0)));
+    }
+
+    #[test]
+    fn after_opening_the_pop_out_leaves_its_place_to_the_user() {
+        // Passing the saved rect every frame would pull the window back
+        // while it is dragged or resized.
+        let prefs = BridgePrefs { window: Some([100.0, 50.0, 700.0, 240.0]), ..Default::default() };
+        let b = viewport_builder(&prefs, false);
+        assert_eq!((b.position, b.inner_size), (None, None));
+        assert_eq!(b.title.as_deref(), Some("Confluence meters"));
     }
 
     #[test]

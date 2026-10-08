@@ -254,6 +254,16 @@ fn dim(k: f32) -> Color32 {
     Color32::from_white_alpha((k * 255.0) as u8)
 }
 
+/// The most rows a segment or dot ladder has: taller bars space them out.
+pub const MAX_ROWS: usize = 120;
+
+/// The row pitch of a ladder `height` tall: fine on small meters, coarser on
+/// very tall ones (a maximized pop-out) so the mesh stays small.
+pub fn ladder_pitch(height: f32, dot: bool) -> f32 {
+    let fine: f32 = if dot { 2.0 } else { 3.0 };
+    fine.max(height / MAX_ROWS as f32)
+}
+
 /// Paints a laid-out meter. `levels` holds each bar's (level, held peak, rms)
 /// in dB, in bar order.
 pub fn paint_meter(p: &egui::Painter, l: &MeterLayout, groups: &[Group], levels: &[(f32, f32, f32)], look: MeterLook) {
@@ -266,8 +276,8 @@ pub fn paint_meter(p: &egui::Painter, l: &MeterLayout, groups: &[Group], levels:
         let r = b.rect;
         match look.style {
             MeterStyle::Segments | MeterStyle::DotMatrix => {
-                let pitch = if dot { 2.0 } else { 3.0 };
-                let seg_h = if dot { 1.6 } else { 2.0 };
+                let pitch = ladder_pitch(r.height(), dot);
+                let seg_h = pitch * if dot { 0.8 } else { 2.0 / 3.0 };
                 let n = (r.height() / pitch).floor().max(1.0) as usize;
                 let held = hold_segments(hv, n, look.double_peak);
                 for k in 0..n {
@@ -278,7 +288,7 @@ pub fn paint_meter(p: &egui::Painter, l: &MeterLayout, groups: &[Group], levels:
                     if dot {
                         let mut x = r.left();
                         while x + 1.0 <= r.right() + 0.01 {
-                            m.add_colored_rect(Rect::from_min_size(Pos2::new(x, y), Vec2::splat(seg_h)), colour);
+                            m.add_colored_rect(Rect::from_min_size(Pos2::new(x, y), Vec2::new(1.6, seg_h)), colour);
                             x += 2.0;
                         }
                     } else {
@@ -403,6 +413,16 @@ pub fn meter_widget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tall_ladders_keep_a_bounded_number_of_rows() {
+        for dot in [true, false] {
+            let short = ladder_pitch(120.0, dot);
+            assert_eq!(short, if dot { 2.0 } else { 3.0 }, "short bars keep the fine pitch");
+            let rows = (1000.0 / ladder_pitch(1000.0, dot)).floor();
+            assert!(rows <= MAX_ROWS as f32, "{rows}");
+        }
+    }
 
     fn groups(ins: usize, outs: usize) -> Vec<Group> {
         let chans = |n: usize, word: &str| -> Vec<Chan> {

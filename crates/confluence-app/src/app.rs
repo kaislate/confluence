@@ -515,6 +515,8 @@ impl ConfluenceApp {
         if self.prefs.bridge.popped {
             let skin = self.skin();
             crate::bridge::popout(&ctx, &view, &skin, &mut self.prefs, &mut self.motion);
+        } else {
+            crate::bridge::docked(&ctx);
         }
         self.notifications(&ctx, &view, now);
         self.dialogs(&ctx, &view);
