@@ -184,7 +184,7 @@ pub enum Command {
     SetMaster {
         pos: Option<PosId>,
     },
-    /// As `Subscribe`, plus meter frames about 20 times a second.
+    /// As `Subscribe`, plus meter frames about 60 times a second.
     SubscribeMeters,
     /// Clears every latched clip indicator.
     ClearClip,
@@ -769,7 +769,7 @@ pub fn byte_db(b: u8) -> f32 {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
-    /// Levels, about 20 times a second, to `SubscribeMeters` clients only.
+    /// Levels, about 60 times a second, to `SubscribeMeters` clients only.
     Meters(MeterFrame),
     /// Versioned: `version` is the previous version + 1.
     Changed { version: u64, changes: Vec<Change> },

@@ -404,8 +404,10 @@ mod app {
 
     /// How often state is diffed and telemetry sent, in control-loop ticks of 10 ms.
     const PUBLISH_TICKS: u64 = 10;
-    /// Control ticks (10 ms) between meter frames.
-    const METER_TICKS: u64 = 5;
+    /// The control loop's tick.
+    const TICK: Duration = Duration::from_millis(10);
+    /// Between meter frames: about 60 a second.
+    const METER_PERIOD: Duration = Duration::from_millis(16);
     /// The journal is rewritten as the current state once it grows past this.
     const JOURNAL_COMPACT_BYTES: u64 = 4 << 20;
     /// How often the device list is refreshed.
@@ -806,8 +808,35 @@ mod app {
         eprintln!("confluence-engine: listening on {}", pipe_path(&pipe));
 
         let mut ticks = 0u64;
+        let (mut next_tick, mut next_meter) = (Instant::now() + TICK, Instant::now() + METER_PERIOD);
+        // The next deadline after `due`, `period` on (or from `now` if it fell behind).
+        let advance = |due: Instant, now: Instant, period: Duration| {
+            if now > due + period {
+                now + period
+            } else {
+                due + period
+            }
+        };
         while !shutdown.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(10));
+            let wake = next_tick.min(next_meter);
+            let now = Instant::now();
+            if wake > now {
+                std::thread::sleep(wake - now);
+            }
+            let now = Instant::now();
+            if now >= next_meter {
+                next_meter = advance(next_meter, now, METER_PERIOD);
+                // Meters about 60 times a second, measured out only for those who asked.
+                let mut s = lock(&state);
+                if s.publisher.has_meter_subscribers() {
+                    let frame = s.engine.meter_frame();
+                    s.publisher.meters(frame);
+                }
+            }
+            if now < next_tick {
+                continue;
+            }
+            next_tick = advance(next_tick, now, TICK);
             let mut s = lock(&state);
             s.engine.tick();
             for p in s.engine.take_returned_processors() {
@@ -815,11 +844,6 @@ mod app {
             }
             midi_tick(&mut s);
             ticks += 1;
-            // Meters about 20 times a second, measured out only for those who asked.
-            if ticks.is_multiple_of(METER_TICKS) && s.publisher.has_meter_subscribers() {
-                let frame = s.engine.meter_frame();
-                s.publisher.meters(frame);
-            }
             if ticks.is_multiple_of(PUBLISH_TICKS) {
                 // Network streams whose engine was not found come back once it is.
                 let State { devices, engine, .. } = &mut *s;

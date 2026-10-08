@@ -57,7 +57,7 @@ pub enum Update {
     State,
     /// Only telemetry (status, health, history): it may be drawn less often.
     Telemetry,
-    /// Only meter levels (about 20 times a second).
+    /// Only meter levels (about 60 times a second).
     Meters,
 }
 
