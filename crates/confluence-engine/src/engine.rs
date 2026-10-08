@@ -290,6 +290,20 @@ enum SlotStats {
     Bus(Arc<AtomicU64>),
 }
 
+/// A slot's channel names: the device's where given, else numbered ("In 3";
+/// an insert bus: "Return 3" / "Send 3").
+fn channel_names(s: &SlotState) -> (Vec<String>, Vec<String>) {
+    let (inp, out) = if s.is_bus() { ("Return", "Send") } else { ("In", "Out") };
+    let fill = |given: &[String], n: u32, word: &str| -> Vec<String> {
+        (0..n as usize)
+            .map(|i| {
+                given.get(i).filter(|g| !g.trim().is_empty()).cloned().unwrap_or_else(|| format!("{word} {}", i + 1))
+            })
+            .collect()
+    };
+    (fill(&s.input_names, s.inputs, inp), fill(&s.output_names, s.outputs, out))
+}
+
 struct SlotRecord {
     state: SlotState,
     stats: SlotStats,
@@ -1208,8 +1222,20 @@ impl Engine {
     pub fn slots(&self) -> Vec<SlotState> {
         self.slots
             .iter()
-            .map(|s| SlotState { color: self.colours.of_key(&Self::key_of(s)), ..s.state.clone() })
+            .map(|s| {
+                let (input_names, output_names) = channel_names(&s.state);
+                SlotState { color: self.colours.of_key(&Self::key_of(s)), input_names, output_names, ..s.state.clone() }
+            })
             .collect()
+    }
+
+    /// Names slot `id`'s channels as its device does (missing ones get
+    /// numbered defaults when published).
+    pub fn set_channel_names(&mut self, id: u32, inputs: Vec<String>, outputs: Vec<String>) {
+        if let Some(s) = self.slots.iter_mut().find(|s| s.state.id == id) {
+            s.state.input_names = inputs;
+            s.state.output_names = outputs;
+        }
     }
 
     fn key_of(s: &SlotRecord) -> String {
