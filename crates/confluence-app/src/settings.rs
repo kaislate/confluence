@@ -2,8 +2,10 @@
 
 use eframe::egui::{self, Color32, Id, Rect, Vec2};
 
+use crate::gear::oled_meter::MeterStyle;
 use crate::gear::paint;
 use crate::gear::skins::{Finish, GearSkin};
+use crate::prefs::ViewPrefs;
 
 /// Where the chosen finish is stored (eframe storage).
 pub const FINISH_KEY: &str = "skin_finish";
@@ -12,7 +14,7 @@ pub const REDUCE_MOTION_KEY: &str = "reduce_motion";
 
 /// Shows the window while `open`; the radio buttons change `finish`, the
 /// checkbox `reduce` (tweens land at once; meters and LEDs keep their timing).
-pub fn show(ctx: &egui::Context, open: &mut bool, finish: &mut Finish, reduce: &mut bool) {
+pub fn show(ctx: &egui::Context, open: &mut bool, finish: &mut Finish, reduce: &mut bool, prefs: &mut ViewPrefs) {
     egui::Window::new("Settings").open(open).resizable(false).collapsible(false).show(ctx, |ui| {
         ui.label("Finish");
         ui.horizontal(|ui| {
@@ -25,6 +27,26 @@ pub fn show(ctx: &egui::Context, open: &mut bool, finish: &mut Finish, reduce: &
         ui.add_space(8.0);
         ui.checkbox(reduce, "Reduce motion")
             .on_hover_text("Panels and highlights move at once; meters and LEDs keep their timing");
+        ui.add_space(10.0);
+        ui.label("Meters");
+        ui.horizontal(|ui| {
+            for s in MeterStyle::all() {
+                ui.radio_value(&mut prefs.meter.style, s, s.name());
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Peak");
+            ui.radio_value(&mut prefs.meter.double_peak, false, "Single line");
+            ui.radio_value(&mut prefs.meter.double_peak, true, "Double line");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Clip");
+            ui.radio_value(&mut prefs.meter.clip_red, false, "White");
+            ui.radio_value(&mut prefs.meter.clip_red, true, "Red");
+        });
+        ui.add_space(10.0);
+        ui.checkbox(&mut prefs.only_custom_names, "Show only custom names")
+            .on_hover_text("Hide device names wherever you have given a custom name");
     });
 }
 

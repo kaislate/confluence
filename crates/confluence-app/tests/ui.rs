@@ -786,3 +786,21 @@ fn turning_a_vasio_off_asks_first() {
     pump_until(&mut h, "VASIO A off", LONG, |_| !slots(&mut c).iter().any(|s| s.name == "VASIO 1"));
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn the_meter_style_is_chosen_in_settings() {
+    let d = EngineDir::new("meter-style");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness(app_for(&d));
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Settings…").click();
+    pump_until(&mut h, "the meter choices", LONG, |h| h.query_by_label("Dot-matrix").is_some());
+    h.get_by_label("Dot-matrix").click();
+    h.get_by_label("Double line").click();
+    h.get_by_label("Show only custom names").click();
+    settle(&mut h);
+    let p = h.state().prefs();
+    assert_eq!(p.meter.style, confluence_app::gear::oled_meter::MeterStyle::DotMatrix);
+    assert!(p.meter.double_peak && p.only_custom_names);
+    client(&d).call(Command::Shutdown).unwrap();
+}

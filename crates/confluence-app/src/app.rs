@@ -237,6 +237,8 @@ pub struct ConfluenceApp {
     finish: Finish,
     styled_for: Option<Finish>,
     settings_open: bool,
+    /// How meters and names are shown, and the meter bridge.
+    prefs: crate::prefs::ViewPrefs,
     motion: Motion,
     /// Engine notices and when they were first seen (they toast once).
     notices_seen: HashMap<String, Instant>,
@@ -321,6 +323,7 @@ impl ConfluenceApp {
             finish: Finish::default(),
             styled_for: None,
             settings_open: false,
+            prefs: crate::prefs::ViewPrefs::default(),
             motion: Motion::default(),
             notices_seen: HashMap::new(),
             routes_seen: HashSet::new(),
@@ -694,6 +697,16 @@ impl ConfluenceApp {
     }
 
     /// The gear finish chosen in Settings.
+    /// How meters and names are shown, and the meter bridge.
+    pub fn prefs(&self) -> &crate::prefs::ViewPrefs {
+        &self.prefs
+    }
+
+    /// Restores the preferences saved last time (see [`crate::prefs::PREFS_KEY`]).
+    pub fn set_prefs(&mut self, prefs: crate::prefs::ViewPrefs) {
+        self.prefs = prefs;
+    }
+
     pub fn finish(&self) -> Finish {
         self.finish
     }
@@ -814,7 +827,7 @@ impl ConfluenceApp {
     fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
         if self.settings_open {
             let mut reduce = self.motion.reduce;
-            crate::settings::show(ctx, &mut self.settings_open, &mut self.finish, &mut reduce);
+            crate::settings::show(ctx, &mut self.settings_open, &mut self.finish, &mut reduce, &mut self.prefs);
             self.motion.reduce = reduce;
         }
         if let (true, Some(state)) = (self.scripts_open, view.state.as_ref()) {
@@ -1026,6 +1039,7 @@ impl eframe::App for ConfluenceApp {
         storage.set_string(INSPECTOR_KEY, self.inspector_open.to_string());
         storage.set_string(crate::settings::FINISH_KEY, self.finish.name().to_string());
         storage.set_string(crate::settings::REDUCE_MOTION_KEY, self.motion.reduce.to_string());
+        storage.set_string(crate::prefs::PREFS_KEY, self.prefs.to_storage());
     }
 }
 

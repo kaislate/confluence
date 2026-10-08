@@ -35,6 +35,8 @@ fn main() -> eframe::Result {
             if let Some(v) = cc.storage.and_then(|s| s.get_string(confluence_app::settings::REDUCE_MOTION_KEY)) {
                 app.set_reduce_motion(v == "true");
             }
+            let prefs = cc.storage.and_then(|s| s.get_string(confluence_app::prefs::PREFS_KEY));
+            app.set_prefs(confluence_app::prefs::ViewPrefs::from_storage(prefs.as_deref()));
             Ok(Box::new(app))
         }),
     );
