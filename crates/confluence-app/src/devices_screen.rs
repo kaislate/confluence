@@ -237,6 +237,16 @@ fn hold(st: &mut ScreenState, key: (bool, u32), peak: f32, now: f64) -> f32 {
     e.0
 }
 
+/// The finish the screen itself (background, empty slots) is drawn in:
+/// candy moulds only the devices, on a neutral silver ground.
+pub fn screen_skin(base: &GearSkin) -> GearSkin {
+    if base.mould {
+        GearSkin::preset(crate::gear::skins::Finish::Silver)
+    } else {
+        *base
+    }
+}
+
 /// Shows the screen; `palette` is the colours offered for a device.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -270,7 +280,7 @@ pub fn show(
                     continue;
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new(row_title(group)).strong());
+                ui.label(RichText::new(row_title(group)).strong().color(screen_skin(skin).ink));
                 let n = per_line(ui.available_width());
                 for line in cards.chunks(n) {
                     let (row, _) =
@@ -285,8 +295,8 @@ pub fn show(
                 }
             }
             ui.add_space(6.0);
-            ui.label(RichText::new("Buses").strong());
-            bus_card(ui, skin, st, &mut actions);
+            ui.label(RichText::new("Buses").strong().color(screen_skin(skin).ink));
+            bus_card(ui, &screen_skin(skin), st, &mut actions);
         });
     });
     if let Some(pos) = st.picker {
@@ -321,9 +331,20 @@ fn card(
         .join(" \u{b7} ");
     let enabled = ui.is_enabled();
     resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &label));
+    // Until the drivers are re-registered with their letters, a DAW lists the
+    // old numbered name (spec: slot model §2.2).
+    let resp = if p.pos.group == PosGroup::Vasio && matches!(p.status, PositionStatus::On { .. }) {
+        resp.on_hover_text(format!(
+            "Your DAW may list this as \"Confluence VASIO {}\" until the drivers are re-registered",
+            p.pos.index + 1
+        ))
+    } else {
+        resp
+    };
     let painter = ui.painter_at(r.expand(30.0));
     if p.status == PositionStatus::Empty {
         // A recessed outline where a device would go.
+        let skin = screen_skin(base);
         paint::tray(&painter, r.shrink(4.0), &skin);
         painter.text(
             r.center(),
@@ -340,6 +361,9 @@ fn card(
     }
     let off = p.status == PositionStatus::Off;
     paint::panel(&painter, r, &skin, None);
+    if off {
+        paint::dim(&painter, r, &skin);
+    }
     if !skin.mould {
         if let Some(c) = colour {
             let band = Rect::from_min_size(r.min + Vec2::new(22.0, 0.0), Vec2::new(r.width() - 44.0, 4.0));
@@ -404,7 +428,7 @@ fn card(
                 actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: false, shape: None }));
             }
             if p.pos.group == PosGroup::Vasio {
-                shape_menu(&mut row, p, actions);
+                shape_menu(&mut row, p, &skin, actions);
             }
         } else {
             if p.pos.group == PosGroup::Asio
@@ -418,7 +442,7 @@ fn card(
             }
         }
         if let Some(&slot) = p.slots.first() {
-            colour_menu(&mut row, slot, p.color, palette, actions);
+            colour_menu(&mut row, slot, p.color, palette, &skin, actions);
         }
     }
     if resp.clicked() && !off {
@@ -432,9 +456,10 @@ fn card(
 }
 
 /// VASIO's shape, as the DAW sees it: both directions together, or each.
-fn shape_menu(ui: &mut egui::Ui, p: &PositionState, actions: &mut Vec<ScreenAction>) {
+fn shape_menu(ui: &mut egui::Ui, p: &PositionState, skin: &GearSkin, actions: &mut Vec<ScreenAction>) {
     let (ins, outs) = p.shape.unwrap_or((8, 8)); // engine side: (DAW outputs, DAW inputs)
-    ui.menu_button("Shape\u{2026}", |ui| {
+    let pill = paint::pill_labeled(ui, "Shape\u{2026}", &format!("Shape of {}", p.pos.label()), skin);
+    egui::Popup::menu(&pill).show(|ui| {
         for n in SHAPES {
             if ui.button(format!("{n}\u{d7}{n}")).clicked() {
                 actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: Some((n, n)) }));
@@ -465,9 +490,11 @@ fn colour_menu(
     slot: u32,
     current: Option<confluence_api::Rgb>,
     palette: &[Color32],
+    skin: &GearSkin,
     actions: &mut Vec<ScreenAction>,
 ) {
-    ui.menu_button("Colour", |ui| {
+    let pill = paint::pill(ui, "Colour", skin);
+    egui::Popup::menu(&pill).show(|ui| {
         ui.horizontal_wrapped(|ui| {
             for c in palette {
                 let rgb = [c.r(), c.g(), c.b()];

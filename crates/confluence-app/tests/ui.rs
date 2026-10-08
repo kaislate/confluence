@@ -723,7 +723,9 @@ fn an_empty_network_slot_is_filled_from_its_picker() {
     h.get_by_label_contains("NET OUT 1 · click").scroll_to_me();
     settle(&mut h);
     h.get_by_label_contains("NET OUT 1 · click").click();
-    pump_until(&mut h, "the send picker", LONG, |h| h.query_by(|n| n.placeholder() == Some("Address (ip:port)")).is_some());
+    pump_until(&mut h, "the send picker", LONG, |h| {
+        h.query_by(|n| n.placeholder() == Some("Address (ip:port)")).is_some()
+    });
     h.get_by(|n| n.placeholder() == Some("Address (ip:port)")).click();
     h.get_by(|n| n.placeholder() == Some("Address (ip:port)")).type_text("127.0.0.1:9");
     h.get_by_label("Send here").click();

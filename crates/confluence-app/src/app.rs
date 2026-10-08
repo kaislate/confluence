@@ -536,6 +536,11 @@ impl ConfluenceApp {
         ui.toggle_value(&mut self.settings_open, "Settings…");
     }
 
+    /// Shows the matrix or the Devices screen.
+    pub fn set_screen(&mut self, screen: Screen) {
+        self.screen = screen;
+    }
+
     /// The gear finish chosen in Settings.
     pub fn finish(&self) -> crate::gear::skins::Finish {
         self.finish
@@ -555,7 +560,8 @@ impl ConfluenceApp {
         let screen_state = &mut self.screen_state;
         let actions = egui::CentralPanel::default()
             .show(ui, |ui| {
-                ui.painter().rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, skin.p3);
+                let ground = crate::devices_screen::screen_skin(&skin).p3;
+                ui.painter().rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, ground);
                 crate::devices_screen::show(ui, view, &list, &skin, &palette, screen_state, editable)
             })
             .inner;

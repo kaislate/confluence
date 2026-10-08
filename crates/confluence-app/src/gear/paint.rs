@@ -50,53 +50,113 @@ fn fade(p: &Painter, r: Rect, from: Color32, to: Color32, vertical: bool) {
     p.add(Shape::mesh(m));
 }
 
-/// A raised panel: the finish's colour with bevel light top-left, shade
-/// bottom-right, and a soft drop shadow. `tint` washes it in a device colour.
+/// `a` to `b` by `t` (0..1), per channel.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()), m(a.a(), b.a()))
+}
+
+/// The outline of a rounded rectangle, clockwise from the top-left corner,
+/// with each point's outward normal.
+fn rounded_outline(r: Rect, radius: f32) -> Vec<(Pos2, Vec2)> {
+    const STEPS: usize = 8;
+    let rad = radius.min(r.width() / 2.0).min(r.height() / 2.0);
+    let corners = [
+        (Pos2::new(r.left() + rad, r.top() + rad), 180.0f32),
+        (Pos2::new(r.right() - rad, r.top() + rad), 270.0),
+        (Pos2::new(r.right() - rad, r.bottom() - rad), 0.0),
+        (Pos2::new(r.left() + rad, r.bottom() - rad), 90.0),
+    ];
+    let mut out = Vec::with_capacity(4 * (STEPS + 1));
+    for (c, start) in corners {
+        for k in 0..=STEPS {
+            let a = (start + 90.0 * k as f32 / STEPS as f32).to_radians();
+            let n = Vec2::new(a.cos(), a.sin());
+            out.push((c + n * rad, n));
+        }
+    }
+    out
+}
+
+/// A rounded rectangle filled with `colour_at` (sampled on rings from the
+/// centre to the edge, so smooth gradients need no texture), its edge
+/// antialiased by a one-pixel feather.
+fn rounded_fill(p: &Painter, r: Rect, radius: f32, colour_at: impl Fn(Pos2) -> Color32) {
+    const RINGS: usize = 6;
+    let outline = rounded_outline(r, radius);
+    let n = outline.len() as u32;
+    let c = r.center();
+    let mut m = Mesh::default();
+    m.colored_vertex(c, colour_at(c));
+    for k in 1..=RINGS {
+        let t = k as f32 / RINGS as f32;
+        for (pt, _) in &outline {
+            let q = c + (*pt - c) * t;
+            m.colored_vertex(q, colour_at(q));
+        }
+    }
+    let feather = p.ctx().pixels_per_point().recip();
+    for (pt, normal) in &outline {
+        m.colored_vertex(*pt + *normal * feather, Color32::TRANSPARENT);
+    }
+    let ring = |k: u32, i: u32| 1 + (k - 1) * n + (i % n);
+    for i in 0..n {
+        m.add_triangle(0, ring(1, i), ring(1, i + 1));
+    }
+    for k in 1..=RINGS as u32 {
+        for i in 0..n {
+            let (a, b, cc, d) = (ring(k, i), ring(k, i + 1), ring(k + 1, i + 1), ring(k + 1, i));
+            m.add_triangle(a, b, cc);
+            m.add_triangle(a, cc, d);
+        }
+    }
+    p.add(Shape::mesh(m));
+}
+
+/// The panel's radial gradient at `q`: light at 28% / 18% of the panel,
+/// stops p1 at 0, p2 at 0.48 and p3 at 1.1 of 1.1 x its larger side.
+fn panel_gradient(r: Rect, s: &GearSkin) -> impl Fn(Pos2) -> Color32 + '_ {
+    let centre = r.min + Vec2::new(r.width() * 0.28, r.height() * 0.18);
+    let reach = 1.1 * r.width().max(r.height());
+    move |q: Pos2| {
+        let d = (q - centre).length() / reach;
+        if d < 0.48 {
+            mix(s.p1, s.p2, d / 0.48)
+        } else {
+            mix(s.p2, s.p3, (d - 0.48) / (1.1 - 0.48))
+        }
+    }
+}
+
+/// A raised panel: the finish's radial gradient, light from the top-left
+/// and a soft drop shadow to the bottom-right. `tint` washes it in a colour.
 pub fn panel(p: &Painter, r: Rect, s: &GearSkin, tint: Option<Color32>) {
     let radius = CornerRadius::same(PANEL_RADIUS);
-    let hl = Shadow { offset: [-6, -6], blur: 16, spread: 0, color: Color32::from_white_alpha((s.hl * 255.0) as u8) };
+    let hl = Shadow { offset: [-5, -5], blur: 14, spread: 0, color: Color32::from_white_alpha((s.hl * 120.0) as u8) };
     let sh = Shadow { offset: [8, 10], blur: 22, spread: 0, color: Color32::from_black_alpha((s.sh * 255.0) as u8) };
     p.add(hl.as_shape(r, radius));
     p.add(sh.as_shape(r, radius));
-    p.rect_filled(r, radius, s.p2);
+    rounded_fill(p, r, PANEL_RADIUS as f32, panel_gradient(r, s));
     if let Some(c) = tint {
         p.rect_filled(r, radius, alpha(c, 0.14));
     }
-    // The light corner and the dark one: the radial gradient, in two fades.
-    let inset = PANEL_RADIUS as f32;
-    let h = r.shrink2(Vec2::new(inset, 0.0));
-    let v = r.shrink2(Vec2::new(0.0, inset));
-    let lift = |c: Color32, k: f32| alpha(c, k);
-    fade(
-        p,
-        Rect::from_min_max(h.left_top(), Pos2::new(h.right(), r.top() + 16.0)),
-        lift(Color32::WHITE, 0.62 * s.hl),
-        Color32::TRANSPARENT,
-        true,
-    );
-    fade(
-        p,
-        Rect::from_min_max(v.left_top(), Pos2::new(r.left() + 12.0, v.bottom())),
-        lift(Color32::WHITE, 0.32 * s.hl),
-        Color32::TRANSPARENT,
-        false,
-    );
-    fade(
-        p,
-        Rect::from_min_max(Pos2::new(h.left(), r.bottom() - 14.0), h.right_bottom()),
-        Color32::TRANSPARENT,
-        lift(Color32::BLACK, 0.10 + 0.1 * s.sh),
-        true,
-    );
-    fade(
-        p,
-        Rect::from_min_max(Pos2::new(r.right() - 12.0, v.top()), v.right_bottom()),
-        Color32::TRANSPARENT,
-        lift(Color32::BLACK, 0.07 + 0.1 * s.sh),
-        false,
-    );
-    // A faint wash of the light stop toward the top-left, the dark one bottom-right.
-    fade(p, r.shrink(inset * 0.5), alpha(s.p1, 0.35), alpha(s.p3, 0.35), true);
+    // The bevel: a light rim, strongest along the top-left.
+    let rim = |q: Pos2| {
+        let d = (q - r.center()).normalized();
+        let facing = (-(d.x + d.y) * std::f32::consts::FRAC_1_SQRT_2).max(0.0);
+        Color32::from_white_alpha((facing * (40.0 + 80.0 * s.hl)) as u8)
+    };
+    let outline = rounded_outline(r.shrink(0.75), PANEL_RADIUS as f32 - 0.75);
+    for w in outline.windows(2) {
+        let (a, b) = (w[0].0, w[1].0);
+        p.line_segment([a, b], Stroke::new(1.0, rim(a + (b - a) * 0.5)));
+    }
+}
+
+/// Greys a switched-off panel.
+pub fn dim(p: &Painter, r: Rect, s: &GearSkin) {
+    p.rect_filled(r, CornerRadius::same(PANEL_RADIUS), alpha(s.p3, 0.45));
 }
 
 /// Insets a recess: dark top and left, light bottom and right.
@@ -183,16 +243,16 @@ pub fn pill(ui: &mut Ui, label: &str, s: &GearSkin) -> Response {
 pub fn pill_labeled(ui: &mut Ui, label: &str, accessible: &str, s: &GearSkin) -> Response {
     let f = font(ui.ctx(), "label", 13.0);
     let galley = ui.painter().layout_no_wrap(label.to_string(), f.clone(), s.ink);
-    let size = Vec2::new(galley.size().x + 28.0, 26.0);
+    let size = Vec2::new(galley.size().x + 18.0, 24.0);
     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
     let p = ui.painter();
-    let radius = CornerRadius::same(13);
+    let radius = CornerRadius::same(12);
     let pressed = resp.is_pointer_button_down_on();
     fade(p, r, Color32::from_black_alpha(if pressed { 30 } else { 15 }), Color32::from_black_alpha(5), true);
     p.rect_stroke(r, radius, Stroke::new(1.0, Color32::from_black_alpha(60)), egui::StrokeKind::Inside);
     fade(
         p,
-        Rect::from_min_size(r.min + Vec2::new(10.0, 1.0), Vec2::new(r.width() - 20.0, 4.0)),
+        Rect::from_min_size(r.min + Vec2::new(8.0, 1.0), Vec2::new(r.width() - 16.0, 4.0)),
         Color32::from_black_alpha(50),
         Color32::TRANSPARENT,
         true,
