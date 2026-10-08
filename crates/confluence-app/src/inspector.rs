@@ -110,7 +110,10 @@ pub fn show(
 
 fn summary(ui: &mut egui::Ui, look: &Look, state: &State) {
     for n in &state.notices {
-        ui.label(RichText::new(n).color(look.skin.colors.warn));
+        // The finish's warning tone (dark on a light ground); the skin file's
+        // warn colour is for the matrix.
+        let _ = look;
+        ui.label(RichText::new(n).color(ui.visuals().warn_fg_color));
     }
     if !state.notices.is_empty() {
         ui.add_space(8.0);

@@ -41,8 +41,21 @@ pub fn light_for(badge: &str) -> Light {
 /// The engine readout: "48K · 256 · GOXLR ASIO DRIVER".
 pub fn readout(s: &EngineStatus) -> String {
     let master = s.master.split_once(':').map_or(s.master.as_str(), |(_, m)| m);
-    let master = if master == "internal" { "INT CLOCK".to_string() } else { master.to_uppercase() };
-    let master: String = master.chars().take(18).collect();
+    // "GoXLR ASIO Driver" is "GOXLR": the driver words are noise here.
+    let master = if master == "internal" {
+        "INT CLOCK".to_string()
+    } else {
+        let words: Vec<&str> = master
+            .split_whitespace()
+            .filter(|w| !matches!(w.to_ascii_uppercase().as_str(), "ASIO" | "DRIVER"))
+            .collect();
+        if words.is_empty() {
+            master.to_uppercase()
+        } else {
+            words.join(" ").to_uppercase()
+        }
+    };
+    let master: String = master.chars().take(14).collect();
     let k = s.sample_rate / 1000.0;
     let rate = if (k - k.round()).abs() < 0.05 { format!("{k:.0}K") } else { format!("{k:.1}K") };
     format!("{rate} \u{b7} {} \u{b7} {master}", s.block)
@@ -346,7 +359,7 @@ mod tests {
             dsp_load: 0.0,
             xruns: 0,
         };
-        assert_eq!(readout(&st), "48K \u{b7} 256 \u{b7} GOXLR ASIO DRIVER");
+        assert_eq!(readout(&st), "48K \u{b7} 256 \u{b7} GOXLR");
         let internal = EngineStatus { master: "internal".into(), sample_rate: 44_100.0, ..st };
         assert_eq!(readout(&internal), "44.1K \u{b7} 256 \u{b7} INT CLOCK");
     }

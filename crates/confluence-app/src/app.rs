@@ -912,7 +912,18 @@ impl ConfluenceApp {
                 );
                 return;
             }
-            let layout = GridLayout::new(&state.slots, self.cell);
+            let mut layout = GridLayout::new(&state.slots, self.cell);
+            // A band's default colour is its position's, as on the cards.
+            let by_slot: HashMap<u32, u32> = state
+                .positions
+                .iter()
+                .flat_map(|p| p.slots.iter().map(move |s| (*s, crate::devices_screen::position_palette(p.pos))))
+                .collect();
+            for band in layout.rows.bands.iter_mut().chain(layout.cols.bands.iter_mut()) {
+                if let Some(n) = by_slot.get(&band.slot) {
+                    band.palette = *n;
+                }
+            }
             let by_point: HashMap<(u32, u32), &PointState> =
                 state.points.iter().map(|p| ((p.input, p.output), p)).collect();
             let pending = &self.pending;

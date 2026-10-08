@@ -46,6 +46,8 @@ pub fn apply_visuals(ctx: &egui::Context, s: &GearSkin) {
     v.selection.bg_fill = s.accent;
     v.selection.stroke = Stroke::new(1.0, skins::ink_on(s.accent));
     v.hyperlink_color = s.accent;
+    v.warn_fg_color = if light { Color32::from_rgb(0x9a, 0x5a, 0x00) } else { skins::AMBER };
+    v.error_fg_color = if light { Color32::from_rgb(0xb0, 0x20, 0x20) } else { skins::RED };
     let (body, hover, active) = if light {
         (Color32::from_black_alpha(18), Color32::from_black_alpha(30), Color32::from_black_alpha(45))
     } else {

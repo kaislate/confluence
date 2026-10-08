@@ -74,11 +74,15 @@ fn wheel_notches(ui: &egui::Ui) -> f32 {
     })
 }
 
+/// "From … / To … / state": the arrow of the accessible label is not in
+/// every face, so the tooltip spells it out.
 fn tooltip(label: &str, p: Option<&PointState>) -> String {
+    let (from, to) = label.split_once(" \u{2192} ").unwrap_or((label, ""));
+    let ends = if to.is_empty() { from.to_string() } else { format!("From {from}\nTo {to}") };
     match p {
-        None => format!("{label}: no route"),
+        None => format!("{ends}\nno route"),
         Some(p) => format!(
-            "{label}: {:+.1} dB{}{}",
+            "{ends}\n{:+.1} dB{}{}",
             p.gain_db,
             if p.mute { ", muted" } else { "" },
             if p.invert { ", inverted" } else { "" }
@@ -517,6 +521,12 @@ fn cell_face(
 fn rotated(p: &egui::Painter, bottom: Pos2, text: &str, font: FontId, colour: Color32, room: f32) {
     if room < 8.0 {
         return;
+    }
+    // A name that does not fit tries a smaller face before it is cut.
+    let mut font = font;
+    let fits = |f: &FontId| p.layout_no_wrap(text.to_string(), f.clone(), colour).size().x <= room;
+    if !fits(&font) {
+        font.size = 9.0;
     }
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, colour);
     job.wrap = egui::text::TextWrapping::from_wrap_mode_and_width(egui::TextWrapMode::Truncate, room);

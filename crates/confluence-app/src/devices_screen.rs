@@ -349,14 +349,29 @@ fn levels(p: &PositionState, v: &Views) -> Vec<(bool, u32, f32)> {
     out
 }
 
-/// A device's colour: the one chosen for it, else the palette entry for its
-/// lowest slot id (what the matrix uses for its bands), else its position's.
+/// The palette index a position takes by default: fixed per position, so a
+/// device keeps its colour across sessions, and spread so a usual setup
+/// (VASIO A, ASIO 1, two Windows inputs, three outputs, an app) gets eight
+/// different colours.
+pub fn position_palette(pos: PosId) -> u32 {
+    let offset = match pos.group {
+        PosGroup::Vasio | PosGroup::Vaio => 0,
+        PosGroup::Asio => 1,
+        PosGroup::WinIn => 2,
+        PosGroup::NetIn => 3,
+        PosGroup::WinOut => 4,
+        PosGroup::NetOut => 5,
+        PosGroup::App => 7,
+    };
+    (offset + pos.index as u32) % 8
+}
+
+/// A device's colour: the one chosen for it, else its position's default.
 pub fn device_color(p: &PositionState, palette: &[Color32]) -> Color32 {
     if let Some(c) = p.color {
         return Color32::from_rgb(c[0], c[1], c[2]);
     }
-    let n = p.slots.iter().copied().min().unwrap_or(p.pos.index as u32 + 1);
-    skins::palette_color(palette, n)
+    skins::palette_color(palette, position_palette(p.pos))
 }
 
 /// Shows the screen; `palette` is the colours offered for a device.
@@ -1316,12 +1331,17 @@ mod tests {
     }
 
     #[test]
-    fn a_devices_colour_defaults_from_its_lowest_slot_like_the_matrix_band() {
+    fn a_devices_colour_defaults_from_its_position_and_a_usual_setup_gets_eight() {
         let palette = skins::DEVICE_PALETTE.to_vec();
         let mut p = st("asio:1", PositionStatus::Filled { online: true });
         p.slots = vec![9, 10];
-        assert_eq!(device_color(&p, &palette), palette[9 % 8]);
+        assert_eq!(device_color(&p, &palette), palette[1]);
         p.color = Some([1, 2, 3]);
         assert_eq!(device_color(&p, &palette), Color32::from_rgb(1, 2, 3));
+        let usual = ["vasio:A", "asio:1", "win-in:1", "win-in:2", "win-out:1", "win-out:2", "win-out:3", "app:1"];
+        let mut seen: Vec<u32> = usual.iter().map(|s| position_palette(s.parse().unwrap())).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), usual.len(), "all different");
     }
 }
