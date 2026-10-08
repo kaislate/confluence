@@ -216,6 +216,12 @@ mod win {
     }
 }
 
+/// The executable path of process `pid` (Windows; `None` if it cannot be read).
+#[cfg(windows)]
+pub fn image_path(pid: u32) -> Option<String> {
+    win::image_path(pid)
+}
+
 /// What a lookup came to.
 enum Entry {
     Pending(Receiver<Option<Rgba>>),
