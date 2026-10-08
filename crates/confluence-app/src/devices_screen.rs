@@ -295,7 +295,7 @@ pub fn device_color(p: &PositionState, palette: &[Color32]) -> Color32 {
 
 /// Card size, gaps and the bays' chrome.
 pub const CARD_W: f32 = 240.0;
-pub const CARD_H: f32 = 136.0;
+pub const CARD_H: f32 = 150.0;
 pub const GAP: f32 = 14.0;
 /// Between bays.
 pub const BAY_GAP: f32 = 18.0;
@@ -696,25 +696,25 @@ fn card(
         );
     }
     // The OLED: the state line on top, the meters below.
-    let well = Rect::from_min_size(r.min + Vec2::new(12.0, 68.0), Vec2::new(w - 24.0, 58.0));
+    let well = Rect::from_min_size(r.min + Vec2::new(12.0, 66.0), Vec2::new(w - 24.0, 74.0));
     paint::oled_well(&painter, well, &skin);
     let inner = well.shrink2(Vec2::new(7.0, 5.0));
     let state_text = if f.line2.is_empty() { f.line1.clone() } else { format!("{} {}", f.line1, f.line2) };
-    let state_text: String = state_text.replace('\u{b7}', " ").replace('\u{2026}', "...").to_uppercase();
-    let state_w = crate::gear::pixel_font::width(&state_text, 1.0);
+    let state_text: String =
+        state_text.replace('\u{b7}', " ").replace('\u{2026}', "...").replace('\u{d7}', "X").to_uppercase();
     let mut text_mesh = egui::epaint::Mesh::default();
     let oled_c = paint::alpha(skin.oled, if off { 0.3 } else { 0.9 });
     if off {
         crate::gear::pixel_font::draw(&mut text_mesh, inner.left_top(), "OFF", 2.0, oled_c, false);
     } else {
-        let x = (inner.right() - state_w).max(inner.left());
-        crate::gear::pixel_font::draw(&mut text_mesh, Pos2::new(x, inner.top()), &state_text, 1.0, oled_c, false);
+        crate::gear::pixel_font::draw(&mut text_mesh, inner.left_top(), &state_text, 1.0, oled_c, false);
     }
     painter.with_clip_rect(inner).add(egui::Shape::mesh(text_mesh));
     if !off {
         let groups = device_groups(p, v);
         if !groups.is_empty() {
-            let mrect = Rect::from_min_max(Pos2::new(inner.left(), inner.top() + 2.0), inner.max);
+            // The state line has its own row; the meter fills the rest.
+            let mrect = Rect::from_min_max(Pos2::new(inner.left(), inner.top() + 9.0), inner.max);
             let mut geom = Geom::card();
             // Group labels share the top row with the state line: they win if both don't fit.
             if crate::gear::oled_meter::meter_layout(&groups, mrect, &geom).overflow {
