@@ -967,3 +967,46 @@ fn settings_work_without_an_engine() {
     settle(&mut h);
     assert_eq!(h.state().finish(), confluence_app::gear::skins::Finish::Candy);
 }
+
+#[test]
+fn the_app_picker_lists_apps_and_keeps_pid_entry_behind_advanced_options() {
+    let d = EngineDir::new("app-picker");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    let open_picker = |h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>| {
+        h.get_by_label("Devices").click();
+        pump_until(h, "APP 1", LONG, |h| h.query_by_label_contains("APP 1 \u{b7} click").is_some());
+        h.get_by_label_contains("APP 1 \u{b7} click").scroll_to_me();
+        settle(h);
+        h.get_by_label_contains("APP 1 \u{b7} click").click();
+        pump_until(h, "the app list", LONG, |h| {
+            h.query_by(|n| n.placeholder() == Some("Filter apps\u{2026}")).is_some()
+        });
+    };
+    open_picker(&mut h);
+    // This test process has no window, but the list fills from what is running.
+    pump_until(&mut h, "a running app", LONG, |h| h.query_all_by_label_contains("Capture ").next().is_some());
+    assert!(h.query_by(|n| n.placeholder() == Some("process name or PID")).is_none(), "PID entry is advanced");
+    assert!(h.query_by_label("Advanced: capture by process name or PID").is_none());
+    h.key_press(eframe::egui::Key::Escape);
+    settle(&mut h);
+    // Switch advanced options on, and the PID entry is there.
+    h.get_by_label("Settings").click();
+    pump_until(&mut h, "Settings", LONG, |h| h.query_by_label("Advanced section").is_some());
+    h.get_by_label("Advanced section").click();
+    for _ in 0..30 {
+        h.step();
+    }
+    h.get_by_label("Enable advanced options").click();
+    settle(&mut h);
+    open_picker(&mut h);
+    // The popover settles once its list is in (it opens upward here).
+    pump_until(&mut h, "the list again", LONG, |h| h.query_all_by_label_contains("Capture ").next().is_some());
+    settle(&mut h);
+    h.get_by_label("Advanced: capture by process name or PID").click();
+    pump_until(&mut h, "the PID entry", LONG, |h| {
+        h.query_by(|n| n.placeholder() == Some("process name or PID")).is_some()
+    });
+    client(&d).call(Command::Shutdown).unwrap();
+}

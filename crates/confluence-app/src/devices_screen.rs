@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use confluence_api::{
     byte_db, DeviceInfo, DeviceKind, MeterFrame, PosGroup, PosId, PositionState, PositionStatus, SlotHealth, SlotState,
 };
-use eframe::egui::{self, Align2, Color32, Id, Key, Pos2, Rect, Sense, TextEdit, Vec2, WidgetInfo, WidgetType};
+use eframe::egui::{self, Align, Align2, Color32, Id, Key, Pos2, Rect, Sense, TextEdit, Vec2, WidgetInfo, WidgetType};
 
 use crate::bays::{Bay, BayView};
 use crate::commands::Edit;
@@ -61,8 +61,14 @@ pub struct ScreenState {
     pub renaming: Option<(PosId, String)>,
     /// The last click on a card's name (a second one soon after renames it).
     pub name_click: Option<(PosId, f64)>,
-    /// App icons for app-capture cards.
+    /// App icons for app-capture cards and the app list.
     pub icons: crate::app_icon::IconCache,
+    /// The running apps, read while an Apps picker is open.
+    pub apps: Option<crate::running_apps::AppLister>,
+    /// The app list's filter.
+    pub app_filter: String,
+    /// The app picker's "capture by process name or PID" section is open.
+    pub pid_entry_open: bool,
     /// The position whose channel list is open.
     pub channels_of: Option<PosId>,
     /// Channel names being typed, by (input?, channel index).
@@ -96,6 +102,9 @@ impl Default for ScreenState {
             name_click: None,
             channels_of: None,
             icons: crate::app_icon::IconCache::default(),
+            apps: None,
+            app_filter: String::new(),
+            pid_entry_open: false,
             channel_drafts: HashMap::new(),
             led_seen: HashMap::new(),
             adding_bus: false,
@@ -507,7 +516,12 @@ pub fn show(
         });
     });
     if let Some(pos) = st.picker {
-        picker(ui.ctx(), pos, devices, &state.positions, skin, st, motion, &mut actions);
+        picker(ui.ctx(), pos, devices, &state.positions, skin, st, motion, prefs.advanced, &mut actions);
+    }
+    // The app list is read only while an Apps picker is open.
+    if st.picker.is_none_or(|p| p.group != PosGroup::App) {
+        st.apps = None;
+        st.app_filter.clear();
     }
     if let Some(pos) = st.channels_of {
         channel_editor(ui.ctx(), pos, &state.positions, &v, st, &mut actions);
@@ -1148,8 +1162,8 @@ fn held_elsewhere(d: &DeviceInfo, pos: PosId, positions: &[PositionState]) -> Op
 }
 
 /// The picker popover's width, and the most it can grow to.
-pub const POPOVER_W: f32 = 300.0;
-pub const POPOVER_MAX_H: f32 = 440.0;
+pub const POPOVER_W: f32 = 340.0;
+pub const POPOVER_MAX_H: f32 = 520.0;
 
 /// Where a popover anchored to `anchor` goes, kept inside `screen`: its
 /// top-left corner under the tray, or (true) its bottom-left corner above
@@ -1165,6 +1179,131 @@ pub fn popover_pos(anchor: Rect, screen: Rect) -> (Pos2, bool) {
     } else {
         (Pos2::new(x, screen.top() + gap), false)
     }
+}
+
+/// The app list's height in the picker.
+const APP_LIST_H: f32 = 330.0;
+
+/// The running apps, playing audio first, with a filter. Returns the
+/// executable of the app clicked.
+fn app_list(ui: &mut egui::Ui, st: &mut ScreenState, advanced: bool, skin: &GearSkin) -> Option<String> {
+    let procs = st.apps.get_or_insert_with(crate::running_apps::AppLister::open).latest();
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    ui.add(TextEdit::singleline(&mut st.app_filter).hint_text("Filter apps\u{2026}").desired_width(f32::INFINITY));
+    // Confluence itself is never a capture target.
+    let own: Vec<u32> = procs
+        .iter()
+        .filter(|p| p.exe.to_ascii_lowercase().starts_with("confluence"))
+        .map(|p| p.pid)
+        .chain([std::process::id()])
+        .collect();
+    let (playing, other) = crate::running_apps::rows(&procs, &st.app_filter, advanced, &own);
+    let mut chosen = None;
+    let heading = |ui: &mut egui::Ui, text: &str| {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(text).size(10.0).strong().color(paint::alpha(skin.ink, 0.55)));
+    };
+    // A fixed height: the popover keeps its size (and place) while the list loads.
+    let (list, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), APP_LIST_H), Sense::hover());
+    let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list).layout(egui::Layout::top_down(Align::Min)));
+    let ui = &mut list_ui;
+    egui::ScrollArea::vertical().id_salt("app-list").max_height(APP_LIST_H).auto_shrink([false, false]).show(
+        ui,
+        |ui| {
+            if procs.is_empty() {
+                ui.label(egui::RichText::new("Looking for apps\u{2026}").color(paint::alpha(skin.ink, 0.6)));
+            }
+            if !playing.is_empty() {
+                heading(ui, "PLAYING AUDIO");
+            }
+            for r in &playing {
+                if app_row(ui, r, advanced, &mut st.icons, skin) {
+                    chosen = Some(r.exe.clone());
+                }
+            }
+            if !other.is_empty() {
+                heading(ui, if advanced { "OTHER APPS AND BACKGROUND PROCESSES" } else { "OTHER APPS" });
+            }
+            for r in &other {
+                if app_row(ui, r, advanced, &mut st.icons, skin) {
+                    chosen = Some(r.exe.clone());
+                }
+            }
+            if !procs.is_empty() && playing.is_empty() && other.is_empty() {
+                ui.label(egui::RichText::new("No apps match").color(paint::alpha(skin.ink, 0.6)));
+            }
+        },
+    );
+    chosen
+}
+
+/// One app in the list: its icon, name, executable (and PID with advanced
+/// options) and, while it plays, a small level. True when clicked.
+fn app_row(
+    ui: &mut egui::Ui,
+    r: &crate::running_apps::AppRow,
+    advanced: bool,
+    icons: &mut crate::app_icon::IconCache,
+    skin: &GearSkin,
+) -> bool {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 38.0), Sense::click());
+    let label = format!("Capture {}", r.name);
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
+    if !ui.is_rect_visible(rect) {
+        return resp.clicked();
+    }
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(
+            rect,
+            egui::CornerRadius::same(8),
+            if skin.light() { Color32::from_black_alpha(14) } else { Color32::from_white_alpha(14) },
+        );
+    }
+    let icon = Rect::from_min_size(rect.min + Vec2::new(8.0, 7.0), Vec2::splat(24.0));
+    let tex = icons.get(ui.ctx(), &r.exe);
+    p.image(tex.id(), icon, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+    let ctx = ui.ctx().clone();
+    let text_w = w - 44.0 - if r.audio { 44.0 } else { 8.0 };
+    paint::truncated(
+        p,
+        rect.min + Vec2::new(40.0, 4.0),
+        Align2::LEFT_TOP,
+        &r.name,
+        paint::font(&ctx, "label-bold", 13.0),
+        skin.ink,
+        text_w,
+    );
+    let mut sub = r.exe.clone();
+    if advanced {
+        if let Some(pid) = r.pids.first() {
+            sub.push_str(&format!(" \u{b7} PID {pid}"));
+            if r.pids.len() > 1 {
+                sub.push_str(&format!(" +{}", r.pids.len() - 1));
+            }
+        }
+    }
+    paint::truncated(
+        p,
+        rect.min + Vec2::new(40.0, 21.0),
+        Align2::LEFT_TOP,
+        &sub,
+        paint::font(&ctx, "label", 10.5),
+        paint::alpha(skin.ink, 0.6),
+        text_w,
+    );
+    if r.audio {
+        // Six steps, lit by the session's peak.
+        let lit = (r.level.clamp(0.0, 1.0).sqrt() * 6.0).round() as usize;
+        for k in 0..6 {
+            let x = rect.right() - 44.0 + k as f32 * 6.0;
+            let bar = Rect::from_min_size(Pos2::new(x, rect.center().y - 5.0), Vec2::new(4.0, 10.0));
+            let c = if k < lit.max(1) { skin.ink } else { paint::alpha(skin.ink, 0.15) };
+            p.rect_filled(bar, egui::CornerRadius::same(1), c);
+        }
+    }
+    resp.clicked()
 }
 
 /// A device row in the picker; `disabled` rows say why.
@@ -1231,6 +1370,7 @@ fn picker(
     skin: &GearSkin,
     st: &mut ScreenState,
     motion: &mut Motion,
+    advanced: bool,
     actions: &mut Vec<ScreenAction>,
 ) {
     let mut open = true;
@@ -1274,17 +1414,43 @@ fn picker(
                 ui.add_space(16.0);
                 match pos.group {
                     PosGroup::App => {
-                        ui.add(
-                            TextEdit::singleline(&mut st.app_name)
-                                .hint_text("process name or PID")
-                                .desired_width(f32::INFINITY),
-                        );
-                        let name = st.app_name.trim().to_string();
-                        let b = ui
-                            .add_enabled_ui(!name.is_empty(), |ui| paint::pill_labeled(ui, "Capture", "Capture", skin))
-                            .inner;
-                        if b.clicked() && !name.is_empty() {
-                            chosen = Some((DeviceKind::AppCapture, name));
+                        let pid_entry = advanced || cfg!(not(windows));
+                        if pid_entry {
+                            // A disclosure row (open by default where there is no list).
+                            let label = "Advanced: capture by process name or PID";
+                            let open = st.pid_entry_open || cfg!(not(windows));
+                            let arrow = if open { "\u{25be}" } else { "\u{25b8}" };
+                            let row = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{arrow} {label}"))
+                                        .size(11.5)
+                                        .color(paint::alpha(skin.ink, 0.7)),
+                                )
+                                .sense(Sense::click()),
+                            );
+                            row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+                            if row.clicked() {
+                                st.pid_entry_open = !st.pid_entry_open;
+                            }
+                            if open {
+                                ui.add(
+                                    TextEdit::singleline(&mut st.app_name)
+                                        .hint_text("process name or PID")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                let name = st.app_name.trim().to_string();
+                                let b = ui
+                                    .add_enabled_ui(!name.is_empty(), |ui| {
+                                        paint::pill_labeled(ui, "Capture", "Capture", skin)
+                                    })
+                                    .inner;
+                                if b.clicked() && !name.is_empty() {
+                                    chosen = Some((DeviceKind::AppCapture, name));
+                                }
+                            }
+                        }
+                        if let Some(exe) = app_list(ui, st, advanced, skin) {
+                            chosen = Some((DeviceKind::AppCapture, exe));
                         }
                     }
                     PosGroup::NetOut => {
