@@ -3,6 +3,9 @@
 //! thread so the window never waits on the engine.
 
 pub mod app;
+pub mod app_icon;
+pub mod bays;
+pub mod bridge;
 pub mod commands;
 pub mod devices;
 pub mod devices_screen;
@@ -12,9 +15,11 @@ pub mod graph;
 pub mod grid_view;
 pub mod inspector;
 pub mod matrix;
+pub mod names;
 pub mod notify;
 pub mod pending;
 pub mod plugins;
+pub mod prefs;
 pub mod scenes;
 pub mod scripts;
 pub mod settings;

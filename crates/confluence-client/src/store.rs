@@ -57,7 +57,7 @@ pub enum Update {
     State,
     /// Only telemetry (status, health, history): it may be drawn less often.
     Telemetry,
-    /// Only meter levels (about 20 times a second).
+    /// Only meter levels (about 60 times a second).
     Meters,
 }
 
@@ -380,6 +380,11 @@ mod tests {
 
     fn slot(id: u32) -> SlotState {
         SlotState {
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+            label: None,
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
             id,
             name: format!("slot {id}"),
             device: String::new(),

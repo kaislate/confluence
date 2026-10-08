@@ -19,7 +19,7 @@ impl Subscription {
     }
 
     /// As [`connect`](Self::connect), with meter frames (`Event::Meters`)
-    /// about 20 times a second among the events.
+    /// about 60 times a second among the events.
     pub fn connect_with_meters(name: &str, timeout: Duration) -> Result<(State, Subscription), ClientError> {
         Self::start(name, timeout, Command::SubscribeMeters)
     }

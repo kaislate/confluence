@@ -237,6 +237,8 @@ pub struct ConfluenceApp {
     finish: Finish,
     styled_for: Option<Finish>,
     settings_open: bool,
+    /// How meters and names are shown, and the meter bridge.
+    prefs: crate::prefs::ViewPrefs,
     motion: Motion,
     /// Engine notices and when they were first seen (they toast once).
     notices_seen: HashMap<String, Instant>,
@@ -321,6 +323,7 @@ impl ConfluenceApp {
             finish: Finish::default(),
             styled_for: None,
             settings_open: false,
+            prefs: crate::prefs::ViewPrefs::default(),
             motion: Motion::default(),
             notices_seen: HashMap::new(),
             routes_seen: HashSet::new(),
@@ -491,7 +494,8 @@ impl ConfluenceApp {
 
         let graphs = self.inspector_open && matches!(self.selection, Selection::Slot(_));
         self.graphs_live.store(graphs, Ordering::Relaxed);
-        self.meters_live.store(self.screen == Screen::Devices, Ordering::Relaxed);
+        // Meters are on screen on the Devices screen and in the popped-out bridge.
+        self.meters_live.store(self.screen == Screen::Devices || self.prefs.bridge.popped, Ordering::Relaxed);
         self.rail(ui, &view, now);
         self.scene_rail(ui, &view);
         self.side_panels(ui, &view, now);
@@ -507,6 +511,12 @@ impl ConfluenceApp {
                     self.devices_screen(ui, &view);
                 }
             }
+        }
+        if self.prefs.bridge.popped {
+            let skin = self.skin();
+            crate::bridge::popout(&ctx, &view, &skin, &mut self.prefs, &mut self.motion);
+        } else {
+            crate::bridge::docked(&ctx);
         }
         self.notifications(&ctx, &view, now);
         self.dialogs(&ctx, &view);
@@ -694,6 +704,21 @@ impl ConfluenceApp {
     }
 
     /// The gear finish chosen in Settings.
+    /// How meters and names are shown, and the meter bridge.
+    pub fn prefs(&self) -> &crate::prefs::ViewPrefs {
+        &self.prefs
+    }
+
+    /// Docks the meter bridge back from its own window.
+    pub fn close_popout(&mut self) {
+        self.prefs.bridge.popped = false;
+    }
+
+    /// Restores the preferences saved last time (see [`crate::prefs::PREFS_KEY`]).
+    pub fn set_prefs(&mut self, prefs: crate::prefs::ViewPrefs) {
+        self.prefs = prefs;
+    }
+
     pub fn finish(&self) -> Finish {
         self.finish
     }
@@ -718,14 +743,24 @@ impl ConfluenceApp {
         let skin = self.skin();
         let palette = self.look.skin.slot_colors.clone();
         let list = view.state.as_ref().map(|s| s.devices.clone()).unwrap_or_default();
-        let (screen_state, motion) = (&mut self.screen_state, &mut self.motion);
+        let (screen_state, motion, prefs) = (&mut self.screen_state, &mut self.motion, &mut self.prefs);
         let actions = egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 paint::ground(ui.painter(), ui.max_rect(), &skin);
                 let inner = ui.max_rect().shrink2(Vec2::new(0.0, 0.0));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
-                crate::devices_screen::show(&mut child, view, &list, &skin, &palette, screen_state, motion, editable)
+                crate::devices_screen::show(
+                    &mut child,
+                    view,
+                    &list,
+                    &skin,
+                    &palette,
+                    screen_state,
+                    motion,
+                    prefs,
+                    editable,
+                )
             })
             .inner;
         for a in actions {
@@ -814,7 +849,7 @@ impl ConfluenceApp {
     fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
         if self.settings_open {
             let mut reduce = self.motion.reduce;
-            crate::settings::show(ctx, &mut self.settings_open, &mut self.finish, &mut reduce);
+            crate::settings::show(ctx, &mut self.settings_open, &mut self.finish, &mut reduce, &mut self.prefs);
             self.motion.reduce = reduce;
         }
         if let (true, Some(state)) = (self.scripts_open, view.state.as_ref()) {
@@ -1026,6 +1061,7 @@ impl eframe::App for ConfluenceApp {
         storage.set_string(INSPECTOR_KEY, self.inspector_open.to_string());
         storage.set_string(crate::settings::FINISH_KEY, self.finish.name().to_string());
         storage.set_string(crate::settings::REDUCE_MOTION_KEY, self.motion.reduce.to_string());
+        storage.set_string(crate::prefs::PREFS_KEY, self.prefs.to_storage());
     }
 }
 

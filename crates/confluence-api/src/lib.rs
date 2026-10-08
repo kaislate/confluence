@@ -12,7 +12,7 @@ pub use positions::*;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 10;
+pub const API_VERSION: u16 = 11;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -184,10 +184,43 @@ pub enum Command {
     SetMaster {
         pos: Option<PosId>,
     },
-    /// As `Subscribe`, plus meter frames about 20 times a second.
+    /// As `Subscribe`, plus meter frames about 60 times a second.
     SubscribeMeters,
     /// Clears every latched clip indicator.
     ClearClip,
+    /// Names a slot's device (`channel: None`; all its slots share the name)
+    /// or one of its channels. `None` or a blank name clears it. Kept with
+    /// the device's position, like its colour.
+    SetSlotLabel {
+        id: u32,
+        channel: Option<ChannelRef>,
+        name: Option<String>,
+    },
+    /// A name as the journal keeps it (`key`: as for `SetColor`, plus
+    /// `/in/<n>` or `/out/<n>` for a channel, 1-based).
+    SetLabel {
+        key: String,
+        name: Option<String>,
+    },
+}
+
+/// One channel of a slot: an input or an output, 0-based.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelRef {
+    pub input: bool,
+    pub index: u32,
+}
+
+/// The longest custom name, in characters.
+pub const MAX_LABEL: usize = 64;
+
+/// A custom name as kept: trimmed, at most [`MAX_LABEL`] characters; blank is none.
+pub fn clean_label(name: Option<&str>) -> Option<String> {
+    let t = name?.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(t.chars().take(MAX_LABEL).collect())
 }
 
 /// A colour: red, green, blue.
@@ -316,6 +349,8 @@ impl Command {
                 | Command::DeleteScript { .. }
                 | Command::SetSlotColor { .. }
                 | Command::SetColor { .. }
+                | Command::SetSlotLabel { .. }
+                | Command::SetLabel { .. }
         )
     }
 }
@@ -356,6 +391,21 @@ pub struct SlotState {
     /// first send column).
     #[serde(default)]
     pub color: Option<Rgb>,
+    /// The device's name for each input channel (e.g. an ASIO driver's).
+    #[serde(default)]
+    pub input_names: Vec<String>,
+    /// The device's name for each output channel.
+    #[serde(default)]
+    pub output_names: Vec<String>,
+    /// The custom name given to this slot's device.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Custom names given to its input channels (one per channel).
+    #[serde(default)]
+    pub input_labels: Vec<Option<String>>,
+    /// Custom names given to its output channels.
+    #[serde(default)]
+    pub output_labels: Vec<Option<String>>,
 }
 
 /// The `device` of an insert bus slot.
@@ -719,7 +769,7 @@ pub fn byte_db(b: u8) -> f32 {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
-    /// Levels, about 20 times a second, to `SubscribeMeters` clients only.
+    /// Levels, about 60 times a second, to `SubscribeMeters` clients only.
     Meters(MeterFrame),
     /// Versioned: `version` is the previous version + 1.
     Changed { version: u64, changes: Vec<Change> },
@@ -892,7 +942,57 @@ mod tests {
         }
         // Positions persist in devices.json (like AddDevice), not the journal.
         assert!(cmds.iter().all(|c| !c.is_mutation()));
-        assert_eq!(API_VERSION, 10);
+        assert_eq!(API_VERSION, 11);
+    }
+
+    #[test]
+    fn label_commands_come_after_clear_clip_and_round_trip() {
+        let clear = postcard::to_allocvec(&Command::ClearClip).unwrap()[0];
+        let cmds = [
+            Command::SetSlotLabel {
+                id: 3,
+                channel: Some(ChannelRef { input: true, index: 2 }),
+                name: Some("Kick".into()),
+            },
+            Command::SetLabel { key: "pos:asio:1/in/3".into(), name: None },
+        ];
+        for (i, c) in cmds.iter().enumerate() {
+            let b = postcard::to_allocvec(c).unwrap();
+            assert_eq!(b[0], clear + 1 + i as u8, "{c:?} keeps its index");
+            assert_eq!(&postcard::from_bytes::<Command>(&b).unwrap(), c);
+        }
+    }
+
+    #[test]
+    fn slots_carry_channel_names_and_labels() {
+        let s = SlotState {
+            id: 1,
+            name: "GoXLR".into(),
+            device: "asio:GoXLR".into(),
+            role: ClockRole::Soft,
+            online: true,
+            first_input: 0,
+            inputs: 2,
+            first_output: 0,
+            outputs: 0,
+            color: None,
+            input_names: vec!["Mic".into(), "Chat".into()],
+            output_names: Vec::new(),
+            label: Some("Desk".into()),
+            input_labels: vec![Some("Voice".into()), None],
+            output_labels: Vec::new(),
+        };
+        let b = postcard::to_allocvec(&s).unwrap();
+        assert_eq!(postcard::from_bytes::<SlotState>(&b).unwrap(), s);
+    }
+
+    #[test]
+    fn labels_are_trimmed_capped_and_empty_means_none() {
+        assert_eq!(clean_label(Some("  a  ")), Some("a".to_string()));
+        assert_eq!(clean_label(Some("   ")), None);
+        assert_eq!(clean_label(None), None);
+        let long = "é".repeat(70);
+        assert_eq!(clean_label(Some(&long)).unwrap().chars().count(), MAX_LABEL);
     }
 
     #[test]
@@ -921,6 +1021,11 @@ mod tests {
     #[test]
     fn a_bus_slot_is_recognised_by_its_device() {
         let s = SlotState {
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+            label: None,
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
             id: 1,
             name: "Reverb".into(),
             device: BUS_DEVICE.into(),

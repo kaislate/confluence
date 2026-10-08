@@ -177,6 +177,20 @@ pub fn rounded_shade(p: &Painter, r: Rect, radius: f32, vertex: impl Fn(Pos2, f3
     p.add(Shape::mesh(plain_mesh(p, r, radius, vertex)));
 }
 
+/// A texture painted over a rounded rectangle and clipped to its corners:
+/// `uv` maps each point to the texture (outside 0..1 samples the texture's
+/// edge, so give it a transparent border), `tint` multiplies it.
+pub fn textured_rounded(
+    p: &Painter,
+    r: Rect,
+    radius: f32,
+    texture: egui::TextureId,
+    uv: impl Fn(Pos2) -> Pos2,
+    tint: Color32,
+) {
+    p.add(Shape::mesh(ring_mesh(p, r, radius, Some(texture), uv, |_, _, _| tint)));
+}
+
 /// White at `white` over black at `black` (both 0..1), premultiplied.
 fn light_dark(white: f32, black: f32) -> Color32 {
     let w = (white.clamp(0.0, 1.0) * 255.0).round();

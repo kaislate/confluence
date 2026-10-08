@@ -305,7 +305,7 @@ fn a_store_says_what_kind_of_update_it_made() {
 }
 
 #[test]
-fn meter_frames_arrive_about_twenty_times_a_second_only_when_asked_for() {
+fn meter_frames_arrive_about_sixty_times_a_second_only_when_asked_for() {
     let dir = tempfile::tempdir().unwrap();
     let pipe = format!("confluence-meters-{}", std::process::id());
     let _engine = spawn(&pipe, dir.path());
@@ -319,7 +319,7 @@ fn meter_frames_arrive_about_twenty_times_a_second_only_when_asked_for() {
             frames += 1;
         }
     }
-    assert!((12..=30).contains(&frames), "{frames} meter frames in a second");
+    assert!((40..=75).contains(&frames), "{frames} meter frames in a second");
     // The plain subscriber got telemetry, never meters.
     let t = std::time::Instant::now();
     while t.elapsed() < Duration::from_millis(300) {

@@ -416,11 +416,18 @@ pub fn show(
                 if y > left.min.y && y < left.max.y {
                     let lit = focus_row == Some(band.start + k as usize);
                     let what = if band.bus { "return" } else { "in" };
+                    // A channel's custom name, else its number.
+                    let text = band
+                        .channel_labels
+                        .get(k as usize)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| format!("{what} {}", k + 1));
                     paint::truncated(
                         &lp,
                         Pos2::new(left.max.x - 8.0, y),
                         Align2::RIGHT_CENTER,
-                        &format!("{what} {}", k + 1),
+                        &text,
                         number_font.clone(),
                         paint::alpha(ink, if lit { 1.0 } else { 0.55 }),
                         HEADER_W - RAIL - 12.0,

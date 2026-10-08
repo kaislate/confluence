@@ -141,6 +141,56 @@ enum Cmd {
     Meters,
     /// Reset the latched clip indicators.
     ClearClip,
+    /// Give slot SLOT's device a custom name (or with --in N / --out N one of
+    /// its channels); --clear removes it.
+    Name {
+        slot: u32,
+        #[arg(long = "in", value_parser = parse_channel, conflicts_with = "output")]
+        input: Option<u32>,
+        #[arg(long = "out", value_parser = parse_channel)]
+        output: Option<u32>,
+        #[arg(long, conflicts_with = "text")]
+        clear: bool,
+        #[arg(required_unless_present = "clear")]
+        text: Option<String>,
+    },
+    /// List the custom names given to devices and channels.
+    Names,
+}
+
+/// A channel number as typed (1-based), as an index.
+fn parse_channel(s: &str) -> Result<u32, String> {
+    match s.trim().parse::<u32>() {
+        Ok(n) if n >= 1 => Ok(n - 1),
+        _ => Err(format!("{s}: channels are numbered from 1")),
+    }
+}
+
+/// Every custom name, device by device.
+fn render_names(slots: &[confluence_api::SlotState]) -> String {
+    let mut lines = Vec::new();
+    for s in slots {
+        let mut mine = Vec::new();
+        if let Some(l) = &s.label {
+            mine.push(format!("#{} {}: {l}", s.id, s.name));
+        }
+        for (dir, labels, names) in
+            [("in", &s.input_labels, &s.input_names), ("out", &s.output_labels, &s.output_names)]
+        {
+            for (i, l) in labels.iter().enumerate() {
+                if let Some(l) = l {
+                    let device = names.get(i).map(String::as_str).unwrap_or("");
+                    mine.push(format!("  #{} {dir} {} ({device}): {l}", s.id, i + 1));
+                }
+            }
+        }
+        lines.extend(mine);
+    }
+    if lines.is_empty() {
+        "no custom names".into()
+    } else {
+        lines.join("\n")
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -256,6 +306,14 @@ impl Cmd {
             Cmd::Master { pos } => Command::SetMaster { pos: pos.0 },
             Cmd::Meters => Command::SubscribeMeters,
             Cmd::ClearClip => Command::ClearClip,
+            Cmd::Name { slot, input, output, clear, ref text } => Command::SetSlotLabel {
+                id: slot,
+                channel: input
+                    .map(|index| confluence_api::ChannelRef { input: true, index })
+                    .or(output.map(|index| confluence_api::ChannelRef { input: false, index })),
+                name: if clear { None } else { text.clone() },
+            },
+            Cmd::Names => Command::Subscribe,
         }
     }
 }
@@ -574,6 +632,10 @@ fn main() -> ExitCode {
             println!("{}", render_scripts(&s));
             ExitCode::SUCCESS
         }
+        Ok(Response::Snapshot(s)) if matches!(cli.command, Cmd::Names) => {
+            println!("{}", render_names(&s.slots));
+            ExitCode::SUCCESS
+        }
         Ok(Response::Snapshot(s)) if matches!(cli.command, Cmd::Positions) => {
             println!("{}", render_positions(&s.positions));
             ExitCode::SUCCESS
@@ -708,7 +770,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use confluence_api::{Change, EngineStatus, Event, PointState, SlotHealth};
+    use confluence_api::{Change, EngineStatus, Event, PointState, SlotHealth, SlotState};
 
     #[test]
     fn positions_render_one_line_each() {
@@ -740,6 +802,59 @@ mod tests {
             "vasio:A    On (DAW: Ableton Live 12 Suite)  8x2  slots [3]
 asio:1     Filled  GoXLR ASIO Driver  slots [1, 2]  MASTER"
         );
+    }
+
+    #[test]
+    fn name_commands_parse() {
+        let parse = |a: &[&str]| {
+            let mut v = vec!["confluence-cli"];
+            v.extend_from_slice(a);
+            Cli::try_parse_from(v).map(|c| c.command.to_command())
+        };
+        let ch = |input, index| Some(confluence_api::ChannelRef { input, index });
+        assert_eq!(
+            parse(&["name", "3", "Kick drum"]).unwrap(),
+            Command::SetSlotLabel { id: 3, channel: None, name: Some("Kick drum".into()) }
+        );
+        assert_eq!(
+            parse(&["name", "3", "--in", "2", "Snare"]).unwrap(),
+            Command::SetSlotLabel { id: 3, channel: ch(true, 1), name: Some("Snare".into()) },
+            "channels are typed 1-based"
+        );
+        assert_eq!(
+            parse(&["name", "3", "--out", "1", "--clear"]).unwrap(),
+            Command::SetSlotLabel { id: 3, channel: ch(false, 0), name: None }
+        );
+        assert!(parse(&["name", "3", "--in", "0", "x"]).is_err(), "channel 0 does not exist");
+        assert!(parse(&["name", "3"]).is_err(), "a name or --clear is needed");
+        assert_eq!(parse(&["names"]).unwrap(), Command::Subscribe);
+    }
+
+    #[test]
+    fn names_render_devices_and_channels() {
+        let mut s = SlotState {
+            id: 5,
+            name: "VASIO 1".into(),
+            device: "vasio:1:2x2".into(),
+            role: confluence_api::ClockRole::Strict,
+            online: true,
+            first_input: 0,
+            inputs: 2,
+            first_output: 0,
+            outputs: 2,
+            color: None,
+            input_names: vec!["DAW out 1".into(), "DAW out 2".into()],
+            output_names: vec!["DAW in 1".into(), "DAW in 2".into()],
+            label: Some("Ableton".into()),
+            input_labels: vec![Some("Kick".into()), None],
+            output_labels: vec![None, None],
+        };
+        let text = render_names(&[s.clone()]);
+        assert!(text.contains("#5 VASIO 1: Ableton"), "{text}");
+        assert!(text.contains("in 1 (DAW out 1): Kick"), "{text}");
+        s.label = None;
+        s.input_labels = vec![None, None];
+        assert_eq!(render_names(&[s]), "no custom names");
     }
 
     #[test]

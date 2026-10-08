@@ -4,7 +4,9 @@
 
 pub mod knob_maps;
 pub mod motion;
+pub mod oled_meter;
 pub mod paint;
+pub mod pixel_font;
 pub mod skins;
 
 use eframe::egui::{self, Color32, CornerRadius, FontData, FontFamily, Stroke};

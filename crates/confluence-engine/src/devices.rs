@@ -139,6 +139,25 @@ enum Loaded {
 /// One direction of a placement: its first channel, and the move its routes make.
 type DirectionPlace = (Option<u32>, Option<(u32, u32, u32)>);
 
+/// `word 1`, `word 2`, … for `n` channels.
+fn numbered(word: &str, n: usize) -> Vec<String> {
+    (1..=n).map(|i| format!("{word} {i}")).collect()
+}
+
+/// Channel names for a Windows device of `channels` channels, by speaker
+/// position (the standard layouts), else numbered.
+pub fn speaker_names(channels: usize) -> Vec<String> {
+    let names: &[&str] = match channels {
+        1 => &["Mono"],
+        2 => &["L", "R"],
+        4 => &["FL", "FR", "RL", "RR"],
+        6 => &["FL", "FR", "C", "LFE", "SL", "SR"],
+        8 => &["FL", "FR", "C", "LFE", "RL", "RR", "SL", "SR"],
+        n => return numbered("Ch", n),
+    };
+    names.iter().map(|s| s.to_string()).collect()
+}
+
 /// A loaded device's (inputs, outputs), where known before it is attached.
 fn loaded_shape(kind: DeviceKind, name: &str, loaded: &Loaded) -> Option<(u32, u32)> {
     match loaded {
@@ -1536,6 +1555,7 @@ impl DeviceManager {
                     );
                     let (id, mut side) = engine.add_soft_output(&spec).map_err(|e| e.to_string())?;
                     binding.outputs = f.channels as u32;
+                    engine.set_channel_names(id, Vec::new(), speaker_names(f.channels));
                     (id, Handler::Render(Box::new(move |buf: &mut [f32], now| side.read_interleaved(buf, now))))
                 } else {
                     let spec = self.soft_spec(
@@ -1548,6 +1568,7 @@ impl DeviceManager {
                     );
                     let (id, mut side) = engine.add_soft_input(&spec).map_err(|e| e.to_string())?;
                     binding.inputs = f.channels as u32;
+                    engine.set_channel_names(id, speaker_names(f.channels), Vec::new());
                     (id, Handler::Capture(Box::new(move |buf: &[f32], now| side.write_interleaved(buf, now))))
                 };
                 if let Err(e) = stream.start(handler) {
@@ -1639,6 +1660,7 @@ impl DeviceManager {
             rate: Some(stream_rate as u32),
             ..binding_of(kind, name)
         };
+        engine.set_channel_names(id, numbered("Ch", channels), Vec::new());
         Ok(Bound { binding, slots: vec![id], handles: vec![Handle::NetReceive(h)], pos: None })
     }
 
@@ -1691,6 +1713,7 @@ impl DeviceManager {
             rate: None,
         };
         let handles = stats.map(Handle::Vasio).into_iter().collect();
+        engine.set_channel_names(id, numbered("DAW out", daw_outputs), numbered("DAW in", daw_inputs));
         Ok(Bound { binding, slots: vec![id], handles, pos: None })
     }
 
@@ -1735,6 +1758,7 @@ impl DeviceManager {
             rate: None,
         };
         let handles = stats.map(Handle::Vaio).into_iter().collect();
+        engine.set_channel_names(id, vec!["App L".into(), "App R".into()], Vec::new());
         Ok(Bound { binding, slots: vec![id], handles, pos: None })
     }
 
@@ -1761,6 +1785,7 @@ impl DeviceManager {
             let spec =
                 self.soft_spec(format!("{name} in"), device.clone(), ins, rate, block, at.map(|b| b.first_input));
             let (id, side) = engine.add_soft_input(&spec).map_err(|e| e.to_string())?;
+            engine.set_channel_names(id, info.input_names.clone(), Vec::new());
             slots.push(id);
             dev_in = Some(side);
         }
@@ -1768,6 +1793,7 @@ impl DeviceManager {
             let spec = self.soft_spec(format!("{name} out"), device, outs, rate, block, at.map(|b| b.first_output));
             match engine.add_soft_output(&spec) {
                 Ok((id, side)) => {
+                    engine.set_channel_names(id, Vec::new(), info.output_names.clone());
                     slots.push(id);
                     dev_out = Some(side);
                 }
@@ -1850,6 +1876,7 @@ pub fn start_asio_master(
         first_output: placement.map(|p| p.1),
     };
     let (id, ch) = engine.add_master_slot(&spec).map_err(|e| e.to_string())?;
+    engine.set_channel_names(id, info.input_names.clone(), info.output_names.clone());
     let callback = move |io: &mut AsioIo<'_>| {
         for c in 0..ch.inputs {
             io.read_input(c, audio.inputs_mut().channel_mut(ch.first_input + c));
