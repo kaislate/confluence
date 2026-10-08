@@ -907,3 +907,24 @@ fn the_meter_bridge_pops_out_and_docks_back() {
     assert!(!h.state().prefs().bridge.popped);
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_sixteen_channel_vasio_gets_a_double_card() {
+    let d = EngineDir::new("double");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let on = |pos: &str, shape| Command::SetVirtual { pos: pos.parse().unwrap(), on: true, shape: Some(shape) };
+    let r = c.call(on("vasio:B", (16, 16))).unwrap();
+    assert!(matches!(r, Response::Applied { .. }), "VASIO B 16x16: {r:?}");
+    assert!(matches!(c.call(on("vasio:A", (8, 8))).unwrap(), Response::Applied { .. }), "VASIO A 8x8");
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "the meters", LONG, |h| h.query_by_label("Channels of VASIO B").is_some());
+    settle(&mut h);
+    let wide = h.get_by_label("Channels of VASIO B").rect().width();
+    let single = h.get_by_label("Channels of VASIO A").rect().width();
+    assert!(wide > 400.0, "16x16 takes a double card: its meter is {wide} wide");
+    assert!(single < 220.0, "8x8 stays single: its meter is {single} wide");
+    c.call(Command::Shutdown).unwrap();
+}

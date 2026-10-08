@@ -129,10 +129,40 @@ pub fn pack_bays(widths: &[f32], avail: f32, gap: f32) -> Vec<Vec<usize>> {
     rows
 }
 
+/// Where cards of `spans` columns go in a bay at most `max_cols` wide: each
+/// card's (row, column), in order, a card that does not fit the rest of a
+/// row starting the next; then the columns used and the rows. Spans wider
+/// than the bay are clamped to it.
+pub fn place_cards(spans: &[usize], max_cols: usize) -> (Vec<(usize, usize)>, usize, usize) {
+    let max_cols = max_cols.max(1);
+    let (mut row, mut col, mut used) = (0usize, 0usize, 0usize);
+    let mut at = Vec::with_capacity(spans.len());
+    for &s in spans {
+        let s = s.clamp(1, max_cols);
+        if col > 0 && col + s > max_cols {
+            row += 1;
+            col = 0;
+        }
+        at.push((row, col));
+        col += s;
+        used = used.max(col);
+    }
+    (at, used.max(1), row + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use confluence_api::{all_positions, PositionDevice};
+
+    #[test]
+    fn cards_with_spans_pack_row_by_row() {
+        assert_eq!(place_cards(&[2, 1, 1, 1], 4), (vec![(0, 0), (0, 2), (0, 3), (1, 0)], 4, 2));
+        assert_eq!(place_cards(&[1, 2, 2], 3), (vec![(0, 0), (0, 1), (1, 0)], 3, 2));
+        assert_eq!(place_cards(&[2], 1), (vec![(0, 0)], 1, 1), "a double card in a one-column bay");
+        assert_eq!(place_cards(&[1, 1], 4), (vec![(0, 0), (0, 1)], 2, 1), "a bay is as wide as its cards");
+        assert_eq!(place_cards(&[], 4), (vec![], 1, 1));
+    }
 
     fn st(pos: &str, status: PositionStatus) -> PositionState {
         PositionState {

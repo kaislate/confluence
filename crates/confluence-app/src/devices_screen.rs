@@ -313,21 +313,52 @@ pub fn device_color(p: &PositionState, palette: &[Color32]) -> Color32 {
 }
 
 /// Card size, gaps and the bays' chrome.
-pub const CARD_W: f32 = 240.0;
+pub const CARD_W: f32 = 220.0;
 pub const CARD_H: f32 = 150.0;
-pub const GAP: f32 = 14.0;
+pub const GAP: f32 = 12.0;
 /// Between bays.
-pub const BAY_GAP: f32 = 18.0;
+pub const BAY_GAP: f32 = 14.0;
+/// The OLED well's inset from the card's sides, and the meter's from the well's.
+const WELL_INSET: f32 = 8.0;
+const METER_INSET: f32 = 5.0;
+/// The width a single card's meter has.
+pub const CARD_METER_W: f32 = CARD_W - 2.0 * (WELL_INSET + METER_INSET);
 /// A bay's padding and its header strip.
 pub const BAY_PAD: f32 = 12.0;
 pub const BAY_HEADER: f32 = 30.0;
 /// Content is centred and capped at this width on very wide windows.
 pub const CONTENT_MAX: f32 = 1760.0;
 
-/// A bay's size for `n` cards when at most `max_cols` fit across.
-pub fn bay_size(n: usize, max_cols: usize) -> Vec2 {
-    let cols = n.clamp(1, max_cols.max(1));
-    let rows = n.div_ceil(cols).max(1);
+/// How many columns a card takes: two when its meter, at full card bars,
+/// is wider than a single card's meter. Worked out from the segment
+/// geometry whatever the style, so switching style never moves cards.
+pub fn card_span(groups: &[Group]) -> usize {
+    let full = Geom::card().resolve(crate::gear::oled_meter::MeterStyle::Segments, 1.0, 50.0);
+    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(CARD_METER_W, 50.0));
+    if crate::gear::oled_meter::meter_layout(groups, r, &full).overflow {
+        2
+    } else {
+        1
+    }
+}
+
+/// The span of position `p`'s card (empty and switched-off cards are single).
+fn span_of(p: &PositionState, v: &Views) -> usize {
+    if crate::bays::vacant(p) || matches!(p.status, PositionStatus::Off) {
+        1
+    } else {
+        card_span(&device_groups(p, v))
+    }
+}
+
+/// The width of a card `span` columns wide.
+fn card_width(span: usize) -> f32 {
+    span as f32 * CARD_W + span.saturating_sub(1) as f32 * GAP
+}
+
+/// A bay's size for `cols` columns and `rows` rows of cards.
+pub fn bay_size(cols: usize, rows: usize) -> Vec2 {
+    let (cols, rows) = (cols.max(1), rows.max(1));
     Vec2::new(
         cols as f32 * CARD_W + (cols - 1) as f32 * GAP + 2.0 * BAY_PAD,
         BAY_HEADER + rows as f32 * CARD_H + (rows - 1) as f32 * GAP + BAY_PAD,
@@ -449,7 +480,15 @@ pub fn show(
             let left = ui.max_rect().left() + (full - width) / 2.0;
             let max_cols = (((width - 2.0 * BAY_PAD + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
             let views = crate::bays::bay_views(&state.positions, &st.expanded);
-            let sizes: Vec<Vec2> = views.iter().map(|b| bay_size(b.cards.len(), max_cols)).collect();
+            let spans: Vec<Vec<usize>> =
+                views.iter().map(|b| b.cards.iter().map(|p| span_of(p, &v)).collect()).collect();
+            let sizes: Vec<Vec2> = spans
+                .iter()
+                .map(|s| {
+                    let (_, cols, rows) = crate::bays::place_cards(s, max_cols);
+                    bay_size(cols, rows)
+                })
+                .collect();
             let widths: Vec<f32> = sizes.iter().map(|s| s.x).collect();
             ui.add_space(8.0);
             for row in crate::bays::pack_bays(&widths, width, BAY_GAP) {
@@ -458,7 +497,7 @@ pub fn show(
                 let mut x = left;
                 for i in row {
                     let r = Rect::from_min_size(Pos2::new(x, band.top()), sizes[i]);
-                    bay(ui, r, &views[i], max_cols, &v, skin, palette, st, motion, prefs, &mut actions);
+                    bay(ui, r, &views[i], &spans[i], max_cols, &v, skin, palette, st, motion, prefs, &mut actions);
                     x += sizes[i].x + BAY_GAP;
                 }
             }
@@ -579,6 +618,7 @@ fn bay(
     ui: &mut egui::Ui,
     r: Rect,
     bv: &BayView,
+    spans: &[usize],
     max_cols: usize,
     v: &Views,
     skin: &GearSkin,
@@ -634,11 +674,11 @@ fn bay(
             }
         }
     }
-    let cols = bv.cards.len().clamp(1, max_cols.max(1));
-    for (k, pos) in bv.cards.iter().enumerate() {
-        let (row, col) = (k / cols, k % cols);
+    let (places, _, _) = crate::bays::place_cards(spans, max_cols);
+    for ((pos, &(row, col)), &span) in bv.cards.iter().zip(&places).zip(spans) {
         let at = r.min + Vec2::new(BAY_PAD + col as f32 * (CARD_W + GAP), BAY_HEADER + row as f32 * (CARD_H + GAP));
-        card(ui, Rect::from_min_size(at, Vec2::new(CARD_W, CARD_H)), pos, v, skin, palette, st, motion, prefs, actions);
+        let w = card_width(span.clamp(1, max_cols.max(1)));
+        card(ui, Rect::from_min_size(at, Vec2::new(w, CARD_H)), pos, v, skin, palette, st, motion, prefs, actions);
     }
 }
 
@@ -874,9 +914,9 @@ fn card(
         );
     }
     // The OLED: the state line on top, the meters below.
-    let well = Rect::from_min_size(r.min + Vec2::new(12.0, 66.0), Vec2::new(w - 24.0, 74.0));
+    let well = Rect::from_min_size(r.min + Vec2::new(WELL_INSET, 66.0), Vec2::new(w - 2.0 * WELL_INSET, 74.0));
     paint::oled_well(&painter, well, &skin);
-    let inner = well.shrink2(Vec2::new(7.0, 5.0));
+    let inner = well.shrink2(Vec2::new(METER_INSET, 5.0));
     if prefs.meter.style == crate::gear::oled_meter::MeterStyle::DotMatrix && !off {
         // The display's own pixel grid, behind its text and meters.
         crate::gear::oled_meter::dot_grid(&painter.with_clip_rect(well.shrink(2.0)), well.shrink(2.0), inner.height());
@@ -1380,6 +1420,34 @@ fn name_to_send(draft: &str, current: &str, edited: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn io(ins: usize, outs: usize) -> Vec<Group> {
+        let chans = |n: usize| (0..n).map(|i| Chan { number: i as u32 + 1, ..Chan::silent() }).collect::<Vec<_>>();
+        [("IN", ins), ("OUT", outs)]
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(l, n)| Group { label: format!("{l} {n}"), channels: chans(n) })
+            .collect()
+    }
+
+    #[test]
+    fn many_channel_devices_take_double_cards() {
+        for (ins, outs) in [(2, 0), (8, 8), (0, 2), (0, 8)] {
+            assert_eq!(card_span(&io(ins, outs)), 1, "{ins}x{outs}");
+        }
+        for (ins, outs) in [(16, 16), (23, 10)] {
+            assert_eq!(card_span(&io(ins, outs)), 2, "{ins}x{outs}");
+        }
+        // Whatever the style or scale, a single card's meter holds what card_span gave it.
+        use crate::gear::oled_meter::{fit_geom, meter_layout, MeterStyle};
+        for style in MeterStyle::all() {
+            let g = io(8, 8);
+            let full = Geom::card().resolve(style, 1.0, 50.0);
+            assert_eq!(fit_geom(&g, CARD_METER_W, full), full, "{style:?}: an 8x8 card keeps full bars at 100 %");
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(CARD_METER_W, 50.0));
+            assert!(!meter_layout(&g, r, &full).overflow);
+        }
+    }
 
     #[test]
     fn a_channel_name_is_sent_only_when_edited_and_changed() {
