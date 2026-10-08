@@ -569,10 +569,26 @@ pub fn pill_tinted(ui: &mut Ui, label: &str, accessible: &str, tint: Color32, s:
     pill_full(ui, label, accessible, s, false, Some(tint))
 }
 
+/// Pills drawn while this is set are compact (card headers): see [`compact_pills`].
+fn compact_id() -> egui::Id {
+    egui::Id::new("paint-compact-pills")
+}
+
+/// Draws `add`'s pills compact: smaller text, padding and height, for rows
+/// with little room (a card's header).
+pub fn compact_pills<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.ctx().data_mut(|d| d.insert_temp(compact_id(), true));
+    let r = add(ui);
+    ui.ctx().data_mut(|d| d.remove::<bool>(compact_id()));
+    r
+}
+
 fn pill_full(ui: &mut Ui, label: &str, accessible: &str, s: &GearSkin, lit: bool, tint: Option<Color32>) -> Response {
-    let f = font(ui.ctx(), "label-bold", 12.0);
+    let compact = ui.ctx().data(|d| d.get_temp::<bool>(compact_id())).unwrap_or(false);
+    let (size, pad, h) = if compact { (11.0, 12.0, PILL_H - 4.0) } else { (12.0, 18.0, PILL_H) };
+    let f = font(ui.ctx(), "label-bold", size);
     let galley = ui.painter().layout_no_wrap(label.to_string(), f.clone(), s.ink);
-    let size = Vec2::new(galley.size().x + 18.0, PILL_H);
+    let size = Vec2::new(galley.size().x + pad, h);
     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
     let enabled = ui.is_enabled();
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, accessible));

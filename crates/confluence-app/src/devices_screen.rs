@@ -979,37 +979,39 @@ fn card(
     row.spacing_mut().item_spacing.x = 5.0;
     let label = p.pos.label();
     let virt = p.pos.group.is_virtual();
-    if let Some(c) = st.confirm.filter(|c| c.pos == p.pos) {
-        row.set_opacity(1.0);
-        confirm_strip(&mut row, c, &skin, st, actions);
-    } else if off {
-        if paint::pill_labeled(&mut row, "Turn on", &format!("Turn on {label}"), &skin).clicked() {
-            st.just_filled.insert(p.pos);
-            actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: None }));
-        }
-    } else {
-        if let Some(&slot) = p.slots.first() {
-            colour_menu(&mut row, slot, &label, colour, palette, &skin, actions);
-        }
-        if virt {
-            if p.pos.group == PosGroup::Vasio {
-                shape_menu(&mut row, p, &skin, actions);
-            }
-            if paint::pill_labeled(&mut row, "Off", &format!("Turn off {label}"), &skin).clicked() {
-                st.confirm = Some(Confirm { pos: p.pos, clear: false, at: now });
+    paint::compact_pills(&mut row, |row| {
+        if let Some(c) = st.confirm.filter(|c| c.pos == p.pos) {
+            row.set_opacity(1.0);
+            confirm_strip(row, c, &skin, st, actions);
+        } else if off {
+            if paint::pill_labeled(row, "Turn on", &format!("Turn on {label}"), &skin).clicked() {
+                st.just_filled.insert(p.pos);
+                actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: None }));
             }
         } else {
-            if paint::pill_labeled(&mut row, "Clear\u{2026}", &format!("Clear {label}"), &skin).clicked() {
-                st.confirm = Some(Confirm { pos: p.pos, clear: true, at: now });
+            if let Some(&slot) = p.slots.first() {
+                colour_menu(row, slot, &label, colour, palette, &skin, actions);
             }
-            if p.pos.group == PosGroup::Asio
-                && !p.master
-                && paint::pill_labeled(&mut row, "Master", &format!("Make {label} master"), &skin).clicked()
-            {
-                actions.push(ScreenAction::Edit(Edit::SetMaster { pos: Some(p.pos) }));
+            if virt {
+                if p.pos.group == PosGroup::Vasio {
+                    shape_menu(row, p, &skin, actions);
+                }
+                if paint::pill_labeled(row, "Off", &format!("Turn off {label}"), &skin).clicked() {
+                    st.confirm = Some(Confirm { pos: p.pos, clear: false, at: now });
+                }
+            } else {
+                if paint::pill_labeled(row, "Clear\u{2026}", &format!("Clear {label}"), &skin).clicked() {
+                    st.confirm = Some(Confirm { pos: p.pos, clear: true, at: now });
+                }
+                if p.pos.group == PosGroup::Asio
+                    && !p.master
+                    && paint::pill_labeled(row, "Master", &format!("Make {label} master"), &skin).clicked()
+                {
+                    actions.push(ScreenAction::Edit(Edit::SetMaster { pos: Some(p.pos) }));
+                }
             }
         }
-    }
+    });
     if resp.clicked() && !off {
         if ui.input(|i| i.modifiers.command) && !virt {
             st.open_picker(p.pos, true, r);
