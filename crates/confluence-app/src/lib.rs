@@ -3,6 +3,7 @@
 //! thread so the window never waits on the engine.
 
 pub mod app;
+pub mod app_icon;
 pub mod bays;
 pub mod bridge;
 pub mod commands;

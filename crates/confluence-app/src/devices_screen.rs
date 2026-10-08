@@ -61,6 +61,8 @@ pub struct ScreenState {
     pub renaming: Option<(PosId, String)>,
     /// The last click on a card's name (a second one soon after renames it).
     pub name_click: Option<(PosId, f64)>,
+    /// App icons for app-capture cards.
+    pub icons: crate::app_icon::IconCache,
     /// The position whose channel list is open.
     pub channels_of: Option<PosId>,
     /// Channel names being typed, by (input?, channel index).
@@ -92,6 +94,7 @@ impl Default for ScreenState {
             renaming: None,
             name_click: None,
             channels_of: None,
+            icons: crate::app_icon::IconCache::default(),
             channel_drafts: HashMap::new(),
             led_seen: HashMap::new(),
             adding_bus: false,
@@ -742,6 +745,20 @@ fn card(
         paint::panel_lifted(&lit_painter, r, &lit, None, lift, paint::PANEL_RADIUS);
     }
     let w = r.width();
+    // An app's icon, painted on the card's corner like a badge.
+    let badge = p.pos.group == PosGroup::App && !off;
+    if let (true, Some(d)) = (badge, p.device.as_ref()) {
+        let tex = st.icons.get(ui.ctx(), &d.name);
+        let (c, side, angle) = crate::app_icon::badge_rect(r);
+        paint::textured_rounded(
+            &painter,
+            r,
+            paint::PANEL_RADIUS as f32,
+            tex.id(),
+            |q| crate::app_icon::badge_uv(q, c, side, angle),
+            crate::app_icon::BADGE_TINT,
+        );
+    }
     // Row 1: the LED, the position tag, a master tag; the controls on the right.
     let led_at = r.min + Vec2::new(17.0, 19.0);
     let now = motion.now();
@@ -882,10 +899,10 @@ fn card(
     }
     // The controls, top right: faint until the card is hovered.
     let quiet = motion.spring(id.with("controls"), if hovered || off { 1.0 } else { 0.38 }, SETTLE);
-    let controls = Rect::from_min_max(
-        Pos2::new(r.left() + 70.0, r.top() + 7.0),
-        Pos2::new(r.right() - 10.0, r.top() + 7.0 + paint::PILL_H),
-    );
+    // (Left of an app's badge.)
+    let right = r.right() - if badge { 44.0 } else { 10.0 };
+    let controls =
+        Rect::from_min_max(Pos2::new(r.left() + 70.0, r.top() + 7.0), Pos2::new(right, r.top() + 7.0 + paint::PILL_H));
     let mut row = ui
         .new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::right_to_left(egui::Align::Center)));
     row.set_opacity(quiet);

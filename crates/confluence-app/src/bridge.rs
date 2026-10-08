@@ -108,6 +108,9 @@ pub fn show_bridge(
     popped: bool,
 ) -> BridgeResponse {
     let mut out = BridgeResponse::default();
+    // Its controls sit on the black display: the dark finish's pills read there.
+    let dark = GearSkin::preset(crate::gear::skins::Finish::Graphite);
+    let pills = &dark;
     // The docked bridge and its window have their own ids (both draw on the frame it pops out).
     let id = Id::new(("meter-bridge", popped));
     let p = ui.painter_at(r.expand(4.0));
@@ -119,14 +122,14 @@ pub fn show_bridge(
     let mut row = ui
         .new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::right_to_left(egui::Align::Center)));
     row.spacing_mut().item_spacing.x = 5.0;
-    if !popped && paint::pill_labeled(&mut row, "Hide", "Collapse meter bridge", skin).clicked() {
+    if !popped && paint::pill_labeled(&mut row, "Hide", "Collapse meter bridge", pills).clicked() {
         prefs.shown = false;
     }
     let (pop_text, pop_label) = if popped { ("Dock", "Dock meters") } else { ("Pop out", "Pop out meters") };
-    if paint::pill_labeled(&mut row, pop_text, pop_label, skin).clicked() {
+    if paint::pill_labeled(&mut row, pop_text, pop_label, pills).clicked() {
         out.toggle_popout = true;
     }
-    let menu = paint::pill_labeled(&mut row, "Channels", "Bridge channels", skin);
+    let menu = paint::pill_labeled(&mut row, "Channels", "Bridge channels", pills);
     egui::Popup::menu(&menu).show(|ui| {
         ui.set_min_width(220.0);
         for d in all {
