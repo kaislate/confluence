@@ -897,11 +897,9 @@ fn card(
         if !groups.is_empty() {
             // The state line has its own row; the meter fills the rest.
             let mrect = Rect::from_min_max(Pos2::new(inner.left(), inner.top() + 9.0), inner.max);
-            let mut geom = Geom::card();
-            // Group labels share the top row with the state line: they win if both don't fit.
-            if crate::gear::oled_meter::meter_layout(&groups, mrect, &geom).overflow {
-                geom = Geom { bar_w: 2.0, gap: 1.0, ..geom };
-            }
+            let ppp = ui.ctx().pixels_per_point();
+            let full = Geom::card().resolve(prefs.meter.style, ppp, mrect.height());
+            let geom = crate::gear::oled_meter::fit_geom(&groups, mrect.width(), full);
             let m =
                 crate::gear::oled_meter::meter_widget(ui, id.with("meter"), mrect, &groups, &geom, prefs.meter, motion);
             let what = format!("Channels of {}", p.pos.label());

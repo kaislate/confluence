@@ -84,16 +84,97 @@ pub struct Geom {
     pub readout: bool,
     /// Points per font pixel for the readout.
     pub readout_px: f32,
+    /// Dot columns per bar in the dot-matrix style.
+    pub dot_cols: usize,
+    /// Set by [`resolve`](Self::resolve) for the dot-matrix: (dot px, gap px,
+    /// pixels per point). Bars are then whole dot columns, a whole number of
+    /// dot cells apart.
+    pub dot: Option<(u32, u32, f32)>,
 }
 
 impl Geom {
     pub fn card() -> Geom {
-        Geom { bar_w: 4.0, gap: 2.0, group_gap: 7.0, scale: false, readout: true, readout_px: 1.0 }
+        Geom {
+            bar_w: 8.0,
+            gap: 3.0,
+            group_gap: 10.0,
+            scale: false,
+            readout: true,
+            readout_px: 1.0,
+            dot_cols: 3,
+            dot: None,
+        }
     }
 
     pub fn bridge() -> Geom {
-        Geom { bar_w: 5.0, gap: 2.0, group_gap: 9.0, scale: true, readout: false, readout_px: 2.0 }
+        Geom {
+            bar_w: 11.0,
+            gap: 3.0,
+            group_gap: 12.0,
+            scale: true,
+            readout: false,
+            readout_px: 2.0,
+            dot_cols: 4,
+            dot: None,
+        }
     }
+
+    /// This geometry for `style` on a screen with `ppp` pixels per point,
+    /// bars about `height` tall: the dot-matrix takes its bar width and gaps
+    /// from whole dot cells; the other styles are unchanged.
+    pub fn resolve(self, style: MeterStyle, ppp: f32, height: f32) -> Geom {
+        if style != MeterStyle::DotMatrix {
+            return Geom { dot: None, ..self };
+        }
+        let (d, g) = PixelGrid { ppp }.dots_px(height);
+        self.with_dots(self.dot_cols, d, g, ppp, true)
+    }
+
+    /// Bars `cols` dots wide; `spaced` leaves one empty dot column between bars.
+    fn with_dots(self, cols: usize, d: u32, g: u32, ppp: f32, spaced: bool) -> Geom {
+        let (dot, gap) = (d as f32 / ppp, g as f32 / ppp);
+        let cell = dot + gap;
+        let bar_w = dot_bar_width(cols, dot, gap);
+        let bar_gap = if spaced { gap + cell } else { gap };
+        // Groups start a whole number of cells after the previous group's last bar.
+        let cells = ((bar_w + self.group_gap) / cell).ceil().max(2.0);
+        Geom { bar_w, gap: bar_gap, group_gap: cells * cell - bar_w, dot_cols: cols, dot: Some((d, g, ppp)), ..self }
+    }
+}
+
+/// The width the bars of `groups` take with `g`.
+fn bars_width(groups: &[Group], g: &Geom) -> f32 {
+    let counts: Vec<usize> = groups.iter().map(|gr| gr.channels.len()).filter(|&n| n > 0).collect();
+    counts.iter().map(|&n| n as f32 * (g.bar_w + g.gap) - g.gap).sum::<f32>()
+        + g.group_gap * counts.len().saturating_sub(1) as f32
+}
+
+/// `g` if the meter fits `width`; otherwise narrower bars that do. The
+/// dot-matrix drops dot columns (down to one), then the empty column between
+/// bars, then shrinks to one-pixel dots; the other styles narrow their bars
+/// evenly (down to one point) with tighter gaps.
+pub fn fit_geom(groups: &[Group], width: f32, g: Geom) -> Geom {
+    let fits = |c: &Geom| bars_width(groups, c) <= width + 0.01;
+    if fits(&g) {
+        return g;
+    }
+    if let Some((d, gp, ppp)) = g.dot {
+        let mut tries: Vec<Geom> = (1..g.dot_cols).rev().map(|cols| g.with_dots(cols, d, gp, ppp, true)).collect();
+        tries.push(g.with_dots(1, d, gp, ppp, false));
+        tries.push(g.with_dots(1, 1, 1, ppp, false));
+        let last = tries[tries.len() - 1];
+        return tries.into_iter().find(|c| fits(c)).unwrap_or(last);
+    }
+    let n: usize = groups.iter().map(|gr| gr.channels.len()).sum();
+    let k = groups.iter().filter(|gr| !gr.channels.is_empty()).count();
+    if n == 0 {
+        return g;
+    }
+    let gap = g.gap.min(1.0);
+    let group_gap = g.group_gap.min(4.0);
+    let room = width - (n - k) as f32 * gap - k.saturating_sub(1) as f32 * group_gap;
+    let bar_w = ((room / n as f32 * 4.0).floor() / 4.0).clamp(1.0, g.bar_w);
+    Geom { bar_w, gap, group_gap, ..g }
 }
 
 /// One bar: which group and channel, and where.
@@ -122,6 +203,8 @@ pub struct MeterLayout {
     pub width_used: f32,
     /// The bars need more width than there is.
     pub overflow: bool,
+    /// The dot-matrix's (dot px, gap px), from the geometry.
+    pub dot: Option<(u32, u32)>,
 }
 
 /// Rows of the layout, top to bottom, in points.
@@ -213,6 +296,7 @@ pub fn meter_layout(groups: &[Group], r: Rect, g: &Geom) -> MeterLayout {
         readout,
         width_used: bars_w,
         overflow: left + bars_w > r.right() + 0.01,
+        dot: g.dot.map(|(d, gap, _)| (d, gap)),
     }
 }
 
@@ -304,6 +388,13 @@ pub fn dot_bar_width(cols: usize, dot: f32, gap: f32) -> f32 {
     cols * dot + (cols - 1.0) * gap
 }
 
+/// How many dot columns a bar `width` points wide holds. Counted from the
+/// width, not the edges: a bar's left edge rounds onto the dot grid, and an
+/// edge test would then drop its last column.
+pub fn dot_columns(width: f32, ppp: f32, dot_px: u32, gap_px: u32) -> usize {
+    ((width * ppp + gap_px as f32) / (dot_px + gap_px) as f32).round().max(1.0) as usize
+}
+
 /// The faint pixel grid of an OLED behind the dot-matrix, over `r`: one quad
 /// with a repeating one-dot texture, anchored to the screen so it lines up
 /// with the meters' dots.
@@ -357,12 +448,12 @@ pub fn paint_meter(p: &egui::Painter, l: &MeterLayout, groups: &[Group], levels:
             MeterStyle::DotMatrix => {
                 // Square dots on the screen's pixel grid (the same grid as
                 // `dot_grid`): cells `pitch` pixels apart from the origin.
-                let (dot_px, gap_px) = grid.dots_px(r.height());
+                let (dot_px, gap_px) = l.dot.unwrap_or_else(|| grid.dots_px(r.height()));
                 let pitch_px = (dot_px + gap_px) as f32;
                 let ppp = grid.ppp;
                 let cell = |v: f32| v * pitch_px / ppp;
-                let (dot_pt, x0, x1) = (dot_px as f32 / ppp, (r.left() * ppp / pitch_px).round(), r.right() * ppp);
-                let cols = (((x1 - x0 * pitch_px - dot_px as f32) / pitch_px).floor() + 1.0).max(1.0) as usize;
+                let (dot_pt, x0) = (dot_px as f32 / ppp, (r.left() * ppp / pitch_px).round());
+                let cols = dot_columns(r.width(), ppp, dot_px, gap_px);
                 let top = (r.top() * ppp / pitch_px).ceil();
                 let bottom = ((r.bottom() * ppp - dot_px as f32) / pitch_px).floor();
                 let n = ((bottom - top) + 1.0).max(1.0) as usize;
@@ -417,7 +508,24 @@ pub fn paint_meter(p: &egui::Painter, l: &MeterLayout, groups: &[Group], levels:
         }
         let clipped = groups.get(b.group).and_then(|g| g.channels.get(b.chan)).is_some_and(|c| c.clipped);
         if let Some(c) = l.clips.get(i) {
-            m.add_colored_rect(*c, if clipped { clip_on } else { dim(0.06) });
+            let colour = if clipped { clip_on } else { dim(0.06) };
+            if dot {
+                let (dot_px, gap_px) = l.dot.unwrap_or_else(|| grid.dots_px(r.height()));
+                let pitch_px = (dot_px + gap_px) as f32;
+                let ppp = grid.ppp;
+                let cell = |v: f32| v * pitch_px / ppp;
+                let x0 = (c.left() * ppp / pitch_px).round();
+                let y = cell((c.top() * ppp / pitch_px).round());
+                let cols = ((c.width() * ppp + gap_px as f32) / pitch_px).round().max(1.0) as usize;
+                for k in 0..cols {
+                    m.add_colored_rect(
+                        Rect::from_min_size(Pos2::new(cell(x0 + k as f32), y), Vec2::splat(dot_px as f32 / ppp)),
+                        colour,
+                    );
+                }
+            } else {
+                m.add_colored_rect(*c, colour);
+            }
         }
     }
     // Text: in the pixel font for segments and dots (it is on the same display).
@@ -537,6 +645,17 @@ mod tests {
     }
 
     #[test]
+    fn a_dot_bar_draws_every_column_it_was_laid_out_with() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let (d, g) = PixelGrid { ppp }.dots_px(60.0);
+            for cols in 1..=4 {
+                let w = dot_bar_width(cols, d as f32 / ppp, g as f32 / ppp);
+                assert_eq!(dot_columns(w, ppp, d, g), cols, "ppp {ppp}, {cols} columns");
+            }
+        }
+    }
+
+    #[test]
     fn a_dot_bar_is_whole_dot_columns() {
         assert_eq!(dot_bar_width(3, 2.0, 1.0), 8.0);
         assert_eq!(dot_bar_width(4, 2.0, 1.0), 11.0);
@@ -589,17 +708,45 @@ mod tests {
     }
 
     #[test]
-    fn a_33_channel_interface_fits_a_card_at_the_narrow_bar() {
-        let g = groups(23, 10);
-        assert!(!meter_layout(&g, rect(216.0, 60.0), &Geom::card()).overflow);
-        let fat = Geom { bar_w: 8.0, ..Geom::card() };
-        assert!(meter_layout(&g, rect(216.0, 60.0), &fat).overflow);
+    fn card_and_bridge_bars_are_8_and_11_points() {
+        let g = groups(2, 2);
+        let seg = |geom: Geom| meter_layout(&g, rect(400.0, 60.0), &geom.resolve(MeterStyle::Segments, 1.0, 60.0));
+        assert_eq!(seg(Geom::card()).bars[0].rect.width(), 8.0);
+        assert_eq!(seg(Geom::bridge()).bars[0].rect.width(), 11.0);
+        // Dot-matrix: whole columns of 2 px dots and 1 px gaps (3 and 4 of them).
+        let dot = |geom: Geom| meter_layout(&g, rect(400.0, 60.0), &geom.resolve(MeterStyle::DotMatrix, 1.0, 60.0));
+        assert_eq!(dot(Geom::card()).bars[0].rect.width(), 8.0);
+        assert_eq!(dot(Geom::bridge()).bars[0].rect.width(), 11.0);
+        // Bars are a whole number of dot cells apart, so every bar sits on the grid.
+        let l = dot(Geom::card());
+        let step = l.bars[1].rect.left() - l.bars[0].rect.left();
+        assert!((step / 3.0 - (step / 3.0).round()).abs() < 1e-4, "{step}");
+    }
+
+    #[test]
+    fn a_64_channel_meter_narrows_to_fit_and_never_overflows() {
+        let g = groups(32, 32);
+        for w in [196.0, 432.0] {
+            for style in MeterStyle::all() {
+                for ppp in [1.0, 1.5] {
+                    let geom = fit_geom(&g, w, Geom::card().resolve(style, ppp, 60.0));
+                    let l = meter_layout(&g, rect(w, 60.0), &geom);
+                    assert!(!l.overflow, "{w} {style:?} {ppp}: {geom:?}");
+                    assert!(l.bars[0].rect.width() * ppp >= 1.0 - 1e-4, "{w} {style:?} {ppp}");
+                }
+            }
+        }
+        // A meter that fits keeps its full bars.
+        let small = groups(2, 2);
+        let full = Geom::card().resolve(MeterStyle::Segments, 1.0, 60.0);
+        assert_eq!(fit_geom(&small, 196.0, full), full);
     }
 
     #[test]
     fn channel_numbers_thin_out_but_keep_the_first_and_last() {
         let g = groups(23, 0);
-        let l = meter_layout(&g, rect(400.0, 60.0), &Geom::card());
+        // Narrow bars (a meter squeezed by `fit_geom`): 6 pt apart.
+        let l = meter_layout(&g, rect(400.0, 60.0), &Geom { bar_w: 4.0, gap: 2.0, ..Geom::card() });
         let numbers: Vec<&str> = l.numbers.iter().map(|n| n.1.as_str()).collect();
         assert!(numbers.len() < 23, "two-digit numbers do not fit every 6 px");
         assert_eq!(numbers.first(), Some(&"1"));

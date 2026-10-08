@@ -166,11 +166,17 @@ pub fn show_bridge(
     // The devices: laid out left to right, wrapping onto further lines.
     let content =
         Rect::from_min_max(Pos2::new(r.left() + 12.0, r.top() + 8.0), Pos2::new(r.right() - 12.0, r.bottom() - 8.0));
+    // One geometry per device (resolved for the style and screen, narrowed
+    // only if a device alone is wider than the bridge), used to measure and draw.
+    let ppp = ui.ctx().pixels_per_point();
+    let base = Geom::bridge().resolve(look.style, ppp, content.height());
+    let geoms: Vec<Geom> =
+        shown.iter().map(|d| oled_meter::fit_geom(&d.groups, content.width() - 16.0, base)).collect();
     let widths: Vec<f32> = shown
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let g = Geom { scale: false, ..Geom::bridge() };
+            let g = Geom { scale: false, ..geoms[i] };
             let w = oled_meter::meter_layout(&d.groups, Rect::from_min_size(Pos2::ZERO, Vec2::new(1.0e6, 60.0)), &g)
                 .width_used;
             w.max(name_width(&p, &d.name)) + if i == 0 { 16.0 } else { 0.0 }
@@ -200,7 +206,7 @@ pub fn show_bridge(
         let mut x = content.left();
         for (k, &i) in line.iter().enumerate() {
             let d = &shown[i];
-            let geom = Geom { scale: k == 0, ..Geom::bridge() };
+            let geom = Geom { scale: k == 0, ..geoms[i] };
             let scale_w = if k == 0 { 16.0 } else { 0.0 };
             let meter_w = widths[i] - if i == 0 { 16.0 } else { 0.0 } + scale_w;
             let dev = Rect::from_min_size(Pos2::new(x, top), Vec2::new(meter_w.max(20.0), line_h));
