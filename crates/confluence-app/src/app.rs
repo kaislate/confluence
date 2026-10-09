@@ -176,12 +176,15 @@ pub fn flag(args: &[String], name: &str) -> Option<String> {
 
 /// The cell size at which `cols` × `rows` cells fit `area` (the cell area,
 /// headers excluded), within the zoom range.
-pub fn fit_cell(area: Vec2, rows: usize, cols: usize) -> f32 {
+/// `rows` and `cols` are (channels, devices): each device's separator strip
+/// takes its room first.
+pub fn fit_cell(area: Vec2, (rows, row_bands): (usize, usize), (cols, col_bands): (usize, usize)) -> f32 {
     if rows == 0 || cols == 0 {
         return crate::matrix::CELL_DEFAULT;
     }
-    let by_w = area.x / cols as f32;
-    let by_h = area.y / rows as f32;
+    let sep = crate::matrix::SEP;
+    let by_w = (area.x - col_bands as f32 * sep) / cols as f32;
+    let by_h = (area.y - row_bands as f32 * sep) / rows as f32;
     by_w.min(by_h).floor().clamp(crate::matrix::CELL_MIN, crate::matrix::CELL_MAX)
 }
 
@@ -495,6 +498,7 @@ impl ConfluenceApp {
         self.graphs_live.store(graphs, Ordering::Relaxed);
         // Meters are on screen on the Devices screen and in the popped-out bridge.
         self.meters_live.store(self.screen == Screen::Devices || self.prefs.bridge.popped, Ordering::Relaxed);
+        shell::edge_resize(&ctx);
         self.rail(ui, &view, now);
         self.scene_rail(ui, &view);
         self.side_panels(ui, &view, now);
@@ -565,7 +569,8 @@ impl ConfluenceApp {
         if zero {
             if let Some(state) = &self.view.state {
                 let l = GridLayout::new(&state.slots, self.cell);
-                self.cell = fit_cell(self.matrix_area, l.rows.len, l.cols.len);
+                self.cell =
+                    fit_cell(self.matrix_area, (l.rows.len, l.rows.bands.len()), (l.cols.len, l.cols.bands.len()));
             }
         }
     }
@@ -616,15 +621,51 @@ impl ConfluenceApp {
             |ui| {
                 let r = ui.max_rect();
                 shell::rail_face(ui.painter(), r, &skin);
+                // The rail is the title bar: drag it to move the window,
+                // double-click to maximize. (Registered first: the pills on
+                // it take their own clicks.)
+                let ctx = ui.ctx().clone();
+                let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                let drag = ui.interact(r, egui::Id::new("title-drag"), egui::Sense::click_and_drag());
+                let press = ctx.input(|i| i.pointer.press_origin());
+                let at_edge = press.is_some_and(|p| {
+                    !maximized && shell::resize_dir(ctx.content_rect(), p, shell::RESIZE_BAND).is_some()
+                });
+                // The rail's controls, as laid out last frame: a press there is theirs.
+                let blocked: Vec<Rect> = ctx.data(|d| d.get_temp(egui::Id::new("title-blocked"))).unwrap_or_default();
+                let free = press.is_some_and(|p| shell::may_drag_window(p, &blocked, at_edge));
+                if drag.drag_started() && free {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if drag.double_clicked() && free {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
                 let inner = Rect::from_min_max(r.min + Vec2::new(10.0, 6.0), r.max - Vec2::new(10.0, 8.0));
                 let mut row =
                     ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
                 row.spacing_mut().item_spacing.x = 6.0;
                 shell::wordmark(&mut row, &skin);
+                let tabs_from = row.cursor().min.x;
                 shell::segmented(&mut row, &skin, screen);
+                let tabs = Rect::from_min_max(
+                    Pos2::new(tabs_from, inner.top()),
+                    Pos2::new(row.cursor().min.x, inner.bottom()),
+                );
                 row.add_space(14.0);
                 shell::engine_cluster(&mut row, &skin, motion, &text, status.as_ref(), flashing, dsp_warn);
-                row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let controls = row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    match shell::window_buttons(ui, &skin, maximized) {
+                        Some(shell::WindowAction::Minimize) => {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                        Some(shell::WindowAction::ToggleMaximized) => {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+                        Some(shell::WindowAction::Close) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        None => {}
+                    }
+                    ui.add_space(10.0);
                     ui.spacing_mut().item_spacing.x = 6.0;
                     for (open, label) in [(scripts, "Scripts…"), (inspector, "Inspector")] {
                         let resp = paint::pill_lit(ui, label, label, *open, &skin);
@@ -634,6 +675,8 @@ impl ConfluenceApp {
                         }
                     }
                 });
+                let right = controls.response.rect;
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("title-blocked"), vec![tabs, right]));
             },
         );
         self.banner(ui, view, now);
@@ -762,6 +805,11 @@ impl ConfluenceApp {
         });
         self.finish = finish;
         self.motion.reduce = reduce;
+    }
+
+    /// The matrix's scroll offset (grid points).
+    pub fn matrix_scroll(&self) -> Vec2 {
+        self.grid_state.offset
     }
 
     /// The screen shown.
@@ -1016,6 +1064,7 @@ impl ConfluenceApp {
                 &lookup,
                 selected,
                 &fresh,
+                &self.routes_seen,
                 editable,
             );
             if let Some(z) = actions.zoom {
@@ -1210,9 +1259,15 @@ mod tests {
 
     #[test]
     fn fit_picks_the_cell_that_shows_the_whole_grid() {
-        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), 20, 30), 26.0, "limited by the width: 800 / 30");
-        assert_eq!(fit_cell(Vec2::new(800.0, 200.0), 20, 10), 12.0, "clamped at the minimum");
-        assert_eq!(fit_cell(Vec2::new(8000.0, 6000.0), 2, 2), crate::matrix::CELL_MAX);
-        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), 0, 5), crate::matrix::CELL_DEFAULT);
+        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), (20, 0), (30, 0)), 26.0, "limited by the width: 800 / 30");
+        let strips = crate::matrix::SEP * 4.0;
+        assert_eq!(
+            fit_cell(Vec2::new(800.0 + strips, 600.0), (20, 1), (30, 4)),
+            26.0,
+            "the separator strips take their room first"
+        );
+        assert_eq!(fit_cell(Vec2::new(800.0, 200.0), (20, 0), (10, 0)), 12.0, "clamped at the minimum");
+        assert_eq!(fit_cell(Vec2::new(8000.0, 6000.0), (2, 0), (2, 0)), crate::matrix::CELL_MAX);
+        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), (0, 0), (5, 0)), crate::matrix::CELL_DEFAULT);
     }
 }

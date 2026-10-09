@@ -823,7 +823,7 @@ fn custom_names_survive_an_engine_that_is_killed_and_a_compaction() {
     let mut engine = spawn(&pipe, &journal);
     let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
-    let vasio = slots.iter().find(|s| s.name == "VASIO 1").expect("a fresh setup has VASIO A").id;
+    let vasio = slots.iter().find(|s| s.name == "VASIO A").expect("a fresh setup has VASIO A").id;
     let set = |name: &str, channel| Command::SetSlotLabel { id: vasio, channel, name: Some(name.into()) };
     let ch = Some(confluence_api::ChannelRef { input: true, index: 0 });
     assert!(matches!(c.call(set("Ableton", None)).unwrap(), Response::Applied { .. }));
@@ -833,7 +833,7 @@ fn custom_names_survive_an_engine_that_is_killed_and_a_compaction() {
     let mut c = Client::connect(&pipe, Duration::from_secs(10)).unwrap();
     let names = |c: &mut Client| {
         let Response::Slots(slots) = c.call(Command::ListSlots).unwrap() else { panic!() };
-        let s = slots.into_iter().find(|s| s.name == "VASIO 1").unwrap();
+        let s = slots.into_iter().find(|s| s.name == "VASIO A").unwrap();
         (s.label, s.input_labels.first().cloned().flatten())
     };
     assert_eq!(names(&mut c), (Some("Ableton".into()), Some("Kick".into())));

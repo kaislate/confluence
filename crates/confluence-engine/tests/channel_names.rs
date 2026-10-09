@@ -85,7 +85,7 @@ fn a_vasio_names_what_the_daw_sends_and_receives() {
     let mut d = DeviceManager::new(None);
     let on = Command::SetVirtual { pos: "vasio:C".parse().unwrap(), on: true, shape: Some((2, 2)) };
     assert_eq!(d.handle(&mut e, &on), Some(Response::Ok));
-    let s = e.slots().into_iter().find(|s| s.name == "VASIO 3").unwrap();
+    let s = e.slots().into_iter().find(|s| s.name == "VASIO C").unwrap();
     assert_eq!(s.input_names, vec!["DAW out 1", "DAW out 2"]);
     assert_eq!(s.output_names, vec!["DAW in 1", "DAW in 2"]);
 }

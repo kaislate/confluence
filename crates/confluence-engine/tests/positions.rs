@@ -102,7 +102,7 @@ fn a_vasio_turns_on_and_off_repeatedly_without_leaving_anything_behind() {
         assert!(matches!(d.handle(&mut e, &off), Some(Response::Ok)));
         assert_eq!(status(&d, &e, "vasio:B"), PositionStatus::Off);
     }
-    assert!(e.slots().iter().all(|s| !s.name.starts_with("VASIO 2")), "no stray slot");
+    assert!(e.slots().iter().all(|s| !s.name.starts_with("VASIO B")), "no stray slot");
 }
 
 #[test]
@@ -267,4 +267,19 @@ fn a_device_with_no_room_anywhere_is_refused_and_the_old_one_stays() {
     assert_eq!(d.positions(&e).into_iter().find(|s| s.pos == p("asio:1")).unwrap().device.unwrap().name, "fake:a");
     assert_eq!(status(&d, &e, "asio:1"), PositionStatus::Filled { online: true });
     assert_eq!(e.points_in(Some((0, 4096)), None).len(), 1, "its route is kept");
+}
+
+#[test]
+fn virtual_devices_are_named_by_their_position() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None);
+    // (VAIO needs its driver to switch on; its naming is unit-tested in devices.rs.)
+    for (pos, want) in [("vasio:B", "VASIO B"), ("vasio:H", "VASIO H")] {
+        let on = Command::SetVirtual { pos: p(pos), on: true, shape: Some((2, 2)) };
+        assert!(matches!(d.handle(&mut e, &on), Some(Response::Ok)), "{pos}");
+        let names: Vec<String> = e.slots().iter().map(|s| s.name.clone()).collect();
+        assert!(names.iter().any(|n| n == want), "{pos}: {names:?}");
+    }
+    assert!(e.slots().iter().all(|s| !s.name.starts_with("VASIO 2") && !s.name.starts_with("VAIO 1")));
 }

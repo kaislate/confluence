@@ -17,7 +17,12 @@ fn main() -> eframe::Result {
     let config = AppConfig { engine_args: engine_args(&pipe, &default_pipe), pipe, engine_exe, skin };
     let options = eframe::NativeOptions {
         persist_window: true,
-        viewport: egui::ViewportBuilder::default().with_title("Confluence").with_inner_size([1100.0, 700.0]),
+        // The app draws its own title bar (spec: round 4 §7).
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Confluence")
+            .with_inner_size([1100.0, 700.0])
+            .with_min_inner_size([640.0, 420.0])
+            .with_decorations(false),
         ..Default::default()
     };
     let result = eframe::run_native(

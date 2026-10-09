@@ -107,6 +107,129 @@ pub fn wordmark(ui: &mut egui::Ui, s: &GearSkin) {
     );
 }
 
+/// What a window button asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowAction {
+    Minimize,
+    /// Maximize, or restore when maximized.
+    ToggleMaximized,
+    Close,
+}
+
+/// The window's own minimize, maximize/restore and close buttons, drawn in
+/// the app's style (the native title bar is off). Add them to a
+/// right-to-left row: close ends up rightmost.
+pub fn window_buttons(ui: &mut egui::Ui, s: &GearSkin, maximized: bool) -> Option<WindowAction> {
+    let mut out = None;
+    let ink = s.ground_ink;
+    let red = Color32::from_rgb(0xe8, 0x3b, 0x3b);
+    let buttons = [
+        (WindowAction::Close, "Close"),
+        (WindowAction::ToggleMaximized, if maximized { "Restore" } else { "Maximize" }),
+        (WindowAction::Minimize, "Minimize"),
+    ];
+    for (action, label) in buttons {
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(36.0, 28.0), Sense::click());
+        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+        let p = ui.painter();
+        let hover = resp.hovered();
+        if hover {
+            let fill = if action == WindowAction::Close { red } else { paint::alpha(ink, 0.12) };
+            p.rect_filled(r, egui::CornerRadius::same(7), fill);
+        }
+        let c = r.center();
+        let stroke = egui::Stroke::new(1.4, if hover && action == WindowAction::Close { Color32::WHITE } else { ink });
+        match action {
+            WindowAction::Minimize => {
+                p.line_segment([c + Vec2::new(-5.0, 0.5), c + Vec2::new(5.0, 0.5)], stroke);
+            }
+            WindowAction::ToggleMaximized if maximized => {
+                let back = Rect::from_center_size(c + Vec2::new(1.5, -1.5), Vec2::splat(8.0));
+                let front = Rect::from_center_size(c + Vec2::new(-1.0, 1.0), Vec2::splat(8.0));
+                p.rect_stroke(back, egui::CornerRadius::same(1), stroke, egui::StrokeKind::Middle);
+                p.rect_filled(front, egui::CornerRadius::same(1), s.ground);
+                p.rect_stroke(front, egui::CornerRadius::same(1), stroke, egui::StrokeKind::Middle);
+            }
+            WindowAction::ToggleMaximized => {
+                let sq = Rect::from_center_size(c, Vec2::splat(10.0));
+                p.rect_stroke(sq, egui::CornerRadius::same(1), stroke, egui::StrokeKind::Middle);
+            }
+            WindowAction::Close => {
+                p.line_segment([c + Vec2::new(-5.0, -5.0), c + Vec2::new(5.0, 5.0)], stroke);
+                p.line_segment([c + Vec2::new(-5.0, 5.0), c + Vec2::new(5.0, -5.0)], stroke);
+            }
+        }
+        if resp.clicked() {
+            out = Some(action);
+        }
+    }
+    out
+}
+
+/// The resize direction for pointer `p` within `band` points of the
+/// window's edges (corners win), or `None` away from them.
+pub fn resize_dir(window: Rect, p: Pos2, band: f32) -> Option<egui::ResizeDirection> {
+    use egui::ResizeDirection as D;
+    if !window.contains(p) {
+        return None;
+    }
+    let (w, e) = (p.x - window.left() < band, window.right() - p.x < band);
+    let (n, s) = (p.y - window.top() < band, window.bottom() - p.y < band);
+    match (n, s, w, e) {
+        (true, _, true, _) => Some(D::NorthWest),
+        (true, _, _, true) => Some(D::NorthEast),
+        (_, true, true, _) => Some(D::SouthWest),
+        (_, true, _, true) => Some(D::SouthEast),
+        (true, ..) => Some(D::North),
+        (_, true, ..) => Some(D::South),
+        (_, _, true, _) => Some(D::West),
+        (_, _, _, true) => Some(D::East),
+        _ => None,
+    }
+}
+
+/// Resizing from the window's edges (the native frame is off): the cursor
+/// shows the direction, and a press starts the system resize. Not while
+/// maximized. Call once per frame.
+pub fn edge_resize(ctx: &egui::Context) {
+    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+    let window = ctx.content_rect();
+    let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else { return };
+    // A floating window (Scripts, a dialog) dragged to the edge keeps its own
+    // grips and scrollbars; nothing mid-drag is interrupted either.
+    let over_window = ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background);
+    if !edge_resize_allowed(maximized, over_window, ctx.dragged_id().is_some()) {
+        return;
+    }
+    let Some(dir) = resize_dir(window, pos, RESIZE_BAND) else { return };
+    use egui::ResizeDirection as D;
+    ctx.set_cursor_icon(match dir {
+        D::North | D::South => egui::CursorIcon::ResizeVertical,
+        D::East | D::West => egui::CursorIcon::ResizeHorizontal,
+        D::NorthWest | D::SouthEast => egui::CursorIcon::ResizeNwSe,
+        D::NorthEast | D::SouthWest => egui::CursorIcon::ResizeNeSw,
+    });
+    if ctx.input(|i| i.pointer.primary_pressed()) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+    }
+}
+
+/// Whether the window's edges resize it now: not while maximized, over a
+/// floating window, or while something is being dragged.
+pub fn edge_resize_allowed(maximized: bool, over_window: bool, dragging: bool) -> bool {
+    !maximized && !over_window && !dragging
+}
+
+/// Whether a press at `press` on the rail may move the window: only from
+/// empty rail, not from its controls (`blocked`: their rects) nor the resize
+/// band. A slow click on a pill must stay a click.
+pub fn may_drag_window(press: Pos2, blocked: &[Rect], at_edge: bool) -> bool {
+    !at_edge && !blocked.iter().any(|r| r.contains(press))
+}
+
+/// How close to the window's edge a press resizes it.
+pub const RESIZE_BAND: f32 = 6.0;
+
 /// The Matrix | Devices | Settings toggle: pills in one recessed housing.
 pub fn segmented(ui: &mut egui::Ui, s: &GearSkin, screen: &mut Screen) {
     let (housing, _) = ui.allocate_exact_size(Vec2::new(4.0, paint::PILL_H + 8.0), Sense::hover());
@@ -348,6 +471,40 @@ pub fn reveal(motion: &mut Motion, id: Id) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_drags_only_from_empty_rail() {
+        let pills = Rect::from_min_max(Pos2::new(800.0, 6.0), Pos2::new(1000.0, 40.0));
+        let tabs = Rect::from_min_max(Pos2::new(140.0, 6.0), Pos2::new(340.0, 40.0));
+        assert!(may_drag_window(Pos2::new(500.0, 20.0), &[pills, tabs], false), "empty rail");
+        assert!(!may_drag_window(Pos2::new(900.0, 20.0), &[pills, tabs], false), "a long press on a pill");
+        assert!(!may_drag_window(Pos2::new(200.0, 20.0), &[pills, tabs], false), "on the tabs");
+        assert!(!may_drag_window(Pos2::new(500.0, 2.0), &[pills, tabs], true), "on the resize band");
+    }
+
+    #[test]
+    fn edge_resizing_is_only_for_the_apps_own_background() {
+        assert!(edge_resize_allowed(false, false, false));
+        assert!(!edge_resize_allowed(true, false, false), "maximized");
+        assert!(!edge_resize_allowed(false, true, false), "over a floating window (Scripts, a dialog)");
+        assert!(!edge_resize_allowed(false, false, true), "while something is being dragged");
+    }
+
+    #[test]
+    fn the_window_edges_and_corners_resize_it() {
+        use egui::ResizeDirection as D;
+        let w = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0));
+        assert_eq!(resize_dir(w, Pos2::new(500.0, 2.0), 6.0), Some(D::North));
+        assert_eq!(resize_dir(w, Pos2::new(500.0, 698.0), 6.0), Some(D::South));
+        assert_eq!(resize_dir(w, Pos2::new(1.0, 300.0), 6.0), Some(D::West));
+        assert_eq!(resize_dir(w, Pos2::new(997.0, 300.0), 6.0), Some(D::East));
+        assert_eq!(resize_dir(w, Pos2::new(2.0, 2.0), 6.0), Some(D::NorthWest));
+        assert_eq!(resize_dir(w, Pos2::new(998.0, 699.0), 6.0), Some(D::SouthEast));
+        assert_eq!(resize_dir(w, Pos2::new(998.0, 1.0), 6.0), Some(D::NorthEast));
+        assert_eq!(resize_dir(w, Pos2::new(1.0, 699.0), 6.0), Some(D::SouthWest));
+        assert_eq!(resize_dir(w, Pos2::new(500.0, 300.0), 6.0), None, "inside");
+        assert_eq!(resize_dir(w, Pos2::new(-5.0, 300.0), 6.0), None, "outside");
+    }
 
     #[test]
     fn the_readout_is_short_and_loud() {

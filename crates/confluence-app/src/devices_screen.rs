@@ -343,12 +343,20 @@ pub const CONTENT_MAX: f32 = 1760.0;
 /// geometry whatever the style, so switching style never moves cards.
 pub fn card_span(groups: &[Group]) -> usize {
     let full = Geom::card().resolve(crate::gear::oled_meter::MeterStyle::Segments, 1.0, 50.0);
-    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(CARD_METER_W, 50.0));
-    if crate::gear::oled_meter::meter_layout(groups, r, &full).overflow {
-        2
-    } else {
-        1
-    }
+    (1..=MAX_SPAN)
+        .find(|&span| {
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(card_meter_w(span), 50.0));
+            !crate::gear::oled_meter::meter_layout(groups, r, &full).overflow
+        })
+        .unwrap_or(MAX_SPAN)
+}
+
+/// The most columns a card spans (a 32x32 device).
+pub const MAX_SPAN: usize = 4;
+
+/// The meter width of a card `span` columns wide.
+pub fn card_meter_w(span: usize) -> f32 {
+    card_width(span) - 2.0 * (WELL_INSET + METER_INSET)
 }
 
 /// The span of position `p`'s card (empty and switched-off cards are single).
@@ -1601,6 +1609,16 @@ mod tests {
             .filter(|(_, n)| *n > 0)
             .map(|(l, n)| Group { label: format!("{l} {n}"), channels: chans(n) })
             .collect()
+    }
+
+    #[test]
+    fn big_devices_span_three_or_four_columns() {
+        assert_eq!(card_span(&io(22, 22)), 3, "about 490 pt of meter");
+        assert_eq!(card_span(&io(32, 32)), 4);
+        assert_eq!(card_span(&io(64, 64)), 4, "four at most; its bars narrow");
+        for span in 1..=4 {
+            assert!(card_meter_w(span) > card_meter_w(span.max(2) - 1) || span == 1);
+        }
     }
 
     #[test]
