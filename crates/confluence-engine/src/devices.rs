@@ -1386,7 +1386,7 @@ impl DeviceManager {
     /// Holds a missing device's channels with an offline slot.
     fn park_offline(engine: &mut Engine, b: Binding) -> Result<Bound, String> {
         let spec = OfflineSlotSpec {
-            name: b.name.clone(),
+            name: offline_slot_name(&b),
             device: b.device(),
             role: ClockRole::Soft,
             first_input: b.first_input,
@@ -1752,7 +1752,7 @@ impl DeviceManager {
         let (rate, block) = (engine.config().sample_rate, engine.config().block);
         // The DAW's outputs are engine inputs and its inputs are engine outputs.
         let spec = StrictSlotSpec {
-            name: format!("VASIO {instance}"),
+            name: format!("VASIO {}", instance_letter(instance)),
             device,
             inputs: daw_outputs,
             outputs: daw_inputs,
@@ -1807,7 +1807,7 @@ impl DeviceManager {
         confluence_provider_vaio::check_rate(rate).map_err(|e| e.to_string())?;
         confluence_provider_vaio::ring_shape(block).map_err(|e| e.to_string())?;
         let spec = StrictSlotSpec {
-            name: format!("VAIO {instance}"),
+            name: format!("VAIO {}", instance_letter(instance)),
             device,
             inputs: confluence_provider_vaio::CHANNELS,
             outputs: 0,
@@ -2103,6 +2103,23 @@ fn same_device(binding: &Binding, kind: DeviceKind, name: &str) -> bool {
 /// An offline network stream whose engine is found but that fails to open is
 /// tried again after this long.
 const NET_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// The letter of virtual device instance `n` (1 is A), as its position is named.
+pub fn instance_letter(n: u32) -> char {
+    char::from_u32('A' as u32 + n.saturating_sub(1)).filter(char::is_ascii_uppercase).unwrap_or('?')
+}
+
+/// An offline slot's name: a virtual device keeps its position's name
+/// ("VASIO B"), anything else its binding name.
+fn offline_slot_name(b: &Binding) -> String {
+    match b.kind {
+        DeviceKind::Vasio => {
+            parse_vasio(&b.name).map_or(b.name.clone(), |(n, _, _)| format!("VASIO {}", instance_letter(n)))
+        }
+        DeviceKind::Vaio => parse_vaio(&b.name).map_or(b.name.clone(), |n| format!("VAIO {}", instance_letter(n))),
+        _ => b.name.clone(),
+    }
+}
 /// How long an app capture that failed to reopen waits before the next try.
 const APP_RETRY_AFTER: Duration = Duration::from_secs(10);
 
@@ -2246,6 +2263,17 @@ pub fn parse_vasio(name: &str) -> Result<(u32, usize, usize), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_instances_are_lettered_and_parked_slots_keep_the_name() {
+        assert_eq!((instance_letter(1), instance_letter(8)), ('A', 'H'));
+        let b = Binding { kind: DeviceKind::Vasio, name: "2:8x8".into(), ..binding_of(DeviceKind::Vasio, "2:8x8") };
+        assert_eq!(offline_slot_name(&b), "VASIO B");
+        let v = binding_of(DeviceKind::Vaio, "1");
+        assert_eq!(offline_slot_name(&v), "VAIO A");
+        let n = Binding { kind: DeviceKind::NetSend, ..binding_of(DeviceKind::NetSend, "x/y:2") };
+        assert_eq!(offline_slot_name(&n), "x/y:2");
+    }
 
     fn app(name: &str, online: bool, pid: Option<u32>) -> AppCaptureState {
         AppCaptureState { name: name.into(), online, pid }

@@ -18,7 +18,8 @@ const LONG: Duration = Duration::from_secs(15);
 fn add_vasio(c: &mut confluence_client::Client, n: u32) -> (u32, u32) {
     let r = c.call(Command::AddDevice { kind: DeviceKind::Vasio, name: n.to_string() }).unwrap();
     assert!(matches!(r, Response::Added { .. }), "{r:?}");
-    let s = slots(c).into_iter().find(|s| s.name == format!("VASIO {n}")).unwrap();
+    let letter = char::from(b'A' + n as u8 - 1);
+    let s = slots(c).into_iter().find(|s| s.name == format!("VASIO {letter}")).unwrap();
     (s.first_input, s.first_output)
 }
 
@@ -47,7 +48,7 @@ fn a_click_selects_a_cell_and_space_or_a_double_click_toggles_its_route() {
     let mut c = client(&d);
     let (i, o) = add_vasio(&mut c, 1);
     let mut h = harness_fast(app_for(&d));
-    let cell = "VASIO 1 in 1 → VASIO 1 out 2";
+    let cell = "VASIO A in 1 → VASIO A out 2";
     pump_until(&mut h, "the grid", LONG, |h| h.query_by_role_and_label(Role::Button, cell).is_some());
     // A click selects, and routes nothing.
     h.get_by_role_and_label(Role::Button, cell).click();
@@ -148,8 +149,8 @@ fn the_inspector_shows_a_vasio_slots_idle_note() {
     let mut c = client(&d);
     add_vasio(&mut c, 1);
     let mut h = harness(app_for(&d));
-    pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO 1 inputs").is_some());
-    h.get_by_label("VASIO 1 inputs").click();
+    pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO A inputs").is_some());
+    h.get_by_label("VASIO A inputs").click();
     pump_until(&mut h, "the idle note", LONG, |h| h.query_by_label_contains("no DAW attached").is_some());
     c.call(Command::Shutdown).unwrap();
 }
@@ -162,7 +163,7 @@ fn the_inspector_edits_the_selected_route() {
     let (i, o) = add_vasio(&mut c, 1);
     c.call(Command::SetPoint { input: i, output: o, gain_db: -6.0, mute: false, invert: false }).unwrap();
     let mut h = harness(app_for(&d));
-    let cell = "VASIO 1 in 1 → VASIO 1 out 1";
+    let cell = "VASIO A in 1 → VASIO A out 1";
     pump_until(&mut h, "the routed cell", LONG, |h| {
         h.state().point(i, o).is_some() && h.query_by_role_and_label(Role::Button, cell).is_some()
     });
@@ -191,8 +192,8 @@ fn a_slot_can_be_removed_after_confirming() {
     let mut c = client(&d);
     add_vasio(&mut c, 1);
     let mut h = harness(app_for(&d));
-    pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO 1 outputs").is_some());
-    h.get_by_label("VASIO 1 outputs").click();
+    pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO A outputs").is_some());
+    h.get_by_label("VASIO A outputs").click();
     pump_until(&mut h, "the slot panel", LONG, |h| h.query_by_label("Remove slot…").is_some());
     click_when_still(&mut h, "Remove slot…");
     pump_until(&mut h, "the confirmation", LONG, |h| h.query_by_label_contains("routes are removed too").is_some());
@@ -209,8 +210,8 @@ fn a_selection_removed_elsewhere_is_cleared() {
     add_vasio(&mut c, 1);
     let id = slots(&mut c)[0].id;
     let mut h = harness(app_for(&d));
-    pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO 1 inputs").is_some());
-    h.get_by_label("VASIO 1 inputs").click();
+    pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO A inputs").is_some());
+    h.get_by_label("VASIO A inputs").click();
     pump_until(&mut h, "selected", LONG, |h| h.state().selection() == confluence_app::matrix::Selection::Slot(id));
     c.call(Command::RemoveSlot { id }).unwrap();
     pump_until(&mut h, "the selection cleared", LONG, |h| {
@@ -235,17 +236,17 @@ fn a_vasio_is_turned_on_from_the_devices_screen() {
     h.get_by_label("Show all Virtual positions").click();
     pump_until(&mut h, "VASIO C's card", LONG, |h| h.query_by_label("Turn on VASIO C").is_some());
     h.get_by_label("Turn on VASIO C").click();
-    pump_until(&mut h, "the new slot", LONG, |_| slots(&mut client(&d)).iter().any(|s| s.name == "VASIO 3"));
+    pump_until(&mut h, "the new slot", LONG, |_| slots(&mut client(&d)).iter().any(|s| s.name == "VASIO C"));
     pump_until(&mut h, "the notification", LONG, |h| h.query_by_label_contains("Turned on VASIO C").is_some());
     pump_until(&mut h, "its Turn off", LONG, |h| h.query_by_label("Turn off VASIO C").is_some());
     client(&d).call(Command::Shutdown).unwrap();
 }
 
-/// Adds VASIO 1 with 16 channels each way (a grid larger than a small window).
+/// Adds VASIO A with 16 channels each way (a grid larger than a small window).
 fn add_big_vasio(c: &mut confluence_client::Client) -> (u32, u32) {
     let r = c.call(Command::AddDevice { kind: DeviceKind::Vasio, name: "1:16x16".into() }).unwrap();
     assert!(matches!(r, Response::Added { .. }), "{r:?}");
-    let s = slots(c).into_iter().find(|s| s.name == "VASIO 1").unwrap();
+    let s = slots(c).into_iter().find(|s| s.name == "VASIO A").unwrap();
     (s.first_input, s.first_output)
 }
 
@@ -257,7 +258,7 @@ fn the_wheel_on_a_route_changes_gain_without_scrolling() {
     let (i, o) = add_big_vasio(&mut c);
     c.call(Command::SetPoint { input: i, output: o, gain_db: -6.0, mute: false, invert: false }).unwrap();
     let mut h = harness_sized(app_for(&d), 520.0, 300.0);
-    let cell = "VASIO 1 in 1 → VASIO 1 out 1";
+    let cell = "VASIO A in 1 → VASIO A out 1";
     pump_until(&mut h, "the routed cell", LONG, |h| {
         h.state().point(i, o).is_some() && h.query_by_role_and_label(Role::Button, cell).is_some()
     });
@@ -294,10 +295,10 @@ fn cells_under_the_sticky_headers_cannot_be_hit() {
     let mut c = client(&d);
     add_big_vasio(&mut c);
     let mut h = harness_sized(app_for(&d), 520.0, 300.0);
-    pump_until(&mut h, "the grid", LONG, |h| h.query_by_label("VASIO 1 inputs").is_some());
+    pump_until(&mut h, "the grid", LONG, |h| h.query_by_label("VASIO A inputs").is_some());
     settle(&mut h);
     // Scroll by a part of a cell, with the pointer on the row header (not a cell).
-    h.hover_at(h.get_by_label("VASIO 1 inputs").rect().center());
+    h.hover_at(h.get_by_label("VASIO A inputs").rect().center());
     h.step();
     h.event(eframe::egui::Event::MouseWheel {
         unit: eframe::egui::MouseWheelUnit::Point,
@@ -309,8 +310,8 @@ fn cells_under_the_sticky_headers_cannot_be_hit() {
         h.step();
         std::thread::sleep(Duration::from_millis(10));
     }
-    let header_bottom = h.get_by_label("VASIO 1 outputs").rect().min.y + confluence_app::grid_view::HEADER_H;
-    let header_right = h.get_by_label("VASIO 1 inputs").rect().max.x;
+    let header_bottom = h.get_by_label("VASIO A outputs").rect().min.y + confluence_app::grid_view::HEADER_H;
+    let header_right = h.get_by_label("VASIO A inputs").rect().max.x;
     let cells: Vec<_> = h.query_all_by_label_contains(" → ").map(|n| n.rect()).collect();
     assert!(!cells.is_empty());
     for r in cells {
@@ -330,8 +331,8 @@ fn the_first_edit_after_an_engine_restart_works() {
     let (i, o) = add_vasio(&mut c, 1);
     drop(c);
     let mut h = harness(app_for(&d));
-    let first = "VASIO 1 in 1 → VASIO 1 out 1";
-    let second = "VASIO 1 in 2 → VASIO 1 out 2";
+    let first = "VASIO A in 1 → VASIO A out 1";
+    let second = "VASIO A in 2 → VASIO A out 2";
     pump_until(&mut h, "the grid", LONG, |h| h.query_by_role_and_label(Role::Button, first).is_some());
     settle(&mut h);
     h.get_by_role_and_label(Role::Button, first).click();
@@ -362,7 +363,7 @@ fn cells_can_be_selected_while_disconnected() {
     let (i, o) = add_vasio(&mut c, 1);
     drop(c);
     let mut h = harness(app_for(&d));
-    let cell = "VASIO 1 in 1 → VASIO 1 out 1";
+    let cell = "VASIO A in 1 → VASIO A out 1";
     pump_until(&mut h, "the grid", LONG, |h| h.query_by_role_and_label(Role::Button, cell).is_some());
     engine.kill();
     pump_until(&mut h, "Reconnecting", LONG, |h| h.query_all_by_label_contains("Reconnecting").next().is_some());
@@ -383,7 +384,7 @@ fn a_press_that_moves_more_than_three_pixels_is_not_a_click() {
     let mut c = client(&d);
     let (i, o) = add_vasio(&mut c, 1);
     let mut h = harness(app_for(&d));
-    let cell = "VASIO 1 in 1 → VASIO 1 out 1";
+    let cell = "VASIO A in 1 → VASIO A out 1";
     pump_until(&mut h, "the grid", LONG, |h| h.query_by_role_and_label(Role::Button, cell).is_some());
     settle(&mut h);
     let p = h.get_by_role_and_label(Role::Button, cell).rect().center();
@@ -434,7 +435,7 @@ fn an_insert_bus_is_added_routed_and_cannot_loop() {
     let bus = slots(&mut c).into_iter().find(|s| s.is_bus()).unwrap();
     h.get_by_label("Matrix").click();
 
-    let send = "VASIO 1 in 1 → Verb send 1";
+    let send = "VASIO A in 1 → Verb send 1";
     pump_until(&mut h, "the send cell", LONG, |h| h.query_by_role_and_label(Role::Button, send).is_some());
     h.get_by_role_and_label(Role::Button, send).click();
     h.key_press(eframe::egui::Key::Space);
@@ -564,7 +565,7 @@ fn a_route_learns_a_midi_control_from_the_window() {
     let mut c = client(&d);
     let (i, o) = add_vasio(&mut c, 1);
     let mut h = harness(app_for(&d));
-    let cell = "VASIO 1 in 1 → VASIO 1 out 1";
+    let cell = "VASIO A in 1 → VASIO A out 1";
     pump_until(&mut h, "the cell", LONG, |h| h.query_by_role_and_label(Role::Button, cell).is_some());
     // A click selects the empty cell and Space routes it.
     h.get_by_role_and_label(Role::Button, cell).click();
@@ -666,8 +667,8 @@ fn a_devices_colour_is_picked_in_the_inspector() {
     let mut c = client(&d);
     add_vasio(&mut c, 1);
     let mut h = harness(app_for(&d));
-    pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO 1 inputs").is_some());
-    h.get_by_label("VASIO 1 inputs").click();
+    pump_until(&mut h, "the slot header", LONG, |h| h.query_by_label("VASIO A inputs").is_some());
+    h.get_by_label("VASIO A inputs").click();
     let first = confluence_app::skin::Look::builtin().skin.slot_colors[0];
     let rgb = [first.r(), first.g(), first.b()];
     let swatch = format!("Colour #{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
@@ -675,7 +676,7 @@ fn a_devices_colour_is_picked_in_the_inspector() {
     // The rack panel animates into place: click once the swatch stops moving.
     click_when_still(&mut h, &swatch);
     pump_until(&mut h, "the device coloured in the engine", LONG, |_| {
-        slots(&mut c).iter().any(|s| s.name == "VASIO 1" && s.color == Some(rgb))
+        slots(&mut c).iter().any(|s| s.name == "VASIO A" && s.color == Some(rgb))
     });
     c.call(Command::Shutdown).unwrap();
 }
@@ -718,7 +719,7 @@ fn turning_a_vasio_on_from_its_card_reaches_the_engine() {
     h.get_by_label("Devices").click();
     pump_until(&mut h, "VASIO B's Turn on", LONG, |h| h.query_by_label("Turn on VASIO B").is_some());
     h.get_by_label("Turn on VASIO B").click();
-    pump_until(&mut h, "VASIO B in the engine", LONG, |_| slots(&mut c).iter().any(|s| s.name == "VASIO 2"));
+    pump_until(&mut h, "VASIO B in the engine", LONG, |_| slots(&mut c).iter().any(|s| s.name == "VASIO B"));
     c.call(Command::Shutdown).unwrap();
 }
 
@@ -777,9 +778,9 @@ fn turning_a_vasio_off_asks_first() {
     pump_until(&mut h, "VASIO A's Turn off", LONG, |h| h.query_by_label("Turn off VASIO A").is_some());
     h.get_by_label("Turn off VASIO A").click();
     pump_until(&mut h, "the question", LONG, |h| h.query_by_label_contains("Its routes are removed").is_some());
-    assert!(slots(&mut c).iter().any(|s| s.name == "VASIO 1"), "nothing happens before the answer");
+    assert!(slots(&mut c).iter().any(|s| s.name == "VASIO A"), "nothing happens before the answer");
     h.get_by_label("Turn off").click();
-    pump_until(&mut h, "VASIO A off", LONG, |_| !slots(&mut c).iter().any(|s| s.name == "VASIO 1"));
+    pump_until(&mut h, "VASIO A off", LONG, |_| !slots(&mut c).iter().any(|s| s.name == "VASIO A"));
     c.call(Command::Shutdown).unwrap();
 }
 
@@ -841,7 +842,7 @@ fn a_device_is_renamed_on_its_card() {
     h.get_by(|n| n.placeholder() == Some("Custom name")).type_text("Ableton");
     h.key_press(eframe::egui::Key::Enter);
     pump_until(&mut h, "the name in the engine", LONG, |_| {
-        slots(&mut c).iter().any(|s| s.name == "VASIO 1" && s.label.as_deref() == Some("Ableton"))
+        slots(&mut c).iter().any(|s| s.name == "VASIO A" && s.label.as_deref() == Some("Ableton"))
     });
     pump_until(&mut h, "the name on the card", LONG, |h| h.query_by_label_contains("VASIO A · Ableton").is_some());
     c.call(Command::Shutdown).unwrap();
@@ -864,7 +865,7 @@ fn a_channel_is_renamed_from_the_cards_meter() {
     pump_until(&mut h, "the channel name in the engine", LONG, |_| {
         slots(&mut c)
             .iter()
-            .any(|s| s.name == "VASIO 1" && s.input_labels.first().cloned().flatten().as_deref() == Some("Kick"))
+            .any(|s| s.name == "VASIO A" && s.input_labels.first().cloned().flatten().as_deref() == Some("Kick"))
     });
     c.call(Command::Shutdown).unwrap();
 }
