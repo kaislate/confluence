@@ -302,7 +302,7 @@ fn cells_under_the_sticky_headers_cannot_be_hit() {
     h.step();
     h.event(eframe::egui::Event::MouseWheel {
         unit: eframe::egui::MouseWheelUnit::Point,
-        delta: eframe::egui::vec2(-12.0, -12.0),
+        delta: eframe::egui::vec2(-25.0, -25.0),
         modifiers: Default::default(),
         phase: eframe::egui::TouchPhase::Move,
     });
@@ -310,8 +310,10 @@ fn cells_under_the_sticky_headers_cannot_be_hit() {
         h.step();
         std::thread::sleep(Duration::from_millis(10));
     }
-    let header_bottom = h.get_by_label("VASIO A outputs").rect().min.y + confluence_app::grid_view::HEADER_H;
-    let header_right = h.get_by_label("VASIO A inputs").rect().max.x;
+    // The minimap fills the corner where the headers meet.
+    let corner = h.get_by_label("Matrix overview").rect();
+    let header_bottom = corner.min.y + confluence_app::grid_view::HEADER_H;
+    let header_right = corner.min.x + confluence_app::grid_view::HEADER_W;
     let cells: Vec<_> = h.query_all_by_label_contains(" → ").map(|n| n.rect()).collect();
     assert!(!cells.is_empty());
     for r in cells {
@@ -1039,5 +1041,35 @@ fn leaving_the_devices_screen_stops_the_app_list() {
     h.key_press_modifiers(eframe::egui::Modifiers::COMMAND, eframe::egui::Key::Num1);
     settle(&mut h);
     assert!(!h.state().app_list_running(), "the reader stops when the Devices screen is left");
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn clicking_the_minimap_moves_the_grid_there() {
+    let d = EngineDir::new("minimap");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_big_vasio(&mut c);
+    let mut h = harness_sized(app_for(&d), 520.0, 300.0);
+    pump_until(&mut h, "the minimap", LONG, |h| h.query_by_label("Matrix overview").is_some());
+    settle(&mut h);
+    assert_eq!(h.state().matrix_scroll(), eframe::egui::Vec2::ZERO);
+    // Bottom-right of the map: the end of the matrix.
+    let at = h.get_by_label("Matrix overview").rect().max - eframe::egui::vec2(10.0, 10.0);
+    h.hover_at(at);
+    h.step();
+    for pressed in [true, false] {
+        h.event(eframe::egui::Event::PointerButton {
+            pos: at,
+            button: eframe::egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+    pump_until(&mut h, "the grid to scroll", LONG, |h| {
+        let o = h.state().matrix_scroll();
+        o.x > 0.0 && o.y > 0.0
+    });
     client(&d).call(Command::Shutdown).unwrap();
 }

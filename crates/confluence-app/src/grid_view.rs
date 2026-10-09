@@ -44,6 +44,10 @@ pub struct GridState {
     pub hover: Option<(usize, usize)>,
     /// Cells whose lift or pop is still moving.
     pub moving: HashSet<(u32, u32)>,
+    /// The grid's scroll offset last frame.
+    pub offset: Vec2,
+    /// Where the minimap asked the grid to scroll (applied next frame).
+    pub scroll_to: Option<Vec2>,
 }
 
 /// Pixels of touchpad (point-unit) scrolling per gain step.
@@ -126,6 +130,7 @@ pub fn show(
     lookup: &dyn Fn((u32, u32)) -> (Option<PointState>, bool),
     selected: Option<(u32, u32)>,
     fresh: &HashSet<(u32, u32)>,
+    routes: &HashSet<(u32, u32)>,
     editable: bool,
 ) -> GridActions {
     let mut actions = GridActions::default();
@@ -142,7 +147,11 @@ pub fn show(
     let skinned = look.has_image("cell_routed") || look.has_image("cell_empty");
     let mut hover_now: Option<(usize, usize)> = None;
     let blink = motion.blink(2.0);
-    ScrollArea::both().auto_shrink(false).id_salt("matrix").show_viewport(ui, |ui, viewport| {
+    let mut area = ScrollArea::both().auto_shrink(false).id_salt("matrix");
+    if let Some(o) = gs.scroll_to.take() {
+        area = area.scroll_offset(o);
+    }
+    area.show_viewport(ui, |ui, viewport| {
         let (outer, _) = ui.allocate_exact_size(Vec2::new(HEADER_W + gw, HEADER_H + gh), Sense::hover());
         let origin = outer.min + Vec2::new(HEADER_W, HEADER_H);
         let (rows, cols) =
@@ -427,8 +436,15 @@ pub fn show(
                 }
             }
         }
+        // The corner: a minimap of the whole matrix that moves the view.
         let corner = Rect::from_min_size(vp.min, Vec2::new(HEADER_W, HEADER_H));
-        ui.painter_at(corner).rect_filled(corner, 0.0, skin.ground);
+        let view = (vp.size() - Vec2::new(HEADER_W, HEADER_H)).max(Vec2::ZERO);
+        let scroll_to = minimap(ui, corner, layout, look, skin, routes, viewport.min.to_vec2(), view);
+        if scroll_to.is_some() {
+            gs.scroll_to = scroll_to;
+            ui.ctx().request_repaint();
+        }
+        gs.offset = viewport.min.to_vec2();
         // Seams where the headers meet the bed.
         let hp = ui.painter_at(vp);
         paint::seam(
@@ -444,6 +460,65 @@ pub fn show(
     });
     gs.hover = hover_now;
     actions
+}
+
+/// The minimap in `corner`: the matrix scaled down with its devices' colours
+/// along the edges, every route as a dot, and the view outlined. Returns the
+/// scroll offset to move to when it is clicked or dragged.
+#[allow(clippy::too_many_arguments)]
+fn minimap(
+    ui: &mut egui::Ui,
+    corner: Rect,
+    layout: &GridLayout,
+    look: &Look,
+    skin: &GearSkin,
+    routes: &HashSet<(u32, u32)>,
+    offset: Vec2,
+    view: Vec2,
+) -> Option<Vec2> {
+    let p = ui.painter_at(corner);
+    p.rect_filled(corner, 0.0, skin.ground);
+    let (gw, gh) = layout.size();
+    let content = Vec2::new(gw, gh);
+    let mini = crate::minimap::mini_rect(corner, content);
+    let resp = ui.interact(corner, Id::new("matrix-minimap"), Sense::click_and_drag());
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Matrix overview"));
+    if !mini.is_positive() {
+        return None;
+    }
+    paint::recess(&p, mini.expand(3.0), skin, 5);
+    let k = mini.width() / gw;
+    for (bi, b) in layout.cols.bands.iter().enumerate() {
+        let x = mini.left() + layout.cols.strip_pos(bi) * k;
+        let w = ((SEP + b.channels as f32 * layout.cell) * k).max(1.0);
+        p.rect_filled(
+            Rect::from_min_size(Pos2::new(x, mini.top()), Vec2::new(w, 2.5)),
+            0.0,
+            band_colour(look, skin, b),
+        );
+    }
+    for (bi, b) in layout.rows.bands.iter().enumerate() {
+        let y = mini.top() + layout.rows.strip_pos(bi) * k;
+        let h = ((SEP + b.channels as f32 * layout.cell) * k).max(1.0);
+        p.rect_filled(
+            Rect::from_min_size(Pos2::new(mini.left(), y), Vec2::new(2.5, h)),
+            0.0,
+            band_colour(look, skin, b),
+        );
+    }
+    let dot = (layout.cell * k / 2.0).clamp(0.8, 2.5);
+    for &(i, o) in routes {
+        let Some((r, c)) = layout.cell_of(i, o) else { continue };
+        let (cx, cy) = layout.cell_pos(r, c);
+        let at = mini.min + Vec2::new(cx + layout.cell / 2.0, cy + layout.cell / 2.0) * k;
+        let colour = layout.rows.at(r).map(|(b, _)| band_colour(look, skin, b)).unwrap_or(skin.ground_ink);
+        p.circle_filled(at, dot, colour);
+    }
+    let v = crate::minimap::view_rect(mini, content, offset, view);
+    p.rect_filled(v, egui::CornerRadius::same(2), paint::alpha(skin.accent, 0.10));
+    p.rect_stroke(v, egui::CornerRadius::same(2), Stroke::new(1.5, skin.accent), StrokeKind::Inside);
+    let moving = resp.clicked() || resp.dragged() || resp.is_pointer_button_down_on();
+    resp.interact_pointer_pos().filter(|_| moving).map(|at| crate::minimap::offset_for(mini, content, view, at))
 }
 
 /// A device's name on its strip ("… · OFFLINE" while it is missing).

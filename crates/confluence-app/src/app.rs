@@ -768,6 +768,11 @@ impl ConfluenceApp {
         self.motion.reduce = reduce;
     }
 
+    /// The matrix's scroll offset (grid points).
+    pub fn matrix_scroll(&self) -> Vec2 {
+        self.grid_state.offset
+    }
+
     /// The screen shown.
     pub fn screen(&self) -> Screen {
         self.screen
@@ -1020,6 +1025,7 @@ impl ConfluenceApp {
                 &lookup,
                 selected,
                 &fresh,
+                &self.routes_seen,
                 editable,
             );
             if let Some(z) = actions.zoom {
