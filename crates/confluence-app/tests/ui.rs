@@ -61,7 +61,13 @@ fn a_click_selects_a_cell_and_space_or_a_double_click_toggles_its_route() {
     pump_until(&mut h, "the route in the engine", LONG, |h| {
         h.state().point(i, o + 1).is_some() && engine_points(&mut c).contains(&(i, o + 1))
     });
-    // A double-click removes it again.
+    // A double-click removes it again. The harness clock moves 1/60 s per
+    // frame whatever the wall clock does: let it pass egui's double-click
+    // window, or the first click below pairs with the selecting click above
+    // whenever the engine answered in few frames.
+    for _ in 0..40 {
+        h.step();
+    }
     let node = h.get_by_role_and_label(Role::Button, cell);
     node.click();
     node.click();
@@ -666,17 +672,8 @@ fn a_devices_colour_is_picked_in_the_inspector() {
     let rgb = [first.r(), first.g(), first.b()];
     let swatch = format!("Colour #{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
     pump_until(&mut h, "the colour swatches", LONG, |h| h.query_by_label(&swatch).is_some());
-    // The rack panel animates into place: click once the swatch stops moving
-    // (a slow machine could otherwise click where it was a frame ago).
-    let mut last = h.get_by_label(&swatch).rect();
-    pump_until(&mut h, "the swatch to settle", LONG, |h| {
-        let now = h.get_by_label(&swatch).rect();
-        let still = now == last;
-        last = now;
-        still
-    });
-    settle(&mut h);
-    h.get_by_label(&swatch).click();
+    // The rack panel animates into place: click once the swatch stops moving.
+    click_when_still(&mut h, &swatch);
     pump_until(&mut h, "the device coloured in the engine", LONG, |_| {
         slots(&mut c).iter().any(|s| s.name == "VASIO 1" && s.color == Some(rgb))
     });
@@ -689,8 +686,8 @@ fn the_skin_is_chosen_in_settings() {
     let _engine = Engine::spawn(&d);
     let mut h = harness(app_for(&d));
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
-    h.get_by_label("Settings…").click();
-    pump_until(&mut h, "the Settings window", LONG, |h| h.query_by_label("Silver").is_some());
+    h.get_by_label("Settings").click();
+    pump_until(&mut h, "the Settings screen", LONG, |h| h.query_by_label("Silver").is_some());
     h.get_by_label("Silver").click();
     settle(&mut h);
     assert_eq!(h.state().finish(), confluence_app::gear::skins::Finish::Silver);
@@ -792,7 +789,7 @@ fn the_meter_style_is_chosen_in_settings() {
     let _engine = Engine::spawn(&d);
     let mut h = harness(app_for(&d));
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
-    h.get_by_label("Settings…").click();
+    h.get_by_label("Settings").click();
     pump_until(&mut h, "the meter choices", LONG, |h| h.query_by_label("Dot-matrix").is_some());
     h.get_by_label("Dot-matrix").click();
     h.get_by_label("Double line").click();
@@ -811,7 +808,17 @@ fn devices_sit_in_bays_by_type() {
     let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
     h.get_by_label("Devices").click();
-    pump_until(&mut h, "the bays", LONG, |h| h.query_by_label("HARDWARE").is_some());
+    // Descriptive titles by default…
+    pump_until(&mut h, "the bays", LONG, |h| h.query_by_label("Audio interfaces").is_some());
+    for bay in ["Windows playback & recording", "Virtual devices for DAWs", "Network streams", "Captured apps"] {
+        assert!(h.query_by_label(bay).is_some(), "{bay}");
+    }
+    assert!(h.query_by_label("HARDWARE").is_none());
+    // …and one word each with "Short bay titles".
+    let mut prefs = h.state().prefs().clone();
+    prefs.short_bay_titles = true;
+    h.state_mut().set_prefs(prefs);
+    pump_until(&mut h, "short titles", LONG, |h| h.query_by_label("HARDWARE").is_some());
     for bay in ["WINDOWS", "VIRTUAL", "NETWORK", "APPS"] {
         assert!(h.query_by_label(bay).is_some(), "{bay}");
     }
@@ -899,5 +906,137 @@ fn the_meter_bridge_pops_out_and_docks_back() {
     h.get_by_label("Dock meters").click();
     pump_until(&mut h, "the docked bridge", LONG, |h| h.query_by_label("Pop out meters").is_some());
     assert!(!h.state().prefs().bridge.popped);
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_sixteen_channel_vasio_gets_a_double_card() {
+    let d = EngineDir::new("double");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let on = |pos: &str, shape| Command::SetVirtual { pos: pos.parse().unwrap(), on: true, shape: Some(shape) };
+    let r = c.call(on("vasio:B", (16, 16))).unwrap();
+    assert!(matches!(r, Response::Applied { .. }), "VASIO B 16x16: {r:?}");
+    assert!(matches!(c.call(on("vasio:A", (8, 8))).unwrap(), Response::Applied { .. }), "VASIO A 8x8");
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "the meters", LONG, |h| h.query_by_label("Channels of VASIO B").is_some());
+    settle(&mut h);
+    let wide = h.get_by_label("Channels of VASIO B").rect().width();
+    let single = h.get_by_label("Channels of VASIO A").rect().width();
+    assert!(wide > 400.0, "16x16 takes a double card: its meter is {wide} wide");
+    assert!(single < 220.0, "8x8 stays single: its meter is {single} wide");
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn ctrl_3_opens_settings_and_advanced_options_start_off() {
+    let d = EngineDir::new("settings-screen");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1400.0, 900.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    assert!(h.query_by_label("Settings…").is_none(), "no Settings window button any more");
+    h.key_press_modifiers(eframe::egui::Modifiers::COMMAND, eframe::egui::Key::Num3);
+    pump_until(&mut h, "the Settings screen", LONG, |h| h.query_by_label("Enable advanced options").is_some());
+    assert_eq!(h.state().screen(), confluence_app::app::Screen::Settings);
+    assert!(!h.state().prefs().advanced);
+    // The section list scrolls the pane into view (off-screen widgets take no clicks).
+    h.get_by_label("Advanced section").click();
+    for _ in 0..30 {
+        h.step();
+    }
+    h.get_by_label("Enable advanced options").click();
+    settle(&mut h);
+    assert!(h.state().prefs().advanced);
+    for label in [
+        "Graphite",
+        "Candy",
+        "Silver",
+        "Segments",
+        "Solid",
+        "Single line",
+        "White",
+        "Red",
+        "Reduce motion",
+        "Short bay titles",
+    ] {
+        assert!(h.query_by_label(label).is_some(), "{label}");
+    }
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn settings_work_without_an_engine() {
+    let d = EngineDir::new("settings-offline");
+    let mut h = harness(app_for(&d));
+    for _ in 0..10 {
+        h.step();
+    }
+    h.get_by_label("Settings").click();
+    pump_until(&mut h, "the Settings screen", LONG, |h| h.query_by_label("Candy").is_some());
+    h.get_by_label("Candy").click();
+    settle(&mut h);
+    assert_eq!(h.state().finish(), confluence_app::gear::skins::Finish::Candy);
+}
+
+#[test]
+fn the_app_picker_lists_apps_and_keeps_pid_entry_behind_advanced_options() {
+    let d = EngineDir::new("app-picker");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    let open_picker = |h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>| {
+        h.get_by_label("Devices").click();
+        pump_until(h, "APP 1", LONG, |h| h.query_by_label_contains("APP 1 \u{b7} click").is_some());
+        h.get_by_label_contains("APP 1 \u{b7} click").scroll_to_me();
+        settle(h);
+        h.get_by_label_contains("APP 1 \u{b7} click").click();
+        pump_until(h, "the app list", LONG, |h| {
+            h.query_by(|n| n.placeholder() == Some("Filter apps\u{2026}")).is_some()
+        });
+    };
+    open_picker(&mut h);
+    // This test process has no window, but the list fills from what is running.
+    pump_until(&mut h, "a running app", LONG, |h| h.query_all_by_label_contains("Capture ").next().is_some());
+    assert!(h.query_by(|n| n.placeholder() == Some("process name or PID")).is_none(), "PID entry is advanced");
+    assert!(h.query_by_label("Advanced: capture by process name or PID").is_none());
+    h.key_press(eframe::egui::Key::Escape);
+    settle(&mut h);
+    // Switch advanced options on, and the PID entry is there.
+    h.get_by_label("Settings").click();
+    pump_until(&mut h, "Settings", LONG, |h| h.query_by_label("Advanced section").is_some());
+    h.get_by_label("Advanced section").click();
+    for _ in 0..30 {
+        h.step();
+    }
+    h.get_by_label("Enable advanced options").click();
+    settle(&mut h);
+    open_picker(&mut h);
+    // The popover settles once its list is in (it opens upward here).
+    pump_until(&mut h, "the list again", LONG, |h| h.query_all_by_label_contains("Capture ").next().is_some());
+    settle(&mut h);
+    h.get_by_label("Advanced: capture by process name or PID").click();
+    pump_until(&mut h, "the PID entry", LONG, |h| {
+        h.query_by(|n| n.placeholder() == Some("process name or PID")).is_some()
+    });
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn leaving_the_devices_screen_stops_the_app_list() {
+    let d = EngineDir::new("app-list-stop");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "APP 1", LONG, |h| h.query_by_label_contains("APP 1 \u{b7} click").is_some());
+    h.get_by_label_contains("APP 1 \u{b7} click").scroll_to_me();
+    settle(&mut h);
+    h.get_by_label_contains("APP 1 \u{b7} click").click();
+    pump_until(&mut h, "the app list", LONG, |h| h.state().app_list_running());
+    h.key_press_modifiers(eframe::egui::Modifiers::COMMAND, eframe::egui::Key::Num1);
+    settle(&mut h);
+    assert!(!h.state().app_list_running(), "the reader stops when the Devices screen is left");
     client(&d).call(Command::Shutdown).unwrap();
 }

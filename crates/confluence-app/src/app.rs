@@ -196,6 +196,7 @@ pub fn rack_panel_width(window_w: f32) -> f32 {
 pub enum Screen {
     Matrix,
     Devices,
+    Settings,
 }
 
 pub struct ConfluenceApp {
@@ -236,7 +237,6 @@ pub struct ConfluenceApp {
     /// The gear finish (Settings), and the one egui's widgets were last styled for.
     finish: Finish,
     styled_for: Option<Finish>,
-    settings_open: bool,
     /// How meters and names are shown, and the meter bridge.
     prefs: crate::prefs::ViewPrefs,
     motion: Motion,
@@ -322,7 +322,6 @@ impl ConfluenceApp {
             scripts: crate::scripts::ScriptsUi::default(),
             finish: Finish::default(),
             styled_for: None,
-            settings_open: false,
             prefs: crate::prefs::ViewPrefs::default(),
             motion: Motion::default(),
             notices_seen: HashMap::new(),
@@ -499,7 +498,16 @@ impl ConfluenceApp {
         self.rail(ui, &view, now);
         self.scene_rail(ui, &view);
         self.side_panels(ui, &view, now);
-        if matches!(view.conn, ConnState::Connecting) && view.state.is_none() {
+        if self.screen != Screen::Devices {
+            // A picker belongs to the Devices screen: leaving it closes the
+            // picker (and stops its running-app reader).
+            self.screen_state.picker = None;
+            self.screen_state.apps = None;
+        }
+        if self.screen == Screen::Settings {
+            // Settings work whether or not the engine is there.
+            self.settings_screen(ui);
+        } else if matches!(view.conn, ConnState::Connecting) && view.state.is_none() {
             self.powered_off(ui, now);
         } else {
             match self.screen {
@@ -510,6 +518,7 @@ impl ConfluenceApp {
                 Screen::Devices => {
                     self.devices_screen(ui, &view);
                 }
+                Screen::Settings => {}
             }
         }
         if self.prefs.bridge.popped {
@@ -530,15 +539,23 @@ impl ConfluenceApp {
         self.motion.end_frame(&ctx);
     }
 
-    /// Ctrl+1 / Ctrl+2 switch screens; Ctrl+0 fits the matrix.
+    /// Ctrl+1 / Ctrl+2 / Ctrl+3 switch screens; Ctrl+0 fits the matrix.
     fn shortcuts(&mut self, ui: &egui::Ui) {
         if ui.ctx().memory(|m| m.focused().is_some()) {
             return;
         }
-        let (one, two, zero) = ui.input(|i| {
+        let (one, two, three, zero) = ui.input(|i| {
             let c = i.modifiers.command;
-            (c && i.key_pressed(Key::Num1), c && i.key_pressed(Key::Num2), c && i.key_pressed(Key::Num0))
+            (
+                c && i.key_pressed(Key::Num1),
+                c && i.key_pressed(Key::Num2),
+                c && i.key_pressed(Key::Num3),
+                c && i.key_pressed(Key::Num0),
+            )
         });
+        if three {
+            self.screen = Screen::Settings;
+        }
         if one {
             self.screen = Screen::Matrix;
         }
@@ -593,8 +610,7 @@ impl ConfluenceApp {
         }
         let motion = &mut self.motion;
         let screen = &mut self.screen;
-        let (inspector, scripts, settings) =
-            (&mut self.inspector_open, &mut self.scripts_open, &mut self.settings_open);
+        let (inspector, scripts) = (&mut self.inspector_open, &mut self.scripts_open);
         egui::Panel::top("top-bar").frame(egui::Frame::NONE).exact_size(shell::RAIL_H).show_separator_line(false).show(
             ui,
             |ui| {
@@ -610,8 +626,7 @@ impl ConfluenceApp {
                 shell::engine_cluster(&mut row, &skin, motion, &text, status.as_ref(), flashing, dsp_warn);
                 row.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    for (open, label) in [(settings, "Settings…"), (scripts, "Scripts…"), (inspector, "Inspector")]
-                    {
+                    for (open, label) in [(scripts, "Scripts…"), (inspector, "Inspector")] {
                         let resp = paint::pill_lit(ui, label, label, *open, &skin);
                         resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, *open, label));
                         if resp.clicked() {
@@ -738,6 +753,27 @@ impl ConfluenceApp {
     }
 
     /// The Devices screen in the central panel.
+    fn settings_screen(&mut self, ui: &mut egui::Ui) {
+        let skin = self.skin();
+        let (mut finish, mut reduce) = (self.finish, self.motion.reduce);
+        let (prefs, motion) = (&mut self.prefs, &mut self.motion);
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            crate::settings::screen(ui, &skin, &mut finish, &mut reduce, prefs, motion);
+        });
+        self.finish = finish;
+        self.motion.reduce = reduce;
+    }
+
+    /// The screen shown.
+    pub fn screen(&self) -> Screen {
+        self.screen
+    }
+
+    /// The Apps picker's list of running apps is being read.
+    pub fn app_list_running(&self) -> bool {
+        self.screen_state.apps.is_some()
+    }
+
     fn devices_screen(&mut self, ui: &mut egui::Ui, view: &StoreView) {
         let editable = self.live();
         let skin = self.skin();
@@ -847,11 +883,6 @@ impl ConfluenceApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, view: &StoreView) {
-        if self.settings_open {
-            let mut reduce = self.motion.reduce;
-            crate::settings::show(ctx, &mut self.settings_open, &mut self.finish, &mut reduce, &mut self.prefs);
-            self.motion.reduce = reduce;
-        }
         if let (true, Some(state)) = (self.scripts_open, view.state.as_ref()) {
             let editable = self.live();
             let scripts = &mut self.scripts;

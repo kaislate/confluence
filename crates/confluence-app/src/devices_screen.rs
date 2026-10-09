@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use confluence_api::{
     byte_db, DeviceInfo, DeviceKind, MeterFrame, PosGroup, PosId, PositionState, PositionStatus, SlotHealth, SlotState,
 };
-use eframe::egui::{self, Align2, Color32, Id, Key, Pos2, Rect, Sense, TextEdit, Vec2, WidgetInfo, WidgetType};
+use eframe::egui::{self, Align, Align2, Color32, Id, Key, Pos2, Rect, Sense, TextEdit, Vec2, WidgetInfo, WidgetType};
 
 use crate::bays::{Bay, BayView};
 use crate::commands::Edit;
@@ -61,8 +61,14 @@ pub struct ScreenState {
     pub renaming: Option<(PosId, String)>,
     /// The last click on a card's name (a second one soon after renames it).
     pub name_click: Option<(PosId, f64)>,
-    /// App icons for app-capture cards.
+    /// App icons for app-capture cards and the app list.
     pub icons: crate::app_icon::IconCache,
+    /// The running apps, read while an Apps picker is open.
+    pub apps: Option<crate::running_apps::AppLister>,
+    /// The app list's filter.
+    pub app_filter: String,
+    /// The app picker's "capture by process name or PID" section is open.
+    pub pid_entry_open: bool,
     /// The position whose channel list is open.
     pub channels_of: Option<PosId>,
     /// Channel names being typed, by (input?, channel index).
@@ -96,6 +102,9 @@ impl Default for ScreenState {
             name_click: None,
             channels_of: None,
             icons: crate::app_icon::IconCache::default(),
+            apps: None,
+            app_filter: String::new(),
+            pid_entry_open: false,
             channel_drafts: HashMap::new(),
             led_seen: HashMap::new(),
             adding_bus: false,
@@ -313,21 +322,52 @@ pub fn device_color(p: &PositionState, palette: &[Color32]) -> Color32 {
 }
 
 /// Card size, gaps and the bays' chrome.
-pub const CARD_W: f32 = 240.0;
+pub const CARD_W: f32 = 220.0;
 pub const CARD_H: f32 = 150.0;
-pub const GAP: f32 = 14.0;
+pub const GAP: f32 = 12.0;
 /// Between bays.
-pub const BAY_GAP: f32 = 18.0;
+pub const BAY_GAP: f32 = 14.0;
+/// The OLED well's inset from the card's sides, and the meter's from the well's.
+const WELL_INSET: f32 = 8.0;
+const METER_INSET: f32 = 5.0;
+/// The width a single card's meter has.
+pub const CARD_METER_W: f32 = CARD_W - 2.0 * (WELL_INSET + METER_INSET);
 /// A bay's padding and its header strip.
 pub const BAY_PAD: f32 = 12.0;
 pub const BAY_HEADER: f32 = 30.0;
 /// Content is centred and capped at this width on very wide windows.
 pub const CONTENT_MAX: f32 = 1760.0;
 
-/// A bay's size for `n` cards when at most `max_cols` fit across.
-pub fn bay_size(n: usize, max_cols: usize) -> Vec2 {
-    let cols = n.clamp(1, max_cols.max(1));
-    let rows = n.div_ceil(cols).max(1);
+/// How many columns a card takes: two when its meter, at full card bars,
+/// is wider than a single card's meter. Worked out from the segment
+/// geometry whatever the style, so switching style never moves cards.
+pub fn card_span(groups: &[Group]) -> usize {
+    let full = Geom::card().resolve(crate::gear::oled_meter::MeterStyle::Segments, 1.0, 50.0);
+    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(CARD_METER_W, 50.0));
+    if crate::gear::oled_meter::meter_layout(groups, r, &full).overflow {
+        2
+    } else {
+        1
+    }
+}
+
+/// The span of position `p`'s card (empty and switched-off cards are single).
+fn span_of(p: &PositionState, v: &Views) -> usize {
+    if crate::bays::vacant(p) || matches!(p.status, PositionStatus::Off) {
+        1
+    } else {
+        card_span(&device_groups(p, v))
+    }
+}
+
+/// The width of a card `span` columns wide.
+fn card_width(span: usize) -> f32 {
+    span as f32 * CARD_W + span.saturating_sub(1) as f32 * GAP
+}
+
+/// A bay's size for `cols` columns and `rows` rows of cards.
+pub fn bay_size(cols: usize, rows: usize) -> Vec2 {
+    let (cols, rows) = (cols.max(1), rows.max(1));
     Vec2::new(
         cols as f32 * CARD_W + (cols - 1) as f32 * GAP + 2.0 * BAY_PAD,
         BAY_HEADER + rows as f32 * CARD_H + (rows - 1) as f32 * GAP + BAY_PAD,
@@ -449,7 +489,15 @@ pub fn show(
             let left = ui.max_rect().left() + (full - width) / 2.0;
             let max_cols = (((width - 2.0 * BAY_PAD + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
             let views = crate::bays::bay_views(&state.positions, &st.expanded);
-            let sizes: Vec<Vec2> = views.iter().map(|b| bay_size(b.cards.len(), max_cols)).collect();
+            let spans: Vec<Vec<usize>> =
+                views.iter().map(|b| b.cards.iter().map(|p| span_of(p, &v)).collect()).collect();
+            let sizes: Vec<Vec2> = spans
+                .iter()
+                .map(|s| {
+                    let (_, cols, rows) = crate::bays::place_cards(s, max_cols);
+                    bay_size(cols, rows)
+                })
+                .collect();
             let widths: Vec<f32> = sizes.iter().map(|s| s.x).collect();
             ui.add_space(8.0);
             for row in crate::bays::pack_bays(&widths, width, BAY_GAP) {
@@ -458,7 +506,7 @@ pub fn show(
                 let mut x = left;
                 for i in row {
                     let r = Rect::from_min_size(Pos2::new(x, band.top()), sizes[i]);
-                    bay(ui, r, &views[i], max_cols, &v, skin, palette, st, motion, prefs, &mut actions);
+                    bay(ui, r, &views[i], &spans[i], max_cols, &v, skin, palette, st, motion, prefs, &mut actions);
                     x += sizes[i].x + BAY_GAP;
                 }
             }
@@ -468,7 +516,12 @@ pub fn show(
         });
     });
     if let Some(pos) = st.picker {
-        picker(ui.ctx(), pos, devices, &state.positions, skin, st, motion, &mut actions);
+        picker(ui.ctx(), pos, devices, &state.positions, skin, st, motion, prefs.advanced, &mut actions);
+    }
+    // The app list is read only while an Apps picker is open.
+    if st.picker.is_none_or(|p| p.group != PosGroup::App) {
+        st.apps = None;
+        st.app_filter.clear();
     }
     if let Some(pos) = st.channels_of {
         channel_editor(ui.ctx(), pos, &state.positions, &v, st, &mut actions);
@@ -579,6 +632,7 @@ fn bay(
     ui: &mut egui::Ui,
     r: Rect,
     bv: &BayView,
+    spans: &[usize],
     max_cols: usize,
     v: &Views,
     skin: &GearSkin,
@@ -590,26 +644,29 @@ fn bay(
 ) {
     let p = ui.painter_at(r.expand(4.0));
     paint::recess(&p, r, skin, 16);
-    let colour = bv.bay.color();
-    let strip = Rect::from_min_size(r.min + Vec2::new(BAY_PAD + 2.0, 15.0), Vec2::new(20.0, 3.0));
-    p.rect_filled(strip, egui::CornerRadius::same(2), colour);
-    p.rect_filled(strip.expand(2.0), egui::CornerRadius::same(3), paint::alpha(colour, 0.18));
-    let title = bv.bay.title().to_uppercase();
-    let text = paint::etched_text(
-        &p,
-        Pos2::new(strip.right() + 8.0, strip.center().y),
-        Align2::LEFT_CENTER,
-        &title,
-        skin,
-        skin.ground_ink,
-        10.5,
-        true,
-        0.16,
-        0.82,
-    );
+    // The title: descriptive, or one word with "Short bay titles"; it
+    // leaves room for the expander on the right.
+    let expander_w = if bv.hidden > 0 || st.expanded.contains(&bv.bay) { 84.0 } else { 0.0 };
+    let at = Pos2::new(r.left() + BAY_PAD + 2.0, r.top() + 16.0);
+    let title = if prefs.short_bay_titles {
+        let title = bv.bay.title().to_uppercase();
+        paint::etched_text(&p, at, Align2::LEFT_CENTER, &title, skin, skin.ground_ink, 10.5, true, 0.16, 0.82);
+        title
+    } else {
+        let title = bv.bay.description().to_string();
+        paint::truncated(
+            &p,
+            at,
+            Align2::LEFT_CENTER,
+            &title,
+            paint::font(ui.ctx(), "label-bold", 12.5),
+            paint::alpha(skin.ground_ink, 0.85),
+            r.width() - 2.0 * BAY_PAD - expander_w - 4.0,
+        );
+        title
+    };
     let (_, label) = ui.allocate_exact_size(Vec2::ZERO, Sense::hover());
     label.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &title));
-    let _ = text;
     // The expander: every position of the bay, or back to the devices.
     let expanded = st.expanded.contains(&bv.bay);
     if bv.hidden > 0 || expanded {
@@ -634,11 +691,11 @@ fn bay(
             }
         }
     }
-    let cols = bv.cards.len().clamp(1, max_cols.max(1));
-    for (k, pos) in bv.cards.iter().enumerate() {
-        let (row, col) = (k / cols, k % cols);
+    let (places, _, _) = crate::bays::place_cards(spans, max_cols);
+    for ((pos, &(row, col)), &span) in bv.cards.iter().zip(&places).zip(spans) {
         let at = r.min + Vec2::new(BAY_PAD + col as f32 * (CARD_W + GAP), BAY_HEADER + row as f32 * (CARD_H + GAP));
-        card(ui, Rect::from_min_size(at, Vec2::new(CARD_W, CARD_H)), pos, v, skin, palette, st, motion, prefs, actions);
+        let w = card_width(span.clamp(1, max_cols.max(1)));
+        card(ui, Rect::from_min_size(at, Vec2::new(w, CARD_H)), pos, v, skin, palette, st, motion, prefs, actions);
     }
 }
 
@@ -874,9 +931,23 @@ fn card(
         );
     }
     // The OLED: the state line on top, the meters below.
-    let well = Rect::from_min_size(r.min + Vec2::new(12.0, 66.0), Vec2::new(w - 24.0, 74.0));
+    let well = Rect::from_min_size(r.min + Vec2::new(WELL_INSET, 66.0), Vec2::new(w - 2.0 * WELL_INSET, 74.0));
     paint::oled_well(&painter, well, &skin);
-    let inner = well.shrink2(Vec2::new(7.0, 5.0));
+    let inner = well.shrink2(Vec2::new(METER_INSET, 5.0));
+    // The meter's geometry, worked out first: the grid behind takes its dots.
+    let groups = if off { Vec::new() } else { device_groups(p, v) };
+    let mrect = Rect::from_min_max(Pos2::new(inner.left(), inner.top() + 9.0), inner.max);
+    let ppp = ui.ctx().pixels_per_point();
+    let geom = crate::gear::oled_meter::fit_geom(
+        &groups,
+        mrect.width(),
+        Geom::card().resolve(prefs.meter.style, ppp, mrect.height()),
+    );
+    if prefs.meter.style == crate::gear::oled_meter::MeterStyle::DotMatrix && !off {
+        // The display's own pixel grid, behind its text and meters.
+        let dots = crate::gear::oled_meter::grid_dots(&geom, ppp, mrect.height());
+        crate::gear::oled_meter::dot_grid(&painter.with_clip_rect(well.shrink(2.0)), well.shrink(2.0), dots);
+    }
     let state_text = if f.line2.is_empty() { f.line1.clone() } else { format!("{} {}", f.line1, f.line2) };
     let state_text: String =
         state_text.replace('\u{b7}', " ").replace('\u{2026}', "...").replace('\u{d7}', "X").to_uppercase();
@@ -888,24 +959,14 @@ fn card(
         crate::gear::pixel_font::draw(&mut text_mesh, inner.left_top(), &state_text, 1.0, oled_c, false);
     }
     painter.with_clip_rect(inner).add(egui::Shape::mesh(text_mesh));
-    if !off {
-        let groups = device_groups(p, v);
-        if !groups.is_empty() {
-            // The state line has its own row; the meter fills the rest.
-            let mrect = Rect::from_min_max(Pos2::new(inner.left(), inner.top() + 9.0), inner.max);
-            let mut geom = Geom::card();
-            // Group labels share the top row with the state line: they win if both don't fit.
-            if crate::gear::oled_meter::meter_layout(&groups, mrect, &geom).overflow {
-                geom = Geom { bar_w: 2.0, gap: 1.0, ..geom };
-            }
-            let m =
-                crate::gear::oled_meter::meter_widget(ui, id.with("meter"), mrect, &groups, &geom, prefs.meter, motion);
-            let what = format!("Channels of {}", p.pos.label());
-            m.response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
-            if m.response.clicked() {
-                st.channels_of = Some(p.pos);
-                st.channel_drafts.clear();
-            }
+    if !groups.is_empty() {
+        // The state line has its own row; the meter fills the rest.
+        let m = crate::gear::oled_meter::meter_widget(ui, id.with("meter"), mrect, &groups, &geom, prefs.meter, motion);
+        let what = format!("Channels of {}", p.pos.label());
+        m.response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
+        if m.response.clicked() {
+            st.channels_of = Some(p.pos);
+            st.channel_drafts.clear();
         }
     }
     // The controls, top right: faint until the card is hovered.
@@ -920,37 +981,39 @@ fn card(
     row.spacing_mut().item_spacing.x = 5.0;
     let label = p.pos.label();
     let virt = p.pos.group.is_virtual();
-    if let Some(c) = st.confirm.filter(|c| c.pos == p.pos) {
-        row.set_opacity(1.0);
-        confirm_strip(&mut row, c, &skin, st, actions);
-    } else if off {
-        if paint::pill_labeled(&mut row, "Turn on", &format!("Turn on {label}"), &skin).clicked() {
-            st.just_filled.insert(p.pos);
-            actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: None }));
-        }
-    } else {
-        if let Some(&slot) = p.slots.first() {
-            colour_menu(&mut row, slot, &label, colour, palette, &skin, actions);
-        }
-        if virt {
-            if p.pos.group == PosGroup::Vasio {
-                shape_menu(&mut row, p, &skin, actions);
-            }
-            if paint::pill_labeled(&mut row, "Off", &format!("Turn off {label}"), &skin).clicked() {
-                st.confirm = Some(Confirm { pos: p.pos, clear: false, at: now });
+    paint::compact_pills(&mut row, |row| {
+        if let Some(c) = st.confirm.filter(|c| c.pos == p.pos) {
+            row.set_opacity(1.0);
+            confirm_strip(row, c, &skin, st, actions);
+        } else if off {
+            if paint::pill_labeled(row, "Turn on", &format!("Turn on {label}"), &skin).clicked() {
+                st.just_filled.insert(p.pos);
+                actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: None }));
             }
         } else {
-            if paint::pill_labeled(&mut row, "Clear\u{2026}", &format!("Clear {label}"), &skin).clicked() {
-                st.confirm = Some(Confirm { pos: p.pos, clear: true, at: now });
+            if let Some(&slot) = p.slots.first() {
+                colour_menu(row, slot, &label, colour, palette, &skin, actions);
             }
-            if p.pos.group == PosGroup::Asio
-                && !p.master
-                && paint::pill_labeled(&mut row, "Master", &format!("Make {label} master"), &skin).clicked()
-            {
-                actions.push(ScreenAction::Edit(Edit::SetMaster { pos: Some(p.pos) }));
+            if virt {
+                if p.pos.group == PosGroup::Vasio {
+                    shape_menu(row, p, &skin, actions);
+                }
+                if paint::pill_labeled(row, "Off", &format!("Turn off {label}"), &skin).clicked() {
+                    st.confirm = Some(Confirm { pos: p.pos, clear: false, at: now });
+                }
+            } else {
+                if paint::pill_labeled(row, "Clear\u{2026}", &format!("Clear {label}"), &skin).clicked() {
+                    st.confirm = Some(Confirm { pos: p.pos, clear: true, at: now });
+                }
+                if p.pos.group == PosGroup::Asio
+                    && !p.master
+                    && paint::pill_labeled(row, "Master", &format!("Make {label} master"), &skin).clicked()
+                {
+                    actions.push(ScreenAction::Edit(Edit::SetMaster { pos: Some(p.pos) }));
+                }
             }
         }
-    }
+    });
     if resp.clicked() && !off {
         if ui.input(|i| i.modifiers.command) && !virt {
             st.open_picker(p.pos, true, r);
@@ -1106,8 +1169,8 @@ fn held_elsewhere(d: &DeviceInfo, pos: PosId, positions: &[PositionState]) -> Op
 }
 
 /// The picker popover's width, and the most it can grow to.
-pub const POPOVER_W: f32 = 300.0;
-pub const POPOVER_MAX_H: f32 = 440.0;
+pub const POPOVER_W: f32 = 340.0;
+pub const POPOVER_MAX_H: f32 = 520.0;
 
 /// Where a popover anchored to `anchor` goes, kept inside `screen`: its
 /// top-left corner under the tray, or (true) its bottom-left corner above
@@ -1123,6 +1186,131 @@ pub fn popover_pos(anchor: Rect, screen: Rect) -> (Pos2, bool) {
     } else {
         (Pos2::new(x, screen.top() + gap), false)
     }
+}
+
+/// The app list's height in the picker.
+const APP_LIST_H: f32 = 330.0;
+
+/// The running apps, playing audio first, with a filter. Returns the
+/// executable of the app clicked.
+fn app_list(ui: &mut egui::Ui, st: &mut ScreenState, advanced: bool, skin: &GearSkin) -> Option<String> {
+    let procs = st.apps.get_or_insert_with(crate::running_apps::AppLister::open).latest();
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    ui.add(TextEdit::singleline(&mut st.app_filter).hint_text("Filter apps\u{2026}").desired_width(f32::INFINITY));
+    // Confluence itself is never a capture target.
+    let own: Vec<u32> = procs
+        .iter()
+        .filter(|p| p.exe.to_ascii_lowercase().starts_with("confluence"))
+        .map(|p| p.pid)
+        .chain([std::process::id()])
+        .collect();
+    let (playing, other) = crate::running_apps::rows(&procs, &st.app_filter, advanced, &own);
+    let mut chosen = None;
+    let heading = |ui: &mut egui::Ui, text: &str| {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(text).size(10.0).strong().color(paint::alpha(skin.ink, 0.55)));
+    };
+    // A fixed height: the popover keeps its size (and place) while the list loads.
+    let (list, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), APP_LIST_H), Sense::hover());
+    let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list).layout(egui::Layout::top_down(Align::Min)));
+    let ui = &mut list_ui;
+    egui::ScrollArea::vertical().id_salt("app-list").max_height(APP_LIST_H).auto_shrink([false, false]).show(
+        ui,
+        |ui| {
+            if procs.is_empty() {
+                ui.label(egui::RichText::new("Looking for apps\u{2026}").color(paint::alpha(skin.ink, 0.6)));
+            }
+            if !playing.is_empty() {
+                heading(ui, "PLAYING AUDIO");
+            }
+            for r in &playing {
+                if app_row(ui, r, advanced, &mut st.icons, skin) {
+                    chosen = Some(r.exe.clone());
+                }
+            }
+            if !other.is_empty() {
+                heading(ui, if advanced { "OTHER APPS AND BACKGROUND PROCESSES" } else { "OTHER APPS" });
+            }
+            for r in &other {
+                if app_row(ui, r, advanced, &mut st.icons, skin) {
+                    chosen = Some(r.exe.clone());
+                }
+            }
+            if !procs.is_empty() && playing.is_empty() && other.is_empty() {
+                ui.label(egui::RichText::new("No apps match").color(paint::alpha(skin.ink, 0.6)));
+            }
+        },
+    );
+    chosen
+}
+
+/// One app in the list: its icon, name, executable (and PID with advanced
+/// options) and, while it plays, a small level. True when clicked.
+fn app_row(
+    ui: &mut egui::Ui,
+    r: &crate::running_apps::AppRow,
+    advanced: bool,
+    icons: &mut crate::app_icon::IconCache,
+    skin: &GearSkin,
+) -> bool {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 38.0), Sense::click());
+    let label = format!("Capture {}", r.name);
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
+    if !ui.is_rect_visible(rect) {
+        return resp.clicked();
+    }
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(
+            rect,
+            egui::CornerRadius::same(8),
+            if skin.light() { Color32::from_black_alpha(14) } else { Color32::from_white_alpha(14) },
+        );
+    }
+    let icon = Rect::from_min_size(rect.min + Vec2::new(8.0, 7.0), Vec2::splat(24.0));
+    let tex = icons.get(ui.ctx(), &r.exe);
+    p.image(tex.id(), icon, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+    let ctx = ui.ctx().clone();
+    let text_w = w - 44.0 - if r.audio { 44.0 } else { 8.0 };
+    paint::truncated(
+        p,
+        rect.min + Vec2::new(40.0, 4.0),
+        Align2::LEFT_TOP,
+        &r.name,
+        paint::font(&ctx, "label-bold", 13.0),
+        skin.ink,
+        text_w,
+    );
+    let mut sub = r.exe.clone();
+    if advanced {
+        if let Some(pid) = r.pids.first() {
+            sub.push_str(&format!(" \u{b7} PID {pid}"));
+            if r.pids.len() > 1 {
+                sub.push_str(&format!(" +{}", r.pids.len() - 1));
+            }
+        }
+    }
+    paint::truncated(
+        p,
+        rect.min + Vec2::new(40.0, 21.0),
+        Align2::LEFT_TOP,
+        &sub,
+        paint::font(&ctx, "label", 10.5),
+        paint::alpha(skin.ink, 0.6),
+        text_w,
+    );
+    if r.audio {
+        // Six steps, lit by the session's peak.
+        let lit = (r.level.clamp(0.0, 1.0).sqrt() * 6.0).round() as usize;
+        for k in 0..6 {
+            let x = rect.right() - 44.0 + k as f32 * 6.0;
+            let bar = Rect::from_min_size(Pos2::new(x, rect.center().y - 5.0), Vec2::new(4.0, 10.0));
+            let c = if k < lit.max(1) { skin.ink } else { paint::alpha(skin.ink, 0.15) };
+            p.rect_filled(bar, egui::CornerRadius::same(1), c);
+        }
+    }
+    resp.clicked()
 }
 
 /// A device row in the picker; `disabled` rows say why.
@@ -1189,6 +1377,7 @@ fn picker(
     skin: &GearSkin,
     st: &mut ScreenState,
     motion: &mut Motion,
+    advanced: bool,
     actions: &mut Vec<ScreenAction>,
 ) {
     let mut open = true;
@@ -1232,17 +1421,43 @@ fn picker(
                 ui.add_space(16.0);
                 match pos.group {
                     PosGroup::App => {
-                        ui.add(
-                            TextEdit::singleline(&mut st.app_name)
-                                .hint_text("process name or PID")
-                                .desired_width(f32::INFINITY),
-                        );
-                        let name = st.app_name.trim().to_string();
-                        let b = ui
-                            .add_enabled_ui(!name.is_empty(), |ui| paint::pill_labeled(ui, "Capture", "Capture", skin))
-                            .inner;
-                        if b.clicked() && !name.is_empty() {
-                            chosen = Some((DeviceKind::AppCapture, name));
+                        let pid_entry = advanced || cfg!(not(windows));
+                        if pid_entry {
+                            // A disclosure row (open by default where there is no list).
+                            let label = "Advanced: capture by process name or PID";
+                            let open = st.pid_entry_open || cfg!(not(windows));
+                            let arrow = if open { "\u{25be}" } else { "\u{25b8}" };
+                            let row = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{arrow} {label}"))
+                                        .size(11.5)
+                                        .color(paint::alpha(skin.ink, 0.7)),
+                                )
+                                .sense(Sense::click()),
+                            );
+                            row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+                            if row.clicked() {
+                                st.pid_entry_open = !st.pid_entry_open;
+                            }
+                            if open {
+                                ui.add(
+                                    TextEdit::singleline(&mut st.app_name)
+                                        .hint_text("process name or PID")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                let name = st.app_name.trim().to_string();
+                                let b = ui
+                                    .add_enabled_ui(!name.is_empty(), |ui| {
+                                        paint::pill_labeled(ui, "Capture", "Capture", skin)
+                                    })
+                                    .inner;
+                                if b.clicked() && !name.is_empty() {
+                                    chosen = Some((DeviceKind::AppCapture, name));
+                                }
+                            }
+                        }
+                        if let Some(exe) = app_list(ui, st, advanced, skin) {
+                            chosen = Some((DeviceKind::AppCapture, exe));
                         }
                     }
                     PosGroup::NetOut => {
@@ -1379,6 +1594,34 @@ fn name_to_send(draft: &str, current: &str, edited: bool) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn io(ins: usize, outs: usize) -> Vec<Group> {
+        let chans = |n: usize| (0..n).map(|i| Chan { number: i as u32 + 1, ..Chan::silent() }).collect::<Vec<_>>();
+        [("IN", ins), ("OUT", outs)]
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(l, n)| Group { label: format!("{l} {n}"), channels: chans(n) })
+            .collect()
+    }
+
+    #[test]
+    fn many_channel_devices_take_double_cards() {
+        for (ins, outs) in [(2, 0), (8, 8), (0, 2), (0, 8)] {
+            assert_eq!(card_span(&io(ins, outs)), 1, "{ins}x{outs}");
+        }
+        for (ins, outs) in [(16, 16), (23, 10)] {
+            assert_eq!(card_span(&io(ins, outs)), 2, "{ins}x{outs}");
+        }
+        // Whatever the style or scale, a single card's meter holds what card_span gave it.
+        use crate::gear::oled_meter::{fit_geom, meter_layout, MeterStyle};
+        for style in MeterStyle::all() {
+            let g = io(8, 8);
+            let full = Geom::card().resolve(style, 1.0, 50.0);
+            assert_eq!(fit_geom(&g, CARD_METER_W, full), full, "{style:?}: an 8x8 card keeps full bars at 100 %");
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(CARD_METER_W, 50.0));
+            assert!(!meter_layout(&g, r, &full).overflow);
+        }
+    }
+
     #[test]
     fn a_channel_name_is_sent_only_when_edited_and_changed() {
         assert_eq!(name_to_send("Kick", "Snare", false), None, "an untouched draft never overwrites");
@@ -1467,7 +1710,7 @@ mod tests {
         let low = Rect::from_min_size(Pos2::new(800.0, 700.0), Vec2::new(240.0, 190.0));
         let (at, above) = popover_pos(low, screen);
         assert!(above, "no room below: its bottom sits over the tray");
-        assert_eq!(at, Pos2::new(700.0, 692.0), "pulled in from the right edge");
+        assert_eq!(at, Pos2::new(1000.0 - POPOVER_W, 692.0), "pulled in from the right edge");
         let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 500.0));
         assert_eq!(popover_pos(tray, short), (Pos2::new(100.0, 8.0), false), "neither fits: pinned to the top");
     }

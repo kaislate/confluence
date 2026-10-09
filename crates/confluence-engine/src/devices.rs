@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use confluence_api::{
     all_positions, ClockRole, Command, DeviceInfo, DeviceKind, PosGroup, PosId, PositionDevice, PositionState,
@@ -125,8 +125,9 @@ pub type AsioOpener = Box<dyn Fn(&str) -> Result<AsioDevice, AsioHostError> + Se
 /// A device loaded but not yet attached to the engine.
 enum Loaded {
     Asio(AsioDevice),
-    /// The stream, and the endpoint id (None for per-app capture).
-    Wasapi(WasapiStream, Option<String>),
+    /// The stream, the endpoint id (None for per-app capture), and the
+    /// captured process (per-app capture only).
+    Wasapi(WasapiStream, Option<String>, Option<u32>),
     /// Nothing slow to do: the engine side is created when attached.
     Vasio,
     /// As VASIO: the driver is attached when the slot is created.
@@ -162,7 +163,7 @@ pub fn speaker_names(channels: usize) -> Vec<String> {
 fn loaded_shape(kind: DeviceKind, name: &str, loaded: &Loaded) -> Option<(u32, u32)> {
     match loaded {
         Loaded::Asio(dev) => Some((dev.info().inputs() as u32, dev.info().outputs() as u32)),
-        Loaded::Wasapi(stream, _) => {
+        Loaded::Wasapi(stream, _, _) => {
             let f = stream.format();
             let ch = f.channels as u32;
             Some(if f.direction == Direction::Render { (0, ch) } else { (ch, 0) })
@@ -245,11 +246,11 @@ fn load(
                 }
                 _ => Target::App { pid: find_process(name).map_err(|e| e.to_string())? },
             };
-            let id = match &target {
-                Target::Endpoint { id, .. } => Some(id.clone()),
-                Target::App { .. } => None,
+            let (id, pid) = match &target {
+                Target::Endpoint { id, .. } => (Some(id.clone()), None),
+                Target::App { pid } => (None, Some(*pid)),
             };
-            Loaded::Wasapi(WasapiStream::open(target).map_err(|e| e.to_string())?, id)
+            Loaded::Wasapi(WasapiStream::open(target).map_err(|e| e.to_string())?, id, pid)
         }
     })
 }
@@ -424,6 +425,10 @@ pub struct DeviceManager {
     master_health: Option<(u32, Arc<AsioHealth>)>,
     /// Offline network streams that failed to come back, and when to try again.
     net_retry_failed: Vec<(String, Instant)>,
+    /// The process each online app capture captures, by binding name.
+    app_pids: HashMap<String, u32>,
+    /// App captures that failed to reopen, and when to try again.
+    app_retry_failed: Vec<(String, Instant)>,
     /// Virtual positions' on/off and shape, and the master flag.
     table: PositionTable,
     /// Devices read at startup with their positions, not yet restored.
@@ -460,6 +465,8 @@ impl DeviceManager {
             save_blocked: None,
             master_health: None,
             net_retry_failed: Vec::new(),
+            app_pids: HashMap::new(),
+            app_retry_failed: Vec::new(),
             table: Self::all_off(),
             restore_list: Vec::new(),
             virtual_at: BTreeMap::new(),
@@ -1309,6 +1316,73 @@ impl DeviceManager {
         back
     }
 
+    /// App captures follow their app (spec: round 3 §4.1): one whose process
+    /// has exited goes offline (channels, routes and position kept), and an
+    /// offline one captured by name reopens when a process of that name runs
+    /// again. Call every couple of seconds. Returns whether anything changed.
+    pub fn follow_apps(
+        &mut self,
+        engine: &mut Engine,
+        alive: &dyn Fn(u32) -> bool,
+        find: &dyn Fn(&str) -> Option<u32>,
+    ) -> bool {
+        let now = Instant::now();
+        self.app_retry_failed.retain(|(_, at)| now < *at);
+        let apps: Vec<AppCaptureState> = self
+            .bound
+            .iter()
+            .filter(|b| b.binding.kind == DeviceKind::AppCapture)
+            .filter(|b| !self.app_retry_failed.iter().any(|(n, _)| *n == b.binding.name))
+            .map(|b| AppCaptureState {
+                name: b.binding.name.clone(),
+                online: !b.handles.is_empty(),
+                pid: self.app_pids.get(&b.binding.name).copied(),
+            })
+            .collect();
+        let mut changed = false;
+        for act in decide_follow(&apps, alive, find) {
+            match act {
+                FollowAction::Park(name) => {
+                    let Some(i) = self.bound.iter().position(|b| {
+                        b.binding.kind == DeviceKind::AppCapture && b.binding.name == name && !b.handles.is_empty()
+                    }) else {
+                        continue;
+                    };
+                    let Bound { binding, slots, handles, pos } = self.bound.remove(i);
+                    drop(handles); // stop the capture before its slot is detached
+                    for id in &slots {
+                        let _ = engine.detach_slot(*id);
+                    }
+                    self.app_pids.remove(&name);
+                    match Self::park_offline(engine, binding.clone()) {
+                        Ok(mut parked) => {
+                            parked.pos = pos;
+                            Self::key_colours(engine, &parked);
+                            self.bound.push(parked);
+                        }
+                        Err(e) => {
+                            eprintln!("confluence-engine: {}: {e}", binding.device());
+                            self.unplaced.push(binding);
+                        }
+                    }
+                    eprintln!("confluence-engine: app:{name} exited; its capture is offline until it runs again");
+                    changed = true;
+                }
+                FollowAction::Reopen(name) => match self.add(engine, DeviceKind::AppCapture, &name) {
+                    Ok(_) => {
+                        eprintln!("confluence-engine: app:{name} is running again; captured");
+                        changed = true;
+                    }
+                    Err(e) => {
+                        eprintln!("confluence-engine: app:{name} is running but could not be captured: {e}");
+                        self.app_retry_failed.push((name, now + APP_RETRY_AFTER));
+                    }
+                },
+            }
+        }
+        changed
+    }
+
     /// Holds a missing device's channels with an offline slot.
     fn park_offline(engine: &mut Engine, b: Binding) -> Result<Bound, String> {
         let spec = OfflineSlotSpec {
@@ -1541,7 +1615,10 @@ impl DeviceManager {
             Loaded::Vasio => self.open_vasio(engine, name, device, at).map(|b| (b, None)),
             Loaded::Vaio => self.open_vaio(engine, name, device, at).map(|b| (b, None)),
             Loaded::Net(n, looked_up) => self.open_net(engine, kind, name, at, n, looked_up).map(|b| (b, None)),
-            Loaded::Wasapi(mut stream, endpoint_id) => {
+            Loaded::Wasapi(mut stream, endpoint_id, pid) => {
+                if let (DeviceKind::AppCapture, Some(pid)) = (kind, pid) {
+                    self.app_pids.insert(name.to_string(), pid);
+                }
                 let f = stream.format();
                 let mut binding = Binding { endpoint_id, ..binding_of(kind, name) };
                 let (id, handler) = if f.direction == Direction::Render {
@@ -2026,6 +2103,48 @@ fn same_device(binding: &Binding, kind: DeviceKind, name: &str) -> bool {
 /// An offline network stream whose engine is found but that fails to open is
 /// tried again after this long.
 const NET_RETRY_AFTER: Duration = Duration::from_secs(5);
+/// How long an app capture that failed to reopen waits before the next try.
+const APP_RETRY_AFTER: Duration = Duration::from_secs(10);
+
+/// An app capture, for [`decide_follow`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppCaptureState {
+    /// Its binding name: an executable name, or a PID.
+    pub name: String,
+    pub online: bool,
+    /// The process it captures, when online.
+    pub pid: Option<u32>,
+}
+
+/// What [`decide_follow`] wants done to an app capture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowAction {
+    /// Its process exited: take it offline.
+    Park(String),
+    /// Its app runs again: reopen it.
+    Reopen(String),
+}
+
+/// The pure part of [`DeviceManager::follow_apps`]: online captures whose
+/// process is gone are parked; offline captures by name whose app `find`s
+/// again are reopened. A capture by PID is never reopened (PIDs are reused).
+pub fn decide_follow(
+    apps: &[AppCaptureState],
+    alive: &dyn Fn(u32) -> bool,
+    find: &dyn Fn(&str) -> Option<u32>,
+) -> Vec<FollowAction> {
+    let mut out = Vec::new();
+    for a in apps {
+        match (a.online, a.pid) {
+            (true, Some(pid)) if !alive(pid) => out.push(FollowAction::Park(a.name.clone())),
+            (false, _) if a.name.trim().parse::<u32>().is_err() && find(&a.name).is_some() => {
+                out.push(FollowAction::Reopen(a.name.clone()))
+            }
+            _ => {}
+        }
+    }
+    out
+}
 /// A receive stream silent this long is reported lost.
 const NET_SILENT_MS: u64 = 1000;
 /// The most latency a receive stream may grow to absorb a bad network.
@@ -2127,6 +2246,39 @@ pub fn parse_vasio(name: &str) -> Result<(u32, usize, usize), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app(name: &str, online: bool, pid: Option<u32>) -> AppCaptureState {
+        AppCaptureState { name: name.into(), online, pid }
+    }
+
+    #[test]
+    fn an_exited_app_goes_offline() {
+        let apps = [app("discord.exe", true, Some(100))];
+        let acts = decide_follow(&apps, &|pid| pid != 100, &|_| None);
+        assert_eq!(acts, [FollowAction::Park("discord.exe".into())]);
+    }
+
+    #[test]
+    fn a_restarted_app_reopens_by_name() {
+        let apps = [app("discord.exe", false, None)];
+        let acts = decide_follow(&apps, &|_| false, &|n| (n == "discord.exe").then_some(200));
+        assert_eq!(acts, [FollowAction::Reopen("discord.exe".into())]);
+        assert!(decide_follow(&apps, &|_| false, &|_| None).is_empty(), "not back yet");
+    }
+
+    #[test]
+    fn a_capture_by_pid_is_not_reopened() {
+        let apps = [app("4242", false, None)];
+        assert!(decide_follow(&apps, &|_| true, &|_| Some(4242)).is_empty(), "PIDs are reused");
+        let gone = [app("4242", true, Some(4242))];
+        assert_eq!(decide_follow(&gone, &|_| false, &|_| None), [FollowAction::Park("4242".into())]);
+    }
+
+    #[test]
+    fn a_running_app_is_left_alone() {
+        let apps = [app("discord.exe", true, Some(100)), app("spotify.exe", true, None)];
+        assert!(decide_follow(&apps, &|_| true, &|_| Some(1)).is_empty());
+    }
     use crate::engine::EngineConfig;
 
     #[test]

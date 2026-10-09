@@ -499,11 +499,6 @@ fn pill_body(p: &Painter, r: Rect, s: &GearSkin, pressed: f32, lit: bool) {
         Stroke::new(1.0, Color32::from_black_alpha(if light { 60 } else { 120 })),
         StrokeKind::Inside,
     );
-    // The light below its bottom edge.
-    p.line_segment(
-        [Pos2::new(r.left() + 10.0, r.bottom() + 0.5), Pos2::new(r.right() - 10.0, r.bottom() + 0.5)],
-        Stroke::new(1.0, Color32::from_white_alpha((s.etch * 200.0 * (1.0 - pressed)) as u8)),
-    );
 }
 
 /// A glass pill button.
@@ -517,6 +512,53 @@ pub fn pill_labeled(ui: &mut Ui, label: &str, accessible: &str, s: &GearSkin) ->
     pill_full(ui, label, accessible, s, false, None)
 }
 
+/// A gear toggle in `r`: a dark track whose knob slides right and glows gold
+/// when `on`, with `label` and a `sub` line beside it. The whole row
+/// toggles; it is one accessible checkbox labelled `label`.
+pub fn switch(ui: &mut Ui, r: Rect, on: &mut bool, label: &str, sub: &str, s: &GearSkin) -> Response {
+    let resp = ui.interact(r, ui.id().with(("switch", label)), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+    }
+    let state = *on;
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, state, label));
+    let p = ui.painter();
+    let k = ui.ctx().animate_bool_with_time(resp.id.with("knob"), state, 0.15);
+    let track = Rect::from_min_size(Pos2::new(r.left(), r.center().y - 12.0), Vec2::new(46.0, 24.0));
+    let gold = Color32::from_rgb(0xf3, 0xc2, 0x4f);
+    p.rect_filled(track, CornerRadius::same(12), Color32::from_rgb(0x16, 0x17, 0x1a));
+    p.rect_filled(track, CornerRadius::same(12), alpha(Color32::from_rgb(0x5a, 0x42, 0x10), k));
+    p.rect_stroke(
+        track,
+        CornerRadius::same(12),
+        egui::Stroke::new(1.0, alpha(Color32::BLACK, 0.5)),
+        egui::StrokeKind::Inside,
+    );
+    let c = Pos2::new(track.left() + 12.0 + 22.0 * k, track.center().y);
+    if k > 0.01 {
+        p.circle_filled(c, 12.0, alpha(gold, 0.25 * k));
+    }
+    let knob = Color32::from_rgb(0xc8, 0xc8, 0xcc).lerp_to_gamma(gold, k);
+    p.circle_filled(c, 9.0, knob);
+    p.circle_filled(c - Vec2::new(0.0, 2.0), 5.0, alpha(Color32::WHITE, 0.25));
+    let ink = s.ground_ink;
+    p.text(
+        Pos2::new(track.right() + 12.0, r.center().y - 8.0),
+        Align2::LEFT_CENTER,
+        label,
+        font(ui.ctx(), "label-bold", 13.0),
+        alpha(ink, if resp.hovered() { 1.0 } else { 0.92 }),
+    );
+    p.text(
+        Pos2::new(track.right() + 12.0, r.center().y + 9.0),
+        Align2::LEFT_CENTER,
+        sub,
+        font(ui.ctx(), "label", 11.5),
+        alpha(ink, 0.58),
+    );
+    resp
+}
+
 /// A pill that is lit (filled with the accent) while `lit`: tabs, scenes.
 pub fn pill_lit(ui: &mut Ui, label: &str, accessible: &str, lit: bool, s: &GearSkin) -> Response {
     pill_full(ui, label, accessible, s, lit, None)
@@ -527,10 +569,26 @@ pub fn pill_tinted(ui: &mut Ui, label: &str, accessible: &str, tint: Color32, s:
     pill_full(ui, label, accessible, s, false, Some(tint))
 }
 
+/// Pills drawn while this is set are compact (card headers): see [`compact_pills`].
+fn compact_id() -> egui::Id {
+    egui::Id::new("paint-compact-pills")
+}
+
+/// Draws `add`'s pills compact: smaller text, padding and height, for rows
+/// with little room (a card's header).
+pub fn compact_pills<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.ctx().data_mut(|d| d.insert_temp(compact_id(), true));
+    let r = add(ui);
+    ui.ctx().data_mut(|d| d.remove::<bool>(compact_id()));
+    r
+}
+
 fn pill_full(ui: &mut Ui, label: &str, accessible: &str, s: &GearSkin, lit: bool, tint: Option<Color32>) -> Response {
-    let f = font(ui.ctx(), "label-bold", 12.0);
+    let compact = ui.ctx().data(|d| d.get_temp::<bool>(compact_id())).unwrap_or(false);
+    let (size, pad, h) = if compact { (11.0, 12.0, PILL_H - 4.0) } else { (12.0, 18.0, PILL_H) };
+    let f = font(ui.ctx(), "label-bold", size);
     let galley = ui.painter().layout_no_wrap(label.to_string(), f.clone(), s.ink);
-    let size = Vec2::new(galley.size().x + 18.0, PILL_H);
+    let size = Vec2::new(galley.size().x + pad, h);
     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
     let enabled = ui.is_enabled();
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, accessible));

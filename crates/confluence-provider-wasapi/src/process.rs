@@ -54,6 +54,27 @@ pub(crate) fn pick(procs: &[Proc], name: &str) -> Option<u32> {
         .or_else(|| matches.iter().map(|p| p.pid).min())
 }
 
+/// True while process `pid` runs. A process we may not open (elevated,
+/// protected) counts as running: only "no such process" or an exit code
+/// says it is gone.
+pub fn process_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: query-only access; the handle is closed below.
+    let h = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => h,
+        Err(e) => return e.code() == ERROR_ACCESS_DENIED.to_hresult(),
+    };
+    let mut code = 0u32;
+    // SAFETY: `h` is a process handle we own; `code` receives the exit code.
+    let ok = unsafe { GetExitCodeProcess(h, &mut code) }.is_ok();
+    // SAFETY: closing the handle opened above.
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    !ok || code == STILL_ACTIVE.0 as u32
+}
+
 /// Resolves a process name (e.g. `Discord`, `obs64.exe`) or a numeric PID.
 pub fn find_process(name_or_pid: &str) -> Result<u32, WasapiError> {
     if let Ok(pid) = name_or_pid.trim().parse::<u32>() {
@@ -65,6 +86,17 @@ pub fn find_process(name_or_pid: &str) -> Result<u32, WasapiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_process_is_alive_and_an_exited_one_is_not() {
+        assert!(process_alive(std::process::id()));
+        let mut child = std::process::Command::new("cmd").args(["/c", "exit"]).spawn().expect("cmd runs");
+        let pid = child.id();
+        child.wait().unwrap();
+        // The handle `child` held is closed with it, so the PID is gone.
+        drop(child);
+        assert!(!process_alive(pid), "{pid} exited");
+    }
 
     fn p(pid: u32, parent: u32, exe: &str) -> Proc {
         Proc { pid, parent, exe: exe.into() }

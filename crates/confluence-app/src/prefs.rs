@@ -19,6 +19,11 @@ pub struct ViewPrefs {
     /// one still shows its device name).
     pub only_custom_names: bool,
     pub bridge: BridgePrefs,
+    /// "Enable advanced options" (Settings): power-user choices such as
+    /// capturing an app by process name or PID.
+    pub advanced: bool,
+    /// One-word bay titles ("HARDWARE") instead of descriptive ones.
+    pub short_bay_titles: bool,
 }
 
 impl Default for ViewPrefs {
@@ -27,6 +32,8 @@ impl Default for ViewPrefs {
             meter: MeterLook { style: MeterStyle::Segments, double_peak: false, clip_red: true },
             only_custom_names: false,
             bridge: BridgePrefs::default(),
+            advanced: false,
+            short_bay_titles: false,
         }
     }
 }
@@ -79,6 +86,15 @@ impl ViewPrefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advanced_options_are_saved_and_default_off() {
+        assert!(!ViewPrefs::default().advanced);
+        let p = ViewPrefs { advanced: true, ..ViewPrefs::default() };
+        let back = ViewPrefs::from_storage(Some(&p.to_storage()));
+        assert!(back.advanced);
+        assert!(!ViewPrefs::from_storage(Some("{}")).advanced, "older saves have it off");
+    }
     use crate::gear::oled_meter::MeterStyle;
 
     #[test]
