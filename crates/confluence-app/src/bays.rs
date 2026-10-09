@@ -13,13 +13,14 @@ pub enum Bay {
     Hardware,
     Windows,
     Virtual,
+    Vaio,
     Network,
     Apps,
 }
 
 impl Bay {
-    pub fn all() -> [Bay; 5] {
-        [Bay::Hardware, Bay::Windows, Bay::Virtual, Bay::Network, Bay::Apps]
+    pub fn all() -> [Bay; 6] {
+        [Bay::Hardware, Bay::Windows, Bay::Virtual, Bay::Vaio, Bay::Network, Bay::Apps]
     }
 
     pub fn title(self) -> &'static str {
@@ -27,6 +28,7 @@ impl Bay {
             Bay::Hardware => "Hardware",
             Bay::Windows => "Windows",
             Bay::Virtual => "Virtual",
+            Bay::Vaio => "VAIO",
             Bay::Network => "Network",
             Bay::Apps => "Apps",
         }
@@ -38,6 +40,7 @@ impl Bay {
             Bay::Hardware => "Audio interfaces",
             Bay::Windows => "Windows playback & recording",
             Bay::Virtual => "Virtual devices for DAWs",
+            Bay::Vaio => "Virtual Windows devices",
             Bay::Network => "Network streams",
             Bay::Apps => "Captured apps",
         }
@@ -49,6 +52,7 @@ impl Bay {
             Bay::Hardware => Color32::from_rgb(0xe9, 0xa5, 0x4b),
             Bay::Windows => Color32::from_rgb(0x55, 0xc7, 0xe9),
             Bay::Virtual => Color32::from_rgb(0x6a, 0xa7, 0xff),
+            Bay::Vaio => Color32::from_rgb(0x8e, 0x9c, 0xff),
             Bay::Network => Color32::from_rgb(0x55, 0xd6, 0xa0),
             Bay::Apps => Color32::from_rgb(0xc4, 0x8c, 0xff),
         }
@@ -59,7 +63,8 @@ impl Bay {
         match self {
             Bay::Hardware => &[PosGroup::Asio],
             Bay::Windows => &[PosGroup::WinIn, PosGroup::WinOut],
-            Bay::Virtual => &[PosGroup::Vasio, PosGroup::Vaio],
+            Bay::Virtual => &[PosGroup::Vasio],
+            Bay::Vaio => &[PosGroup::Vaio],
             Bay::Network => &[PosGroup::NetIn, PosGroup::NetOut],
             Bay::Apps => &[PosGroup::App],
         }
@@ -71,7 +76,8 @@ pub fn bay_of(g: PosGroup) -> Bay {
     match g {
         PosGroup::Asio => Bay::Hardware,
         PosGroup::WinIn | PosGroup::WinOut => Bay::Windows,
-        PosGroup::Vasio | PosGroup::Vaio => Bay::Virtual,
+        PosGroup::Vasio => Bay::Virtual,
+        PosGroup::Vaio => Bay::Vaio,
         PosGroup::NetIn | PosGroup::NetOut => Bay::Network,
         PosGroup::App => Bay::Apps,
     }
@@ -167,6 +173,24 @@ mod tests {
     use confluence_api::{all_positions, PositionDevice};
 
     #[test]
+    fn vaio_has_its_own_bay_after_virtual() {
+        assert_eq!(bay_of(PosGroup::Vaio), Bay::Vaio);
+        assert_eq!(bay_of(PosGroup::Vasio), Bay::Virtual);
+        assert_eq!(Bay::Virtual.groups(), &[PosGroup::Vasio]);
+        let all = Bay::all();
+        let i = all.iter().position(|b| *b == Bay::Virtual).unwrap();
+        assert_eq!(all[i + 1], Bay::Vaio);
+        assert_eq!(Bay::Vaio.title(), "VAIO");
+        assert_ne!(Bay::Vaio.color(), Bay::Virtual.color());
+    }
+
+    #[test]
+    fn a_four_column_card_in_a_three_column_bay_is_clamped() {
+        assert_eq!(place_cards(&[4, 1], 3), (vec![(0, 0), (1, 0)], 3, 2));
+        assert_eq!(place_cards(&[1, 3], 4), (vec![(0, 0), (0, 1)], 4, 1));
+    }
+
+    #[test]
     fn cards_with_spans_pack_row_by_row() {
         assert_eq!(place_cards(&[2, 1, 1, 1], 4), (vec![(0, 0), (0, 2), (0, 3), (1, 0)], 4, 2));
         assert_eq!(place_cards(&[1, 2, 2], 3), (vec![(0, 0), (0, 1), (1, 0)], 3, 2));
@@ -206,7 +230,7 @@ mod tests {
     fn groups_map_to_their_bays() {
         assert_eq!(bay_of(PosGroup::WinIn), Bay::Windows);
         assert_eq!(bay_of(PosGroup::WinOut), Bay::Windows);
-        assert_eq!(bay_of(PosGroup::Vaio), Bay::Virtual);
+        assert_eq!(bay_of(PosGroup::Vaio), Bay::Vaio);
         assert_eq!(bay_of(PosGroup::NetOut), Bay::Network);
         for b in Bay::all() {
             assert!(b.groups().iter().all(|g| bay_of(*g) == b));
@@ -228,11 +252,12 @@ mod tests {
             views.iter().find(|v| v.bay == b).unwrap().cards.iter().map(|p| p.pos.to_string()).collect()
         };
         assert_eq!(names(Bay::Windows), vec!["win-in:1", "win-in:2", "win-out:1"]);
-        assert_eq!(names(Bay::Virtual), vec!["vasio:A", "vasio:B", "vaio:A"]);
+        assert_eq!(names(Bay::Virtual), vec!["vasio:A", "vasio:B"]);
+        assert_eq!(names(Bay::Vaio), vec!["vaio:A"]);
         assert_eq!(names(Bay::Hardware), vec!["asio:1"]);
         let windows = views.iter().find(|v| v.bay == Bay::Windows).unwrap();
         assert_eq!(windows.hidden, 6 + 7, "WIN IN 3-8 and WIN OUT 2-8 are folded");
         let all = bay_views(&ps, &[Bay::Virtual].into_iter().collect());
-        assert_eq!(all.iter().find(|v| v.bay == Bay::Virtual).unwrap().cards.len(), 9);
+        assert_eq!(all.iter().find(|v| v.bay == Bay::Virtual).unwrap().cards.len(), 8);
     }
 }
