@@ -193,11 +193,14 @@ pub fn resize_dir(window: Rect, p: Pos2, band: f32) -> Option<egui::ResizeDirect
 /// maximized. Call once per frame.
 pub fn edge_resize(ctx: &egui::Context) {
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-    if maximized {
-        return;
-    }
     let window = ctx.content_rect();
     let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else { return };
+    // A floating window (Scripts, a dialog) dragged to the edge keeps its own
+    // grips and scrollbars; nothing mid-drag is interrupted either.
+    let over_window = ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background);
+    if !edge_resize_allowed(maximized, over_window, ctx.dragged_id().is_some()) {
+        return;
+    }
     let Some(dir) = resize_dir(window, pos, RESIZE_BAND) else { return };
     use egui::ResizeDirection as D;
     ctx.set_cursor_icon(match dir {
@@ -209,6 +212,19 @@ pub fn edge_resize(ctx: &egui::Context) {
     if ctx.input(|i| i.pointer.primary_pressed()) {
         ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
     }
+}
+
+/// Whether the window's edges resize it now: not while maximized, over a
+/// floating window, or while something is being dragged.
+pub fn edge_resize_allowed(maximized: bool, over_window: bool, dragging: bool) -> bool {
+    !maximized && !over_window && !dragging
+}
+
+/// Whether a press at `press` on the rail may move the window: only from
+/// empty rail, not from its controls (`blocked`: their rects) nor the resize
+/// band. A slow click on a pill must stay a click.
+pub fn may_drag_window(press: Pos2, blocked: &[Rect], at_edge: bool) -> bool {
+    !at_edge && !blocked.iter().any(|r| r.contains(press))
 }
 
 /// How close to the window's edge a press resizes it.
@@ -455,6 +471,24 @@ pub fn reveal(motion: &mut Motion, id: Id) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_drags_only_from_empty_rail() {
+        let pills = Rect::from_min_max(Pos2::new(800.0, 6.0), Pos2::new(1000.0, 40.0));
+        let tabs = Rect::from_min_max(Pos2::new(140.0, 6.0), Pos2::new(340.0, 40.0));
+        assert!(may_drag_window(Pos2::new(500.0, 20.0), &[pills, tabs], false), "empty rail");
+        assert!(!may_drag_window(Pos2::new(900.0, 20.0), &[pills, tabs], false), "a long press on a pill");
+        assert!(!may_drag_window(Pos2::new(200.0, 20.0), &[pills, tabs], false), "on the tabs");
+        assert!(!may_drag_window(Pos2::new(500.0, 2.0), &[pills, tabs], true), "on the resize band");
+    }
+
+    #[test]
+    fn edge_resizing_is_only_for_the_apps_own_background() {
+        assert!(edge_resize_allowed(false, false, false));
+        assert!(!edge_resize_allowed(true, false, false), "maximized");
+        assert!(!edge_resize_allowed(false, true, false), "over a floating window (Scripts, a dialog)");
+        assert!(!edge_resize_allowed(false, false, true), "while something is being dragged");
+    }
 
     #[test]
     fn the_window_edges_and_corners_resize_it() {

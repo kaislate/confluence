@@ -627,13 +627,17 @@ impl ConfluenceApp {
                 let ctx = ui.ctx().clone();
                 let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                 let drag = ui.interact(r, egui::Id::new("title-drag"), egui::Sense::click_and_drag());
-                let at_edge = ctx.input(|i| i.pointer.press_origin()).is_some_and(|p| {
+                let press = ctx.input(|i| i.pointer.press_origin());
+                let at_edge = press.is_some_and(|p| {
                     !maximized && shell::resize_dir(ctx.content_rect(), p, shell::RESIZE_BAND).is_some()
                 });
-                if drag.drag_started() && !at_edge {
+                // The rail's controls, as laid out last frame: a press there is theirs.
+                let blocked: Vec<Rect> = ctx.data(|d| d.get_temp(egui::Id::new("title-blocked"))).unwrap_or_default();
+                let free = press.is_some_and(|p| shell::may_drag_window(p, &blocked, at_edge));
+                if drag.drag_started() && free {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                if drag.double_clicked() {
+                if drag.double_clicked() && free {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                 }
                 let inner = Rect::from_min_max(r.min + Vec2::new(10.0, 6.0), r.max - Vec2::new(10.0, 8.0));
@@ -641,10 +645,15 @@ impl ConfluenceApp {
                     ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
                 row.spacing_mut().item_spacing.x = 6.0;
                 shell::wordmark(&mut row, &skin);
+                let tabs_from = row.cursor().min.x;
                 shell::segmented(&mut row, &skin, screen);
+                let tabs = Rect::from_min_max(
+                    Pos2::new(tabs_from, inner.top()),
+                    Pos2::new(row.cursor().min.x, inner.bottom()),
+                );
                 row.add_space(14.0);
                 shell::engine_cluster(&mut row, &skin, motion, &text, status.as_ref(), flashing, dsp_warn);
-                row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let controls = row.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     match shell::window_buttons(ui, &skin, maximized) {
                         Some(shell::WindowAction::Minimize) => {
@@ -666,6 +675,8 @@ impl ConfluenceApp {
                         }
                     }
                 });
+                let right = controls.response.rect;
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("title-blocked"), vec![tabs, right]));
             },
         );
         self.banner(ui, view, now);

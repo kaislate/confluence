@@ -1087,6 +1087,13 @@ fn the_window_buttons_sit_by_scripts_and_work() {
         h.get_by_label("Close").rect(),
     );
     assert!(scripts.right() < min.left() && min.right() <= max.left() && max.right() <= close.left(), "in order");
+    // Only the rail's controls block a window drag; the empty rail between them moves it.
+    let blocked: Vec<eframe::egui::Rect> =
+        h.ctx.data(|d| d.get_temp(eframe::egui::Id::new("title-blocked"))).unwrap_or_default();
+    let inspector = h.get_by_label("Inspector").rect();
+    let gap = eframe::egui::pos2(inspector.left() - 60.0, inspector.center().y);
+    assert!(blocked.iter().any(|r| r.contains(inspector.center())), "{blocked:?}");
+    assert!(!blocked.iter().any(|r| r.contains(gap)), "empty rail stays draggable: {blocked:?}");
     h.get_by_label("Maximize").click();
     h.step();
     let cmds = &h.output().viewport_output[&eframe::egui::ViewportId::ROOT].commands;
