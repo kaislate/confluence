@@ -1073,3 +1073,23 @@ fn clicking_the_minimap_moves_the_grid_there() {
     });
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn the_window_buttons_sit_by_scripts_and_work() {
+    let d = EngineDir::new("chrome");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1400.0, 900.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    let (scripts, min, max, close) = (
+        h.get_by_label("Scripts\u{2026}").rect(),
+        h.get_by_label("Minimize").rect(),
+        h.get_by_label("Maximize").rect(),
+        h.get_by_label("Close").rect(),
+    );
+    assert!(scripts.right() < min.left() && min.right() <= max.left() && max.right() <= close.left(), "in order");
+    h.get_by_label("Maximize").click();
+    h.step();
+    let cmds = &h.output().viewport_output[&eframe::egui::ViewportId::ROOT].commands;
+    assert!(cmds.contains(&eframe::egui::ViewportCommand::Maximized(true)), "{cmds:?}");
+    client(&d).call(Command::Shutdown).unwrap();
+}

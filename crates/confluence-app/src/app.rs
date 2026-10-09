@@ -498,6 +498,7 @@ impl ConfluenceApp {
         self.graphs_live.store(graphs, Ordering::Relaxed);
         // Meters are on screen on the Devices screen and in the popped-out bridge.
         self.meters_live.store(self.screen == Screen::Devices || self.prefs.bridge.popped, Ordering::Relaxed);
+        shell::edge_resize(&ctx);
         self.rail(ui, &view, now);
         self.scene_rail(ui, &view);
         self.side_panels(ui, &view, now);
@@ -620,6 +621,21 @@ impl ConfluenceApp {
             |ui| {
                 let r = ui.max_rect();
                 shell::rail_face(ui.painter(), r, &skin);
+                // The rail is the title bar: drag it to move the window,
+                // double-click to maximize. (Registered first: the pills on
+                // it take their own clicks.)
+                let ctx = ui.ctx().clone();
+                let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                let drag = ui.interact(r, egui::Id::new("title-drag"), egui::Sense::click_and_drag());
+                let at_edge = ctx.input(|i| i.pointer.press_origin()).is_some_and(|p| {
+                    !maximized && shell::resize_dir(ctx.content_rect(), p, shell::RESIZE_BAND).is_some()
+                });
+                if drag.drag_started() && !at_edge {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if drag.double_clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
                 let inner = Rect::from_min_max(r.min + Vec2::new(10.0, 6.0), r.max - Vec2::new(10.0, 8.0));
                 let mut row =
                     ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
@@ -629,6 +645,18 @@ impl ConfluenceApp {
                 row.add_space(14.0);
                 shell::engine_cluster(&mut row, &skin, motion, &text, status.as_ref(), flashing, dsp_warn);
                 row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    match shell::window_buttons(ui, &skin, maximized) {
+                        Some(shell::WindowAction::Minimize) => {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                        Some(shell::WindowAction::ToggleMaximized) => {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+                        Some(shell::WindowAction::Close) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        None => {}
+                    }
+                    ui.add_space(10.0);
                     ui.spacing_mut().item_spacing.x = 6.0;
                     for (open, label) in [(scripts, "Scripts…"), (inspector, "Inspector")] {
                         let resp = paint::pill_lit(ui, label, label, *open, &skin);
