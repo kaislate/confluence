@@ -14,6 +14,8 @@ pub const CELL_MIN: f32 = 12.0;
 pub const CELL_MAX: f32 = 40.0;
 /// Pixels of vertical drag per gain step.
 pub const DRAG_PX_PER_STEP: f32 = 4.0;
+/// The separator strip before each device's channels (its name sits in it).
+pub const SEP: f32 = 20.0;
 
 /// One slot's channels along an axis.
 #[derive(Clone, Debug, PartialEq)]
@@ -23,6 +25,8 @@ pub struct Band {
     pub name: String,
     /// Custom names of its channels in this direction (one per channel).
     pub channel_labels: Vec<Option<String>>,
+    /// The device's own names for those channels ("Front L", "DAW out 1").
+    pub channel_names: Vec<String>,
     pub online: bool,
     /// An insert bus: its rows are returns and its columns sends.
     pub bus: bool,
@@ -42,23 +46,26 @@ pub struct Band {
 pub struct Axis {
     pub bands: Vec<Band>,
     pub len: usize,
+    /// The cell size the offsets below are in.
+    pub cell: f32,
 }
 
 impl Axis {
     pub fn inputs(slots: &[SlotState]) -> Axis {
-        Self::build(slots, |s| (s.first_input, s.inputs, s.input_labels.clone()))
+        Self::build(slots, |s| (s.first_input, s.inputs, s.input_labels.clone(), s.input_names.clone()))
     }
 
     pub fn outputs(slots: &[SlotState]) -> Axis {
-        Self::build(slots, |s| (s.first_output, s.outputs, s.output_labels.clone()))
+        Self::build(slots, |s| (s.first_output, s.outputs, s.output_labels.clone(), s.output_names.clone()))
     }
 
-    fn build(slots: &[SlotState], range: impl Fn(&SlotState) -> (u32, u32, Vec<Option<String>>)) -> Axis {
+    #[allow(clippy::type_complexity)]
+    fn build(slots: &[SlotState], range: impl Fn(&SlotState) -> (u32, u32, Vec<Option<String>>, Vec<String>)) -> Axis {
         let mut sorted: Vec<&SlotState> = slots.iter().collect();
         sorted.sort_by_key(|s| s.id);
-        let mut axis = Axis::default();
+        let mut axis = Axis { cell: CELL_DEFAULT, ..Axis::default() };
         for s in sorted {
-            let (first_channel, channels, channel_labels) = range(s);
+            let (first_channel, channels, channel_labels, channel_names) = range(s);
             if channels == 0 {
                 continue;
             }
@@ -70,6 +77,7 @@ impl Axis {
                 slot: s.id,
                 name: s.label.clone().unwrap_or_else(|| s.name.clone()),
                 channel_labels,
+                channel_names,
                 online: s.online,
                 bus: s.is_bus(),
                 first_channel,
@@ -105,6 +113,49 @@ impl Axis {
     pub fn band(&self, slot: u32) -> Option<&Band> {
         self.bands.iter().find(|b| b.slot == slot)
     }
+
+    /// Where band `bi`'s separator strip starts (each band is its strip, then
+    /// its channels).
+    pub fn strip_pos(&self, bi: usize) -> f32 {
+        self.bands.get(bi).map_or(self.extent(), |b| b.start as f32 * self.cell + bi as f32 * SEP)
+    }
+
+    /// Where channel `index` starts.
+    pub fn pos(&self, index: usize) -> f32 {
+        let bi = self.bands.iter().position(|b| index < b.start + b.channels as usize).unwrap_or(self.bands.len());
+        index as f32 * self.cell + (bi + 1).min(self.bands.len().max(1)) as f32 * SEP
+    }
+
+    /// The axis's whole length: every strip and channel.
+    pub fn extent(&self) -> f32 {
+        self.len as f32 * self.cell + self.bands.len() as f32 * SEP
+    }
+
+    /// The channel at offset `p` (`None` on a strip or off the axis).
+    pub fn index_at(&self, p: f32) -> Option<usize> {
+        self.bands.iter().enumerate().find_map(|(bi, b)| {
+            let from = self.strip_pos(bi) + SEP;
+            let k = ((p - from) / self.cell).floor();
+            (p >= from && k < b.channels as f32).then(|| b.start + k as usize)
+        })
+    }
+
+    /// The channels whose cells touch offsets `a..b`.
+    pub fn range(&self, a: f32, b: f32) -> Range<usize> {
+        let touching: Vec<usize> = self
+            .bands
+            .iter()
+            .flat_map(|band| band.start..band.start + band.channels as usize)
+            .filter(|&k| {
+                let p = self.pos(k);
+                p + self.cell > a && p < b
+            })
+            .collect();
+        match (touching.first(), touching.last()) {
+            (Some(&f), Some(&l)) => f..l + 1,
+            _ => 0..0,
+        }
+    }
 }
 
 pub struct GridLayout {
@@ -115,31 +166,31 @@ pub struct GridLayout {
 
 impl GridLayout {
     pub fn new(slots: &[SlotState], cell: f32) -> Self {
-        GridLayout { rows: Axis::inputs(slots), cols: Axis::outputs(slots), cell: cell.clamp(CELL_MIN, CELL_MAX) }
+        let cell = cell.clamp(CELL_MIN, CELL_MAX);
+        let (mut rows, mut cols) = (Axis::inputs(slots), Axis::outputs(slots));
+        (rows.cell, cols.cell) = (cell, cell);
+        GridLayout { rows, cols, cell }
     }
 
-    /// Width and height of the cell area.
+    /// Width and height of the cell area, separator strips included.
     pub fn size(&self) -> (f32, f32) {
-        (self.cols.len as f32 * self.cell, self.rows.len as f32 * self.cell)
+        (self.cols.extent(), self.rows.extent())
     }
 
-    /// The (row, column) under a point relative to the cell area's top left.
+    /// The (row, column) under a point relative to the cell area's top left
+    /// (`None` on a separator strip).
     pub fn cell_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
-        if x < 0.0 || y < 0.0 {
-            return None;
-        }
-        let (row, col) = ((y / self.cell) as usize, (x / self.cell) as usize);
-        (row < self.rows.len && col < self.cols.len).then_some((row, col))
+        Some((self.rows.index_at(y)?, self.cols.index_at(x)?))
     }
 
     /// Row and column ranges intersecting the rectangle (cell-area coordinates).
     pub fn visible(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> (Range<usize>, Range<usize>) {
-        let span = |a: f32, b: f32, len: usize| {
-            let start = ((a / self.cell).floor().max(0.0) as usize).min(len);
-            let end = ((b / self.cell).ceil().max(0.0) as usize).min(len);
-            start..end.max(start)
-        };
-        (span(y0, y1, self.rows.len), span(x0, x1, self.cols.len))
+        (self.rows.range(y0, y1), self.cols.range(x0, x1))
+    }
+
+    /// A cell's top-left corner (cell-area coordinates).
+    pub fn cell_pos(&self, row: usize, col: usize) -> (f32, f32) {
+        (self.cols.pos(col), self.rows.pos(row))
     }
 
     /// The (input, output) global channels of a cell.
@@ -282,6 +333,42 @@ pub fn move_selection(l: &GridLayout, at: (usize, usize), dr: i32, dc: i32) -> O
 mod tests {
     use super::*;
 
+    /// Two input devices of 2 and 3 channels, one output device of 2.
+    fn two_bands() -> GridLayout {
+        GridLayout::new(&[slot(1, "A", 0, 2, 0, 2), slot(2, "B", 2, 3, 0, 0)], 20.0)
+    }
+
+    #[test]
+    fn each_device_has_a_separator_strip_before_its_channels() {
+        let l = two_bands();
+        // Rows: [strip A][a1][a2][strip B][b1][b2][b3]
+        assert_eq!(l.rows.strip_pos(0), 0.0);
+        assert_eq!(l.rows.pos(0), SEP);
+        assert_eq!(l.rows.pos(1), SEP + 20.0);
+        assert_eq!(l.rows.strip_pos(1), SEP + 40.0);
+        assert_eq!(l.rows.pos(2), 2.0 * SEP + 40.0);
+        assert_eq!(l.rows.extent(), 2.0 * SEP + 100.0);
+        assert_eq!(l.size(), (SEP + 40.0, 2.0 * SEP + 100.0));
+    }
+
+    #[test]
+    fn points_map_to_cells_and_strips_take_no_cell() {
+        let l = two_bands();
+        for k in 0..l.rows.len {
+            assert_eq!(l.rows.index_at(l.rows.pos(k) + 10.0), Some(k), "row {k}");
+        }
+        assert_eq!(l.rows.index_at(SEP / 2.0), None, "the first strip");
+        assert_eq!(l.rows.index_at(l.rows.strip_pos(1) + 1.0), None, "the second strip");
+        assert_eq!(l.rows.index_at(-1.0), None);
+        assert_eq!(l.rows.index_at(l.rows.extent() + 1.0), None);
+        assert_eq!(l.cell_at(SEP + 25.0, 2.0 * SEP + 45.0), Some((2, 1)));
+        assert_eq!(l.cell_at(5.0, 2.0 * SEP + 45.0), None, "on the column strip");
+        // Visible ranges cover every cell touching the window.
+        let (rows, cols) = l.visible(0.0, SEP + 30.0, 1000.0, 2.0 * SEP + 41.0);
+        assert_eq!(rows, 1..3);
+        assert_eq!(cols, 0..2);
+    }
+
     #[test]
     fn custom_names_show_on_the_bands_and_in_crosspoint_labels() {
         let mut a = slot(1, "VASIO 1", 0, 2, 0, 2);
@@ -376,11 +463,13 @@ mod tests {
     #[test]
     fn hit_testing_finds_the_cell_and_respects_edges() {
         let l = GridLayout::new(&slots(), 20.0);
-        assert_eq!(l.cell_at(0.0, 0.0), Some((0, 0)));
-        assert_eq!(l.cell_at(39.9, 59.9), Some((2, 1)));
-        assert_eq!(l.cell_at(80.0, 0.0), None, "right of the last column");
+        let at = |r: usize, c: usize, dx: f32, dy: f32| l.cell_at(l.cols.pos(c) + dx, l.rows.pos(r) + dy);
+        assert_eq!(at(0, 0, 0.0, 0.0), Some((0, 0)));
+        assert_eq!(at(2, 1, 19.9, 19.9), Some((2, 1)));
+        assert_eq!(l.cell_at(l.cols.extent(), l.rows.pos(0)), None, "right of the last column");
         assert_eq!(l.cell_at(-1.0, 5.0), None);
-        assert_eq!(l.size(), (80.0, 60.0));
+        let (cb, rb) = (l.cols.bands.len() as f32, l.rows.bands.len() as f32);
+        assert_eq!(l.size(), (80.0 + cb * SEP, 60.0 + rb * SEP));
     }
 
     #[test]
@@ -401,7 +490,8 @@ mod tests {
     fn only_visible_cells_are_returned_for_a_large_matrix() {
         let big = vec![slot(1, "Big", 0, 1024, 0, 1024)];
         let l = GridLayout::new(&big, 20.0);
-        let (rows, cols) = l.visible(400.0, 2000.0, 1200.0, 2600.0);
+        // One device: its strip comes first.
+        let (rows, cols) = l.visible(400.0 + SEP, 2000.0 + SEP, 1200.0 + SEP, 2600.0 + SEP);
         assert_eq!(rows, 100..130);
         assert_eq!(cols, 20..60);
     }

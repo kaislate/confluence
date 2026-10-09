@@ -302,7 +302,7 @@ fn cells_under_the_sticky_headers_cannot_be_hit() {
     h.step();
     h.event(eframe::egui::Event::MouseWheel {
         unit: eframe::egui::MouseWheelUnit::Point,
-        delta: eframe::egui::vec2(-25.0, -25.0),
+        delta: eframe::egui::vec2(-12.0, -12.0),
         modifiers: Default::default(),
         phase: eframe::egui::TouchPhase::Move,
     });

@@ -16,17 +16,14 @@ use crate::commands::Edit;
 use crate::gear::motion::{Curve, Motion, POP, SETTLE};
 use crate::gear::paint;
 use crate::gear::skins::{self, GearSkin};
-use crate::matrix::{cell_edit, Band, CellInput, GridLayout, Selection};
+use crate::matrix::{cell_edit, Band, CellInput, GridLayout, Selection, SEP};
 use crate::skin::Look;
 use crate::theme;
 
-/// Width of the row headers and height of the column headers.
-pub const HEADER_W: f32 = 160.0;
-pub const HEADER_H: f32 = TOP_RAIL + 22.0;
-/// The colour rail at the outer edge of each header: a narrow one down the
-/// left, a tall one along the top (its names read upward).
-const RAIL: f32 = 22.0;
-const TOP_RAIL: f32 = 74.0;
+/// Width of the row headers and height of the column headers: channel
+/// names read across on the left and upward along the top.
+pub const HEADER_W: f32 = 170.0;
+pub const HEADER_H: f32 = 96.0;
 /// Badges are drawn from this cell size up; below it gain shows as dot size.
 pub const BADGE_FROM: f32 = 20.0;
 /// Below this gain a route is a hollow ring rather than a darker square.
@@ -158,21 +155,22 @@ pub fn show(
         let grid = Rect::from_min_size(origin, Vec2::new(gw, gh));
         let bed = ui.painter_at(cell_area);
         paint::recess(&bed, grid, skin, 10);
-        // Hairlines between bands.
-        let hair = Stroke::new(1.0, paint::alpha(skin.ground_ink, 0.10));
-        for b in layout.rows.bands.iter().skip(1) {
-            let y = origin.y + b.start as f32 * cell;
-            bed.line_segment([Pos2::new(grid.left(), y), Pos2::new(grid.right(), y)], hair);
+        // Each device's separator strip runs across the bed, faintly in its colour.
+        for (bi, b) in layout.rows.bands.iter().enumerate() {
+            let y = origin.y + layout.rows.strip_pos(bi);
+            let strip = Rect::from_min_size(Pos2::new(grid.left(), y), Vec2::new(gw, SEP));
+            bed.rect_filled(strip, 0.0, paint::alpha(band_colour(look, skin, b), 0.10));
         }
-        for b in layout.cols.bands.iter().skip(1) {
-            let x = origin.x + b.start as f32 * cell;
-            bed.line_segment([Pos2::new(x, grid.top()), Pos2::new(x, grid.bottom())], hair);
+        for (bi, b) in layout.cols.bands.iter().enumerate() {
+            let x = origin.x + layout.cols.strip_pos(bi);
+            let strip = Rect::from_min_size(Pos2::new(x, grid.top()), Vec2::new(SEP, gh));
+            bed.rect_filled(strip, 0.0, paint::alpha(band_colour(look, skin, b), 0.10));
         }
         // The crosshair: the hovered (else selected) row and column, tinted.
         let focus = gs.hover.or_else(|| selected.and_then(|(i, o)| layout.cell_of(i, o)));
         if let Some((r, c)) = focus {
-            let ty = motion.tween(Id::new("cross-row"), r as f32 * cell, Curve::Enter, 0.09);
-            let tx = motion.tween(Id::new("cross-col"), c as f32 * cell, Curve::Enter, 0.09);
+            let ty = motion.tween(Id::new("cross-row"), layout.rows.pos(r), Curve::Enter, 0.09);
+            let tx = motion.tween(Id::new("cross-col"), layout.cols.pos(c), Curve::Enter, 0.09);
             let tint = paint::alpha(skin.ground_ink, 0.06);
             bed.rect_filled(Rect::from_min_size(Pos2::new(grid.left(), origin.y + ty), Vec2::new(gw, cell)), 0.0, tint);
             bed.rect_filled(Rect::from_min_size(Pos2::new(origin.x + tx, grid.top()), Vec2::new(cell, gh)), 0.0, tint);
@@ -187,7 +185,8 @@ pub fn show(
                 // Strings are built only when asked for: the label when the
                 // accessibility tree is active, the tooltip on hover.
                 let label = || layout.label(r, c).unwrap_or_default();
-                let rect = Rect::from_min_size(origin + Vec2::new(c as f32 * cell, r as f32 * cell), Vec2::splat(cell));
+                let (cx, cy) = layout.cell_pos(r, c);
+                let rect = Rect::from_min_size(origin + Vec2::new(cx, cy), Vec2::splat(cell));
                 // Only the visible part of a cell takes the pointer: a cell scrolled
                 // under a header must not take clicks meant for the header.
                 let hit = rect.intersect(cell_area);
@@ -327,110 +326,103 @@ pub fn show(
         let focus_col = focus.map(|(_, c)| c);
         let focus_row = focus.map(|(r, _)| r);
 
-        for band in &layout.cols.bands {
-            let x0 = origin.x + band.start as f32 * cell;
-            let strip = Rect::from_min_size(
-                Pos2::new(x0, top.min.y + 2.0),
-                Vec2::new(band.channels as f32 * cell, TOP_RAIL - 4.0),
-            );
+        // The outputs: each device's strip with its name reading upward, then
+        // its channels' numbers and names, also reading upward.
+        for (bi, band) in layout.cols.bands.iter().enumerate() {
+            let x0 = origin.x + layout.cols.strip_pos(bi);
+            let strip = Rect::from_min_size(Pos2::new(x0, top.min.y + 2.0), Vec2::new(SEP, HEADER_H - 6.0));
             let colour = band_colour(look, skin, band);
-            let painter = ui.painter_at(strip.intersect(top).expand2(Vec2::new(0.0, 2.0)));
-            if look.has_image("band") {
-                look.paint_band(&painter, strip.shrink2(Vec2::new(1.0, 0.0)), colour);
-            } else {
-                paint::raised(&painter, strip.shrink2(Vec2::new(1.0, 0.0)), colour, 4.0);
-            }
-            let name = if band.online { band.name.clone() } else { format!("{} \u{b7} OFFLINE", band.name) };
-            // The name reads upward along the band's visible start, as the
-            // column labels of a patch bay do.
-            let first_visible = x0.max(top.min.x);
-            rotated(
-                &painter,
-                Pos2::new(first_visible + cell / 2.0, strip.bottom() - 6.0),
-                &name,
-                name_font.clone(),
-                skins::ink_on(colour),
-                strip.height() - 10.0,
-            );
-            let hit = Rect::from_min_size(Pos2::new(x0, top.min.y), Vec2::new(strip.width(), HEADER_H)).intersect(top);
-            if hit.is_positive() {
-                let resp = ui.interact(hit, Id::new(("band-out", band.slot)), Sense::click());
-                resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{} outputs", band.name)));
-                if resp.clicked() {
-                    actions.select = Some(Selection::Slot(band.slot));
+            let name = band_name(band);
+            if strip.intersects(top) {
+                let painter = ui.painter_at(top);
+                if look.has_image("band") {
+                    look.paint_band(&painter, strip.shrink2(Vec2::new(1.0, 0.0)), colour);
+                } else {
+                    paint::raised(&painter, strip.shrink2(Vec2::new(1.0, 0.0)), colour, 4.0);
                 }
-                resp.on_hover_text(format!("{name}: {} outputs", band.channels));
+                rotated(
+                    &painter,
+                    Pos2::new(strip.center().x, strip.bottom() - 6.0),
+                    &name,
+                    name_font.clone(),
+                    skins::ink_on(colour),
+                    strip.height() - 12.0,
+                );
+                let hit = strip.intersect(top);
+                if hit.is_positive() {
+                    let resp = ui.interact(hit, Id::new(("band-out", band.slot)), Sense::click());
+                    resp.widget_info(|| {
+                        WidgetInfo::labeled(WidgetType::Button, true, format!("{} outputs", band.name))
+                    });
+                    if resp.clicked() {
+                        actions.select = Some(Selection::Slot(band.slot));
+                    }
+                    resp.on_hover_text(format!("{name}: {} outputs", band.channels));
+                }
             }
             for k in 0..band.channels {
-                let x = x0 + (k as f32 + 0.5) * cell;
+                let idx = band.start + k as usize;
+                let x = origin.x + layout.cols.pos(idx) + cell / 2.0;
                 if x > top.min.x && x < top.max.x {
-                    let lit = focus_col == Some(band.start + k as usize);
-                    tp.text(
-                        Pos2::new(x, top.min.y + TOP_RAIL + 11.0),
-                        Align2::CENTER_CENTER,
-                        (k + 1).to_string(),
+                    let lit = focus_col == Some(idx);
+                    rotated(
+                        &tp,
+                        Pos2::new(x, top.max.y - 6.0),
+                        &channel_text(band, k, if band.bus { "send" } else { "out" }),
                         number_font.clone(),
-                        paint::alpha(ink, if lit { 1.0 } else { 0.55 }),
+                        paint::alpha(ink, if lit { 1.0 } else { 0.6 }),
+                        HEADER_H - 12.0,
                     );
                 }
             }
         }
 
-        for band in &layout.rows.bands {
-            let y0 = origin.y + band.start as f32 * cell;
-            let strip = Rect::from_min_size(
-                Pos2::new(left.min.x + 2.0, y0),
-                Vec2::new(RAIL - 4.0, band.channels as f32 * cell),
-            );
+        // The inputs: each device's strip with its name across, then its
+        // channels' numbers and names.
+        for (bi, band) in layout.rows.bands.iter().enumerate() {
+            let y0 = origin.y + layout.rows.strip_pos(bi);
+            let strip = Rect::from_min_size(Pos2::new(left.min.x + 4.0, y0), Vec2::new(HEADER_W - 8.0, SEP));
             let colour = band_colour(look, skin, band);
-            let painter = ui.painter_at(strip.intersect(left).expand2(Vec2::new(2.0, 0.0)));
-            if look.has_image("band") {
-                look.paint_band(&painter, strip.shrink2(Vec2::new(0.0, 1.0)), colour);
-            } else {
-                paint::raised(&painter, strip.shrink2(Vec2::new(0.0, 1.0)), colour, 4.0);
-            }
-            let name = if band.online { band.name.clone() } else { format!("{} \u{b7} OFFLINE", band.name) };
-            let visible_bottom = strip.bottom().min(left.max.y);
-            let visible_top = strip.top().max(left.min.y);
-            let room = (visible_bottom - visible_top - 10.0).max(0.0);
-            rotated(
-                &painter,
-                Pos2::new(strip.center().x, visible_bottom - 6.0),
-                &name,
-                name_font.clone(),
-                skins::ink_on(colour),
-                room,
-            );
-            let hit =
-                Rect::from_min_size(Pos2::new(left.min.x, y0), Vec2::new(HEADER_W, strip.height())).intersect(left);
-            if hit.is_positive() {
-                let resp = ui.interact(hit, Id::new(("band-in", band.slot)), Sense::click());
-                resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{} inputs", band.name)));
-                if resp.clicked() {
-                    actions.select = Some(Selection::Slot(band.slot));
+            let name = band_name(band);
+            if strip.intersects(left) {
+                let painter = ui.painter_at(left);
+                if look.has_image("band") {
+                    look.paint_band(&painter, strip.shrink2(Vec2::new(0.0, 1.0)), colour);
+                } else {
+                    paint::raised(&painter, strip.shrink2(Vec2::new(0.0, 1.0)), colour, 4.0);
                 }
-                resp.on_hover_text(format!("{name}: {} inputs", band.channels));
+                paint::truncated(
+                    &painter,
+                    Pos2::new(strip.left() + 8.0, strip.center().y),
+                    Align2::LEFT_CENTER,
+                    &name,
+                    name_font.clone(),
+                    skins::ink_on(colour),
+                    strip.width() - 16.0,
+                );
+                let hit = strip.intersect(left);
+                if hit.is_positive() {
+                    let resp = ui.interact(hit, Id::new(("band-in", band.slot)), Sense::click());
+                    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{} inputs", band.name)));
+                    if resp.clicked() {
+                        actions.select = Some(Selection::Slot(band.slot));
+                    }
+                    resp.on_hover_text(format!("{name}: {} inputs", band.channels));
+                }
             }
             for k in 0..band.channels {
-                let y = y0 + (k as f32 + 0.5) * cell;
+                let idx = band.start + k as usize;
+                let y = origin.y + layout.rows.pos(idx) + cell / 2.0;
                 if y > left.min.y && y < left.max.y {
-                    let lit = focus_row == Some(band.start + k as usize);
-                    let what = if band.bus { "return" } else { "in" };
-                    // A channel's custom name, else its number.
-                    let text = band
-                        .channel_labels
-                        .get(k as usize)
-                        .cloned()
-                        .flatten()
-                        .unwrap_or_else(|| format!("{what} {}", k + 1));
+                    let lit = focus_row == Some(idx);
                     paint::truncated(
                         &lp,
                         Pos2::new(left.max.x - 8.0, y),
                         Align2::RIGHT_CENTER,
-                        &text,
+                        &channel_text(band, k, if band.bus { "return" } else { "in" }),
                         number_font.clone(),
-                        paint::alpha(ink, if lit { 1.0 } else { 0.55 }),
-                        HEADER_W - RAIL - 12.0,
+                        paint::alpha(ink, if lit { 1.0 } else { 0.6 }),
+                        HEADER_W - 16.0,
                     );
                 }
             }
@@ -452,6 +444,31 @@ pub fn show(
     });
     gs.hover = hover_now;
     actions
+}
+
+/// A device's name on its strip ("… · OFFLINE" while it is missing).
+fn band_name(band: &Band) -> String {
+    if band.online {
+        band.name.clone()
+    } else {
+        format!("{} \u{b7} OFFLINE", band.name)
+    }
+}
+
+/// A channel's margin text: its number and name ("3  Front L"), the custom
+/// name first, else the device's; "in 3" when it has neither.
+pub fn channel_text(band: &Band, k: u32, word: &str) -> String {
+    let named = band
+        .channel_labels
+        .get(k as usize)
+        .cloned()
+        .flatten()
+        .or_else(|| band.channel_names.get(k as usize).cloned())
+        .filter(|n| !n.trim().is_empty());
+    match named {
+        Some(n) => format!("{}  {n}", k + 1),
+        None => format!("{word} {}", k + 1),
+    }
 }
 
 /// Whether any visible-or-not route exists (cheap: asks the lookup for the
@@ -547,6 +564,27 @@ fn rotated(p: &egui::Painter, bottom: Pos2, text: &str, font: FontId, colour: Co
 mod tests {
     use super::*;
     use eframe::egui::MouseWheelUnit;
+
+    #[test]
+    fn a_channel_shows_its_number_and_name() {
+        let band = Band {
+            slot: 1,
+            name: "GoXLR".into(),
+            channel_labels: vec![Some("Kick".into()), None, None],
+            channel_names: vec!["Mic".into(), "Line".into(), String::new()],
+            online: true,
+            bus: false,
+            first_channel: 0,
+            channels: 3,
+            start: 0,
+            palette: 1,
+            color: None,
+        };
+        assert_eq!(channel_text(&band, 0, "in"), "1  Kick", "the custom name wins");
+        assert_eq!(channel_text(&band, 1, "in"), "2  Line", "else the device's name");
+        assert_eq!(channel_text(&band, 2, "in"), "in 3", "else the number");
+        assert_eq!(channel_text(&band, 9, "out"), "out 10");
+    }
 
     #[test]
     fn wheel_units_become_gain_steps() {

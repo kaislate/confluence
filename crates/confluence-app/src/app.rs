@@ -176,12 +176,15 @@ pub fn flag(args: &[String], name: &str) -> Option<String> {
 
 /// The cell size at which `cols` × `rows` cells fit `area` (the cell area,
 /// headers excluded), within the zoom range.
-pub fn fit_cell(area: Vec2, rows: usize, cols: usize) -> f32 {
+/// `rows` and `cols` are (channels, devices): each device's separator strip
+/// takes its room first.
+pub fn fit_cell(area: Vec2, (rows, row_bands): (usize, usize), (cols, col_bands): (usize, usize)) -> f32 {
     if rows == 0 || cols == 0 {
         return crate::matrix::CELL_DEFAULT;
     }
-    let by_w = area.x / cols as f32;
-    let by_h = area.y / rows as f32;
+    let sep = crate::matrix::SEP;
+    let by_w = (area.x - col_bands as f32 * sep) / cols as f32;
+    let by_h = (area.y - row_bands as f32 * sep) / rows as f32;
     by_w.min(by_h).floor().clamp(crate::matrix::CELL_MIN, crate::matrix::CELL_MAX)
 }
 
@@ -565,7 +568,8 @@ impl ConfluenceApp {
         if zero {
             if let Some(state) = &self.view.state {
                 let l = GridLayout::new(&state.slots, self.cell);
-                self.cell = fit_cell(self.matrix_area, l.rows.len, l.cols.len);
+                self.cell =
+                    fit_cell(self.matrix_area, (l.rows.len, l.rows.bands.len()), (l.cols.len, l.cols.bands.len()));
             }
         }
     }
@@ -1210,9 +1214,15 @@ mod tests {
 
     #[test]
     fn fit_picks_the_cell_that_shows_the_whole_grid() {
-        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), 20, 30), 26.0, "limited by the width: 800 / 30");
-        assert_eq!(fit_cell(Vec2::new(800.0, 200.0), 20, 10), 12.0, "clamped at the minimum");
-        assert_eq!(fit_cell(Vec2::new(8000.0, 6000.0), 2, 2), crate::matrix::CELL_MAX);
-        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), 0, 5), crate::matrix::CELL_DEFAULT);
+        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), (20, 0), (30, 0)), 26.0, "limited by the width: 800 / 30");
+        let strips = crate::matrix::SEP * 4.0;
+        assert_eq!(
+            fit_cell(Vec2::new(800.0 + strips, 600.0), (20, 1), (30, 4)),
+            26.0,
+            "the separator strips take their room first"
+        );
+        assert_eq!(fit_cell(Vec2::new(800.0, 200.0), (20, 0), (10, 0)), 12.0, "clamped at the minimum");
+        assert_eq!(fit_cell(Vec2::new(8000.0, 6000.0), (2, 0), (2, 0)), crate::matrix::CELL_MAX);
+        assert_eq!(fit_cell(Vec2::new(800.0, 600.0), (0, 0), (5, 0)), crate::matrix::CELL_DEFAULT);
     }
 }
