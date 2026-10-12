@@ -371,7 +371,7 @@ pub fn show(
                     resp.on_hover_text(format!("{name}: {} outputs", band.channels));
                 }
             }
-            for k in 0..band.channels {
+            for k in crate::matrix::channels_in(band, &cols) {
                 let idx = band.start + k as usize;
                 let x = origin.x + layout.cols.pos(idx) + cell / 2.0;
                 if x > top.min.x && x < top.max.x {
@@ -421,7 +421,7 @@ pub fn show(
                     resp.on_hover_text(format!("{name}: {} inputs", band.channels));
                 }
             }
-            for k in 0..band.channels {
+            for k in crate::matrix::channels_in(band, &rows) {
                 let idx = band.start + k as usize;
                 let y = origin.y + layout.rows.pos(idx) + cell / 2.0;
                 if y > left.min.y && y < left.max.y {
@@ -518,7 +518,7 @@ fn minimap(
         let points = routes.iter().filter_map(|&(i, o)| {
             let (r, c) = layout.cell_of(i, o)?;
             let (cx, cy) = layout.cell_pos(r, c);
-            let band = layout.rows.bands.iter().position(|b| r >= b.start && r < b.start + b.channels as usize)?;
+            let band = layout.rows.band_of(r);
             Some((Vec2::new(cx, cy) + Vec2::splat(layout.cell / 2.0), band))
         });
         crate::minimap::dots(points, k, dot * 2.0)

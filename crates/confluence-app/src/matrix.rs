@@ -96,7 +96,7 @@ impl Axis {
 
     /// The position of the band holding `index` (`bands.len()` past the end).
     /// Bands are contiguous and in order, so this is a binary search.
-    fn band_of(&self, index: usize) -> usize {
+    pub fn band_of(&self, index: usize) -> usize {
         self.bands.partition_point(|b| b.start + b.channels as usize <= index)
     }
 
@@ -169,6 +169,17 @@ impl Axis {
         } else {
             0..0
         }
+    }
+}
+
+/// The channels (0-based within `band`) whose indices fall in `visible`.
+pub fn channels_in(band: &Band, visible: &Range<usize>) -> Range<u32> {
+    let from = visible.start.max(band.start);
+    let to = visible.end.min(band.start + band.channels as usize);
+    if from < to {
+        (from - band.start) as u32..(to - band.start) as u32
+    } else {
+        0..0
     }
 }
 
@@ -560,6 +571,17 @@ mod tests {
             std::hint::black_box((l.rows.pos(rows.start), l.cols.index_at(y + 450.0), l.rows.at(cols.end)));
         }
         assert!(t.elapsed() < std::time::Duration::from_millis(60), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_bands_channels_on_screen_are_those_in_the_visible_range() {
+        let l = two_bands();
+        let (a, b) = (&l.rows.bands[0], &l.rows.bands[1]); // rows 0..2 and 2..5
+        assert_eq!(channels_in(a, &(1..4)), 1..2);
+        assert_eq!(channels_in(b, &(1..4)), 0..2);
+        assert_eq!(channels_in(b, &(0..2)), 0..0, "none of its channels");
+        assert_eq!(channels_in(a, &(0..0)), 0..0, "nothing visible");
+        assert_eq!(channels_in(b, &(0..99)), 0..3);
     }
 
     #[test]
