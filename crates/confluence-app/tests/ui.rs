@@ -1075,6 +1075,45 @@ fn clicking_the_minimap_moves_the_grid_there() {
 }
 
 #[test]
+fn the_wheel_scrolls_while_the_mouse_is_held_in_the_minimap() {
+    let d = EngineDir::new("minimap-wheel");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_big_vasio(&mut c);
+    let mut h = harness_sized(app_for(&d), 520.0, 360.0);
+    pump_until(&mut h, "the minimap", LONG, |h| h.query_by_label("Matrix overview").is_some());
+    settle(&mut h);
+    // Press in the map's middle and keep holding: the view jumps there once.
+    let at = h.get_by_label("Matrix overview").rect().center();
+    h.hover_at(at);
+    h.step();
+    h.event(eframe::egui::Event::PointerButton {
+        pos: at,
+        button: eframe::egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
+    pump_until(&mut h, "the jump", LONG, |h| h.state().matrix_scroll().y > 0.0);
+    for _ in 0..5 {
+        h.step();
+    }
+    let jumped = h.state().matrix_scroll();
+    // The wheel, still holding: the grid scrolls and stays scrolled.
+    h.event(eframe::egui::Event::MouseWheel {
+        unit: eframe::egui::MouseWheelUnit::Point,
+        delta: eframe::egui::vec2(0.0, -60.0),
+        modifiers: Default::default(),
+        phase: eframe::egui::TouchPhase::Move,
+    });
+    for _ in 0..30 {
+        h.step();
+    }
+    let after = h.state().matrix_scroll();
+    assert!(after.y > jumped.y + 20.0, "the wheel was undone: {jumped:?} -> {after:?}");
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
 fn the_window_buttons_sit_by_scripts_and_work() {
     let d = EngineDir::new("chrome");
     let _engine = Engine::spawn(&d);
