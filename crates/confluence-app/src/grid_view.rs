@@ -23,7 +23,7 @@ use crate::theme;
 /// Width of the row headers and height of the column headers: channel
 /// names read across on the left and upward along the top.
 pub const HEADER_W: f32 = 170.0;
-pub const HEADER_H: f32 = 96.0;
+pub const HEADER_H: f32 = 128.0;
 /// Badges are drawn from this cell size up; below it gain shows as dot size.
 pub const BADGE_FROM: f32 = 20.0;
 /// Below this gain a route is a hollow ring rather than a darker square.
@@ -48,6 +48,8 @@ pub struct GridState {
     pub offset: Vec2,
     /// Where the minimap asked the grid to scroll (applied next frame).
     pub scroll_to: Option<Vec2>,
+    /// The minimap's route dots, kept between frames.
+    pub mini_dots: crate::minimap::DotCache,
 }
 
 /// Pixels of touchpad (point-unit) scrolling per gain step.
@@ -331,7 +333,7 @@ pub fn show(
         tp.rect_filled(top, 0.0, skin.ground);
         lp.rect_filled(left, 0.0, skin.ground);
         let number_font = paint::font(ui.ctx(), "label", 10.0);
-        let name_font = paint::font(ui.ctx(), "label-bold", 11.0);
+        let name_font = paint::font(ui.ctx(), "label-bold", 13.0);
         let focus_col = focus.map(|(_, c)| c);
         let focus_row = focus.map(|(r, _)| r);
 
@@ -369,7 +371,7 @@ pub fn show(
                     resp.on_hover_text(format!("{name}: {} outputs", band.channels));
                 }
             }
-            for k in 0..band.channels {
+            for k in crate::matrix::channels_in(band, &cols) {
                 let idx = band.start + k as usize;
                 let x = origin.x + layout.cols.pos(idx) + cell / 2.0;
                 if x > top.min.x && x < top.max.x {
@@ -419,7 +421,7 @@ pub fn show(
                     resp.on_hover_text(format!("{name}: {} inputs", band.channels));
                 }
             }
-            for k in 0..band.channels {
+            for k in crate::matrix::channels_in(band, &rows) {
                 let idx = band.start + k as usize;
                 let y = origin.y + layout.rows.pos(idx) + cell / 2.0;
                 if y > left.min.y && y < left.max.y {
@@ -439,7 +441,8 @@ pub fn show(
         // The corner: a minimap of the whole matrix that moves the view.
         let corner = Rect::from_min_size(vp.min, Vec2::new(HEADER_W, HEADER_H));
         let view = (vp.size() - Vec2::new(HEADER_W, HEADER_H)).max(Vec2::ZERO);
-        let scroll_to = minimap(ui, corner, layout, look, skin, routes, viewport.min.to_vec2(), view);
+        let scroll_to =
+            minimap(ui, corner, layout, look, skin, routes, &mut gs.mini_dots, viewport.min.to_vec2(), view);
         if scroll_to.is_some() {
             gs.scroll_to = scroll_to;
             ui.ctx().request_repaint();
@@ -473,6 +476,7 @@ fn minimap(
     look: &Look,
     skin: &GearSkin,
     routes: &HashSet<(u32, u32)>,
+    cache: &mut crate::minimap::DotCache,
     offset: Vec2,
     view: Vec2,
 ) -> Option<Vec2> {
@@ -487,10 +491,10 @@ fn minimap(
         return None;
     }
     paint::recess(&p, mini.expand(3.0), skin, 5);
-    let k = mini.width() / gw;
+    let k = crate::minimap::scale(mini, content);
     for (bi, b) in layout.cols.bands.iter().enumerate() {
-        let x = mini.left() + layout.cols.strip_pos(bi) * k;
-        let w = ((SEP + b.channels as f32 * layout.cell) * k).max(1.0);
+        let x = mini.left() + layout.cols.strip_pos(bi) * k.x;
+        let w = ((SEP + b.channels as f32 * layout.cell) * k.x).max(1.0);
         p.rect_filled(
             Rect::from_min_size(Pos2::new(x, mini.top()), Vec2::new(w, 2.5)),
             0.0,
@@ -498,27 +502,62 @@ fn minimap(
         );
     }
     for (bi, b) in layout.rows.bands.iter().enumerate() {
-        let y = mini.top() + layout.rows.strip_pos(bi) * k;
-        let h = ((SEP + b.channels as f32 * layout.cell) * k).max(1.0);
+        let y = mini.top() + layout.rows.strip_pos(bi) * k.y;
+        let h = ((SEP + b.channels as f32 * layout.cell) * k.y).max(1.0);
         p.rect_filled(
             Rect::from_min_size(Pos2::new(mini.left(), y), Vec2::new(2.5, h)),
             0.0,
             band_colour(look, skin, b),
         );
     }
-    let dot = (layout.cell * k / 2.0).clamp(0.8, 2.5);
-    for &(i, o) in routes {
-        let Some((r, c)) = layout.cell_of(i, o) else { continue };
-        let (cx, cy) = layout.cell_pos(r, c);
-        let at = mini.min + Vec2::new(cx + layout.cell / 2.0, cy + layout.cell / 2.0) * k;
-        let colour = layout.rows.at(r).map(|(b, _)| band_colour(look, skin, b)).unwrap_or(skin.ground_ink);
-        p.circle_filled(at, dot, colour);
+    // Routes as dots in their input's colour, one per spot of the map, kept
+    // until the routes, the layout or the map's size change.
+    let dot = (layout.cell * k.min_elem() / 2.0).clamp(0.8, 2.5);
+    let key = minimap_key(layout, routes, mini.size());
+    let dots = cache.get(key, || {
+        let points = routes.iter().filter_map(|&(i, o)| {
+            let (r, c) = layout.cell_of(i, o)?;
+            let (cx, cy) = layout.cell_pos(r, c);
+            let band = layout.rows.band_of(r);
+            Some((Vec2::new(cx, cy) + Vec2::splat(layout.cell / 2.0), band))
+        });
+        crate::minimap::dots(points, k, dot * 2.0)
+    });
+    let colours: Vec<Color32> = layout.rows.bands.iter().map(|b| band_colour(look, skin, b)).collect();
+    for &(at, band) in dots {
+        p.circle_filled(mini.min + at, dot, colours.get(band).copied().unwrap_or(skin.ground_ink));
     }
     let v = crate::minimap::view_rect(mini, content, offset, view);
     p.rect_filled(v, egui::CornerRadius::same(2), paint::alpha(skin.accent, 0.10));
     p.rect_stroke(v, egui::CornerRadius::same(2), Stroke::new(1.5, skin.accent), StrokeKind::Inside);
-    let moving = resp.clicked() || resp.dragged() || resp.is_pointer_button_down_on();
+    // Held down, the map takes the wheel: the grid ignores it during a drag.
+    let wheel = ui.input(|i| i.smooth_scroll_delta);
+    if resp.is_pointer_button_down_on() && wheel != Vec2::ZERO {
+        ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
+        return Some(crate::minimap::wheel_offset(offset, wheel, content, view));
+    }
+    let pressed_here = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.any_pressed());
+    let moving = crate::minimap::moves_view(pressed_here, resp.clicked(), resp.drag_delta());
     resp.interact_pointer_pos().filter(|_| moving).map(|at| crate::minimap::offset_for(mini, content, view, at))
+}
+
+/// What the minimap's dots depend on: the routes, each band's place and
+/// size, the cell size and the map's size.
+fn minimap_key(layout: &GridLayout, routes: &HashSet<(u32, u32)>, mini: Vec2) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The set's order is arbitrary: combine its points order-independently.
+    let mut sum = 0u64;
+    for &(i, o) in routes {
+        let mut ph = std::collections::hash_map::DefaultHasher::new();
+        (i, o).hash(&mut ph);
+        sum = sum.wrapping_add(ph.finish());
+    }
+    (routes.len(), sum, layout.cell.to_bits(), mini.x.to_bits(), mini.y.to_bits()).hash(&mut h);
+    for b in layout.rows.bands.iter().chain(&layout.cols.bands) {
+        (b.slot, b.start, b.first_channel, b.channels).hash(&mut h);
+    }
+    h.finish()
 }
 
 /// A device's name on its strip ("… · OFFLINE" while it is missing).
