@@ -48,6 +48,8 @@ pub struct GridState {
     pub offset: Vec2,
     /// Where the minimap asked the grid to scroll (applied next frame).
     pub scroll_to: Option<Vec2>,
+    /// Bumped whenever the set of routes changes (the minimap's dots follow it).
+    pub routes_version: u64,
     /// The minimap's route dots, kept between frames.
     pub mini_dots: crate::minimap::DotCache,
 }
@@ -441,8 +443,18 @@ pub fn show(
         // The corner: a minimap of the whole matrix that moves the view.
         let corner = Rect::from_min_size(vp.min, Vec2::new(HEADER_W, HEADER_H));
         let view = (vp.size() - Vec2::new(HEADER_W, HEADER_H)).max(Vec2::ZERO);
-        let scroll_to =
-            minimap(ui, corner, layout, look, skin, routes, &mut gs.mini_dots, viewport.min.to_vec2(), view);
+        let scroll_to = minimap(
+            ui,
+            corner,
+            layout,
+            look,
+            skin,
+            routes,
+            gs.routes_version,
+            &mut gs.mini_dots,
+            viewport.min.to_vec2(),
+            view,
+        );
         if scroll_to.is_some() {
             gs.scroll_to = scroll_to;
             ui.ctx().request_repaint();
@@ -476,6 +488,7 @@ fn minimap(
     look: &Look,
     skin: &GearSkin,
     routes: &HashSet<(u32, u32)>,
+    routes_version: u64,
     cache: &mut crate::minimap::DotCache,
     offset: Vec2,
     view: Vec2,
@@ -513,7 +526,7 @@ fn minimap(
     // Routes as dots in their input's colour, one per spot of the map, kept
     // until the routes, the layout or the map's size change.
     let dot = (layout.cell * k.min_elem() / 2.0).clamp(0.8, 2.5);
-    let key = minimap_key(layout, routes, mini.size());
+    let key = minimap_key(layout, routes_version, mini.size());
     let dots = cache.get(key, || {
         let points = routes.iter().filter_map(|&(i, o)| {
             let (r, c) = layout.cell_of(i, o)?;
@@ -530,30 +543,27 @@ fn minimap(
     let v = crate::minimap::view_rect(mini, content, offset, view);
     p.rect_filled(v, egui::CornerRadius::same(2), paint::alpha(skin.accent, 0.10));
     p.rect_stroke(v, egui::CornerRadius::same(2), Stroke::new(1.5, skin.accent), StrokeKind::Inside);
-    // Held down, the map takes the wheel: the grid ignores it during a drag.
-    let wheel = ui.input(|i| i.smooth_scroll_delta);
-    if resp.is_pointer_button_down_on() && wheel != Vec2::ZERO {
-        ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
-        return Some(crate::minimap::wheel_offset(offset, wheel, content, view));
-    }
-    let pressed_here = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.any_pressed());
+    let held = resp.is_pointer_button_down_on();
+    let pressed_here = held && ui.input(|i| i.pointer.any_pressed());
     let moving = crate::minimap::moves_view(pressed_here, resp.clicked(), resp.drag_delta());
-    resp.interact_pointer_pos().filter(|_| moving).map(|at| crate::minimap::offset_for(mini, content, view, at))
+    let jump =
+        resp.interact_pointer_pos().filter(|_| moving).map(|at| crate::minimap::offset_for(mini, content, view, at));
+    // Held down, the map takes the wheel: the grid ignores it during a drag.
+    let mut wheel = Vec2::ZERO;
+    if held {
+        wheel = ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta));
+    }
+    crate::minimap::target(jump, offset, wheel, content, view)
 }
 
-/// What the minimap's dots depend on: the routes, each band's place and
-/// size, the cell size and the map's size.
-fn minimap_key(layout: &GridLayout, routes: &HashSet<(u32, u32)>, mini: Vec2) -> u64 {
+/// What the minimap's dots depend on: the routes (by their version), each
+/// band's place and size, the cell size and the map's size.
+fn minimap_key(layout: &GridLayout, routes_version: u64, mini: Vec2) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    // The set's order is arbitrary: combine its points order-independently.
-    let mut sum = 0u64;
-    for &(i, o) in routes {
-        let mut ph = std::collections::hash_map::DefaultHasher::new();
-        (i, o).hash(&mut ph);
-        sum = sum.wrapping_add(ph.finish());
-    }
-    (routes.len(), sum, layout.cell.to_bits(), mini.x.to_bits(), mini.y.to_bits()).hash(&mut h);
+    (routes_version, layout.cell.to_bits(), mini.x.to_bits(), mini.y.to_bits()).hash(&mut h);
+    // The row count first, so rows and columns can never run together.
+    layout.rows.bands.len().hash(&mut h);
     for b in layout.rows.bands.iter().chain(&layout.cols.bands) {
         (b.slot, b.start, b.first_channel, b.channels).hash(&mut h);
     }

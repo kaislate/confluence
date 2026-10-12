@@ -4,7 +4,7 @@
 //! drawing is in grid_view. All sizes are in grid (cell-area) coordinates
 //! unless named.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use eframe::egui::{Pos2, Rect, Vec2};
 
@@ -67,18 +67,38 @@ pub fn wheel_offset(offset: Vec2, delta: Vec2, content: Vec2, view: Vec2) -> Vec
     (offset - delta).clamp(Vec2::ZERO, (content - view).max(Vec2::ZERO))
 }
 
+/// Where the view goes this frame: to `jump` (where the map was pressed,
+/// clicked or dragged to) if any, then on by the `wheel` while held.
+pub fn target(jump: Option<Vec2>, offset: Vec2, wheel: Vec2, content: Vec2, view: Vec2) -> Option<Vec2> {
+    if wheel == Vec2::ZERO {
+        jump
+    } else {
+        Some(wheel_offset(jump.unwrap_or(offset), wheel, content, view))
+    }
+}
+
 /// Route dots for the map: each point (a cell centre in grid coordinates,
 /// with its row band) placed at its map offset `p * k`. Points landing in
-/// the same `bucket`-sized square of the map share one dot (the first's),
-/// so the map draws at most one dot per square however many routes exist.
+/// the same `bucket`-sized square of the map share one dot at the square's
+/// centre, coloured by the lowest band among them, so the map draws at most
+/// one dot per square however many routes exist, the same whatever their order.
 pub fn dots(points: impl IntoIterator<Item = (Vec2, usize)>, k: Vec2, bucket: f32) -> Vec<(Vec2, usize)> {
     let bucket = bucket.max(0.5);
-    let mut taken = HashSet::new();
-    points
-        .into_iter()
-        .map(|(p, band)| (p * k, band))
-        .filter(|(at, _)| taken.insert(((at.x / bucket).floor() as i64, (at.y / bucket).floor() as i64)))
-        .collect()
+    let mut squares: HashMap<(i64, i64), usize> = HashMap::new();
+    let mut out: Vec<(Vec2, usize)> = Vec::new();
+    for (p, band) in points {
+        let at = p * k;
+        let sq = ((at.x / bucket).floor() as i64, (at.y / bucket).floor() as i64);
+        match squares.get(&sq) {
+            Some(&i) => out[i].1 = out[i].1.min(band),
+            None => {
+                squares.insert(sq, out.len());
+                let centre = Vec2::new(sq.0 as f32 + 0.5, sq.1 as f32 + 0.5) * bucket;
+                out.push((centre, band));
+            }
+        }
+    }
+    out
 }
 
 /// The map's dots, kept between frames and rebuilt only when their `key`
@@ -176,6 +196,17 @@ mod tests {
     }
 
     #[test]
+    fn a_press_with_the_wheel_in_the_same_frame_jumps_then_scrolls() {
+        let (content, view) = (Vec2::new(1000.0, 800.0), Vec2::new(200.0, 100.0));
+        let (offset, wheel) = (Vec2::new(10.0, 10.0), Vec2::new(0.0, -60.0));
+        let jump = Some(Vec2::new(400.0, 300.0));
+        assert_eq!(target(jump, offset, wheel, content, view), Some(Vec2::new(400.0, 360.0)));
+        assert_eq!(target(None, offset, wheel, content, view), Some(Vec2::new(10.0, 70.0)), "held: the wheel");
+        assert_eq!(target(jump, offset, Vec2::ZERO, content, view), jump, "the press alone");
+        assert_eq!(target(None, offset, Vec2::ZERO, content, view), None, "nothing to do");
+    }
+
+    #[test]
     fn routes_on_the_same_spot_of_the_map_share_one_dot() {
         let k = Vec2::new(0.1, 0.05);
         let points = vec![
@@ -185,12 +216,22 @@ mod tests {
         ];
         let d = dots(points, k, 2.0);
         assert_eq!(d.len(), 2, "{d:?}");
-        assert_eq!(d[0], (Vec2::new(10.0, 5.0), 0));
+        assert_eq!(d[0], (Vec2::new(11.0, 5.0), 0));
         assert_eq!(d[1].1, 2);
         // A huge matrix full of routes still draws at most one dot per square.
         let many = (0..200).flat_map(|r| (0..200).map(move |c| (Vec2::new(c as f32 * 22.0, r as f32 * 22.0), 0)));
         let n = dots(many, Vec2::new(158.0 / 4400.0, 116.0 / 4400.0), 2.0).len();
         assert!(n <= 80 * 59, "{n} dots");
+    }
+
+    #[test]
+    fn a_shared_dot_takes_the_lowest_devices_colour_whatever_the_order() {
+        let k = Vec2::splat(0.1);
+        let a = vec![(Vec2::new(100.0, 100.0), 2), (Vec2::new(101.0, 101.0), 0), (Vec2::new(102.0, 101.0), 1)];
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(dots(a, k, 2.0), vec![(Vec2::new(11.0, 11.0), 0)], "at the square's centre");
+        assert_eq!(dots(b, k, 2.0)[0].1, 0, "the routes' order does not matter");
     }
 
     #[test]

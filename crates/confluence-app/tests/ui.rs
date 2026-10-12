@@ -1114,6 +1114,62 @@ fn the_wheel_scrolls_while_the_mouse_is_held_in_the_minimap() {
 }
 
 #[test]
+fn a_press_and_the_wheel_in_one_frame_still_jump_the_view() {
+    let d = EngineDir::new("minimap-press-wheel");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_big_vasio(&mut c);
+    let mut h = harness_sized(app_for(&d), 520.0, 360.0);
+    pump_until(&mut h, "the minimap", LONG, |h| h.query_by_label("Matrix overview").is_some());
+    settle(&mut h);
+    let at = h.get_by_label("Matrix overview").rect().center();
+    h.hover_at(at);
+    h.step();
+    h.event(eframe::egui::Event::PointerButton {
+        pos: at,
+        button: eframe::egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
+    h.event(eframe::egui::Event::MouseWheel {
+        unit: eframe::egui::MouseWheelUnit::Point,
+        delta: eframe::egui::vec2(0.0, -60.0),
+        modifiers: Default::default(),
+        phase: eframe::egui::TouchPhase::Move,
+    });
+    for _ in 0..10 {
+        h.step();
+    }
+    // The wheel only moves down; the jump to the map's middle moves across too.
+    assert!(h.state().matrix_scroll().x > 0.0, "the press was lost: {:?}", h.state().matrix_scroll());
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn the_minimap_rebuilds_its_dots_only_when_the_routes_change() {
+    let d = EngineDir::new("minimap-dots");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_big_vasio(&mut c);
+    let mut h = harness_sized(app_for(&d), 520.0, 360.0);
+    pump_until(&mut h, "the minimap", LONG, |h| h.query_by_label("Matrix overview").is_some());
+    settle(&mut h);
+    let built = h.state().minimap_builds();
+    for _ in 0..20 {
+        h.step();
+    }
+    assert_eq!(h.state().minimap_builds(), built, "idle frames reuse the dots");
+    c.call(Command::SetPoint { input: 0, output: 0, gain_db: 0.0, mute: false, invert: false }).unwrap();
+    pump_until(&mut h, "the new route's dot", LONG, |h| h.state().minimap_builds() > built);
+    let after = h.state().minimap_builds();
+    for _ in 0..20 {
+        h.step();
+    }
+    assert_eq!(h.state().minimap_builds(), after);
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
 fn the_window_buttons_sit_by_scripts_and_work() {
     let d = EngineDir::new("chrome");
     let _engine = Engine::spawn(&d);
