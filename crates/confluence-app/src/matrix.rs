@@ -91,10 +91,28 @@ impl Axis {
 
     /// The band at `index` and the 0-based channel within it.
     pub fn at(&self, index: usize) -> Option<(&Band, u32)> {
-        self.bands
-            .iter()
-            .find(|b| index >= b.start && index < b.start + b.channels as usize)
-            .map(|b| (b, (index - b.start) as u32))
+        self.bands.get(self.band_of(index)).map(|b| (b, (index - b.start) as u32))
+    }
+
+    /// The position of the band holding `index` (`bands.len()` past the end).
+    /// Bands are contiguous and in order, so this is a binary search.
+    fn band_of(&self, index: usize) -> usize {
+        self.bands.partition_point(|b| b.start + b.channels as usize <= index)
+    }
+
+    /// The first `k` in `0..n` for which `pred` is false (`pred` must be
+    /// true then false along `0..n`).
+    fn first_not(n: usize, pred: impl Fn(usize) -> bool) -> usize {
+        let (mut lo, mut hi) = (0, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if pred(mid) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     /// The global channel at `index`.
@@ -122,7 +140,7 @@ impl Axis {
 
     /// Where channel `index` starts.
     pub fn pos(&self, index: usize) -> f32 {
-        let bi = self.bands.iter().position(|b| index < b.start + b.channels as usize).unwrap_or(self.bands.len());
+        let bi = self.band_of(index);
         index as f32 * self.cell + (bi + 1).min(self.bands.len().max(1)) as f32 * SEP
     }
 
@@ -133,27 +151,23 @@ impl Axis {
 
     /// The channel at offset `p` (`None` on a strip or off the axis).
     pub fn index_at(&self, p: f32) -> Option<usize> {
-        self.bands.iter().enumerate().find_map(|(bi, b)| {
-            let from = self.strip_pos(bi) + SEP;
-            let k = ((p - from) / self.cell).floor();
-            (p >= from && k < b.channels as f32).then(|| b.start + k as usize)
-        })
+        // The last band whose strip starts at or before `p`.
+        let bi = Self::first_not(self.bands.len(), |bi| self.strip_pos(bi) <= p).checked_sub(1)?;
+        let b = &self.bands[bi];
+        let from = self.strip_pos(bi) + SEP;
+        let k = ((p - from) / self.cell).floor();
+        (p >= from && k < b.channels as f32).then(|| b.start + k as usize)
     }
 
     /// The channels whose cells touch offsets `a..b`.
     pub fn range(&self, a: f32, b: f32) -> Range<usize> {
-        let touching: Vec<usize> = self
-            .bands
-            .iter()
-            .flat_map(|band| band.start..band.start + band.channels as usize)
-            .filter(|&k| {
-                let p = self.pos(k);
-                p + self.cell > a && p < b
-            })
-            .collect();
-        match (touching.first(), touching.last()) {
-            (Some(&f), Some(&l)) => f..l + 1,
-            _ => 0..0,
+        // Channel offsets only grow along the axis.
+        let first = Self::first_not(self.len, |k| self.pos(k) + self.cell <= a);
+        let end = Self::first_not(self.len, |k| self.pos(k) < b);
+        if first < end {
+            first..end
+        } else {
+            0..0
         }
     }
 }
@@ -484,6 +498,68 @@ mod tests {
     fn the_cell_size_is_clamped() {
         assert_eq!(GridLayout::new(&[], 2.0).cell, CELL_MIN);
         assert_eq!(GridLayout::new(&[], 99.0).cell, CELL_MAX);
+    }
+
+    /// `n` devices whose channel counts cycle 1..=32 in both directions.
+    fn many(n: u32) -> Vec<SlotState> {
+        let mut first = 0;
+        (0..n)
+            .map(|i| {
+                let ch = i % 32 + 1;
+                let s = slot(i + 1, "D", first, ch, first, ch);
+                first += ch;
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lookups_on_a_many_device_axis_agree_with_walking_it() {
+        let l = GridLayout::new(&many(64), 17.0);
+        let a = &l.rows;
+        // Walk the axis: each band's strip, then its channels.
+        let mut walked = Vec::new();
+        let mut p = 0.0;
+        for b in &a.bands {
+            p += SEP;
+            for k in 0..b.channels {
+                walked.push((p, b.slot, k));
+                p += a.cell;
+            }
+        }
+        assert_eq!(a.extent(), p);
+        for (i, &(at, slot, k)) in walked.iter().enumerate() {
+            assert_eq!(a.pos(i), at, "pos {i}");
+            assert_eq!(a.at(i).map(|(b, k)| (b.slot, k)), Some((slot, k)), "at {i}");
+            assert_eq!(a.index_at(at + 1.0), Some(i), "index_at {i}");
+        }
+        assert_eq!(a.at(walked.len()), None);
+        let mut x = -30.0;
+        while x < p + 30.0 {
+            let on = walked.iter().position(|&(at, _, _)| x >= at && x < at + a.cell);
+            assert_eq!(a.index_at(x), on, "index_at {x}");
+            for w in [0.5, 40.0, 333.0] {
+                let touching: Vec<usize> =
+                    (0..walked.len()).filter(|&i| walked[i].0 + a.cell > x && walked[i].0 < x + w).collect();
+                let want = touching.first().map_or(0..0, |&f| f..touching.last().unwrap() + 1);
+                assert_eq!(a.range(x, x + w), want, "range {x}+{w}");
+            }
+            x += 3.7;
+        }
+    }
+
+    #[test]
+    fn a_frames_lookups_stay_cheap_on_a_huge_matrix() {
+        // 256 devices, 4,000+ channels a side: what is on screen is found
+        // without walking every channel of every device.
+        let l = GridLayout::new(&many(256), CELL_MIN);
+        let t = std::time::Instant::now();
+        for i in 0..1000 {
+            let y = (i % 200) as f32 * 300.0;
+            let (rows, cols) = std::hint::black_box(l.visible(y, y, y + 900.0, y + 600.0));
+            std::hint::black_box((l.rows.pos(rows.start), l.cols.index_at(y + 450.0), l.rows.at(cols.end)));
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(60), "{:?}", t.elapsed());
     }
 
     #[test]
