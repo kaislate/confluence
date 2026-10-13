@@ -1195,3 +1195,62 @@ fn the_window_buttons_sit_by_scripts_and_work() {
     assert!(cmds.contains(&eframe::egui::ViewportCommand::Maximized(true)), "{cmds:?}");
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+/// Folds VASIO A's inputs by the chevron on its strip, once the given cell shows.
+fn fold_vasio_a_inputs(h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>) {
+    pump_until(h, "the fold chevron", LONG, |h| h.query_by_label("Fold VASIO A inputs").is_some());
+    h.get_by_label("Fold VASIO A inputs").click();
+    pump_until(h, "the folded line", LONG, |h| {
+        h.query_by_role_and_label(Role::Button, "VASIO A, all inputs → VASIO A out 1").is_some()
+    });
+}
+
+#[test]
+fn a_band_folds_to_one_line_and_its_cell_shows_the_routes_behind_it() {
+    let d = EngineDir::new("fold");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_vasio(&mut c, 1);
+    c.call(Command::SetPoint { input: i + 1, output: o, gain_db: 0.0, mute: false, invert: false }).unwrap();
+    let mut h = harness_fast(app_for(&d));
+    pump_until(&mut h, "the route", LONG, |h| h.state().point(i + 1, o).is_some());
+    fold_vasio_a_inputs(&mut h);
+    assert!(h.query_by_role_and_label(Role::Button, "VASIO A in 2 → VASIO A out 1").is_none(), "its rows are gone");
+    assert_eq!(h.state().prefs().layout.folded_inputs.len(), 1, "the fold is saved");
+    assert!(h.query_by_label("Unfold VASIO A inputs").is_some());
+    assert!(h.query_by_label("2 channels").is_some(), "the folded margin says what is inside");
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_folded_cell_selects_its_block_and_routes_nothing_and_a_double_click_unfolds() {
+    let d = EngineDir::new("fold-click");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_vasio(&mut c, 1);
+    let mut h = harness_fast(app_for(&d));
+    fold_vasio_a_inputs(&mut h);
+    let cell = "VASIO A, all inputs → VASIO A out 1";
+    h.get_by_role_and_label(Role::Button, cell).click();
+    settle(&mut h);
+    assert_eq!(
+        h.state().selection(),
+        confluence_app::matrix::Selection::Block { inputs: (i, i + 2), outputs: (o, o + 1) }
+    );
+    h.key_press(eframe::egui::Key::Space);
+    std::thread::sleep(Duration::from_millis(600));
+    settle(&mut h);
+    assert!(engine_points(&mut c).is_empty(), "a folded cell routes nothing");
+    for _ in 0..40 {
+        h.step();
+    }
+    let node = h.get_by_role_and_label(Role::Button, cell);
+    node.click();
+    node.click();
+    pump_until(&mut h, "the unfolded rows", LONG, |h| {
+        h.query_by_role_and_label(Role::Button, "VASIO A in 2 → VASIO A out 1").is_some()
+    });
+    assert!(h.state().prefs().layout.folded_inputs.is_empty());
+    assert!(engine_points(&mut c).is_empty(), "unfolding routes nothing");
+    c.call(Command::Shutdown).unwrap();
+}

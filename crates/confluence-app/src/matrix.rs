@@ -400,6 +400,24 @@ pub fn selection_valid(selection: &Selection, slots: &[SlotState]) -> bool {
     }
 }
 
+/// The (row, column) a selection sits on: a cell's, or a block's line.
+pub fn selection_cell(l: &GridLayout, s: &Selection) -> Option<(usize, usize)> {
+    match *s {
+        Selection::Cell { input, output } => l.cell_of(input, output),
+        Selection::Block { inputs, outputs } => Some((l.rows.index_of(inputs.0)?, l.cols.index_of(outputs.0)?)),
+        Selection::None | Selection::Slot(_) => None,
+    }
+}
+
+/// What selecting (row, column) selects: the route's cell, or a folded cell's block.
+pub fn selection_at(l: &GridLayout, row: usize, col: usize) -> Option<Selection> {
+    if let Some((input, output)) = l.point(row, col) {
+        return Some(Selection::Cell { input, output });
+    }
+    let (i, o) = l.block(row, col)?;
+    Some(Selection::Block { inputs: (i.start, i.end), outputs: (o.start, o.end) })
+}
+
 /// Pointer input on one cell during one frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CellInput {
