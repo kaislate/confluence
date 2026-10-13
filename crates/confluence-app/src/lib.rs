@@ -22,6 +22,7 @@ pub mod notify;
 pub mod pending;
 pub mod plugins;
 pub mod prefs;
+pub mod rack;
 pub mod running_apps;
 pub mod scenes;
 pub mod scripts;
