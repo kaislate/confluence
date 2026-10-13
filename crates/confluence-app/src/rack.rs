@@ -74,7 +74,7 @@ pub fn place(spans: &[usize], breaks: &[bool], cols: usize) -> (Vec<(usize, usiz
 /// The order with `dragged` moved to where the pointer `at` is over the
 /// trays as shown (`rects`, one per key of `order`): before the tray under
 /// (or nearest) it when left of that tray's centre, else after it. Over its
-/// own slot nothing moves, so a wide neighbour cannot make it flicker.
+/// own slot, in a gap or off the trays, nothing moves, so nothing flickers.
 pub fn drop_order(order: &[String], dragged: &str, rects: &[Rect], at: Pos2) -> Vec<String> {
     let Some(from) = order.iter().position(|k| k == dragged) else { return order.to_vec() };
     if rects.get(from).is_some_and(|r| r.contains(at)) {
@@ -87,6 +87,13 @@ pub fn drop_order(order: &[String], dragged: &str, rects: &[Rect], at: Pos2) -> 
             others.push(k.clone());
             shown.push(rects.get(i).copied().unwrap_or(Rect::NOTHING));
         }
+    }
+    // Only over another tray, or below them all (the end): in a hole, a gap
+    // or off the bed the nearest tray would change with every reflow.
+    let over = shown.iter().any(|r| r.contains(at));
+    let below = shown.iter().all(|r| at.y > r.bottom());
+    if !over && !below {
+        return order.to_vec();
     }
     let to = crate::arrange::drop_index(&shown, at).min(others.len());
     others.insert(to, order[from].clone());
@@ -197,6 +204,26 @@ mod tests {
         assert_eq!(keys(drop_order(&order, "c", &rects, pos2(30.0, 20.0))), "cab", "left half of the first");
         assert_eq!(keys(drop_order(&order, "c", &rects, pos2(200.0, 20.0))), "acb", "left half of the wide tray");
         assert_eq!(keys(drop_order(&order, "x", &rects, pos2(0.0, 0.0))), "abc", "an unknown tray");
+    }
+
+    #[test]
+    fn a_drag_over_an_empty_cell_or_a_gap_moves_nothing() {
+        // Two columns: a b / c _ / d d (d is two wide and wraps, leaving a hole).
+        let order: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let (at, _) = place(&[1, 1, 1, 2], &[false; 4], 2);
+        let rects: Vec<Rect> = at
+            .iter()
+            .zip([1, 1, 1, 2])
+            .map(|(&(r, c), s)| {
+                Rect::from_min_size(pos2(c as f32 * 108.0, r as f32 * 58.0), eframe::egui::vec2(tray_w(s, 100.0), 50.0))
+            })
+            .collect();
+        let keys = |v: Vec<String>| v.join("");
+        assert_eq!(keys(drop_order(&order, "a", &rects, pos2(150.0, 80.0))), "abcd", "the hole beside c");
+        assert_eq!(keys(drop_order(&order, "a", &rects, pos2(104.0, 20.0))), "abcd", "the gap between a and b");
+        assert_eq!(keys(drop_order(&order, "a", &rects, pos2(-30.0, 80.0))), "abcd", "left of the bed");
+        assert_eq!(keys(drop_order(&order, "a", &rects, pos2(150.0, 200.0))), "bcda", "below every tray: the end");
+        assert_eq!(keys(drop_order(&order, "a", &rects, pos2(160.0, 20.0))), "bacd", "over b's right half");
     }
 
     #[test]
