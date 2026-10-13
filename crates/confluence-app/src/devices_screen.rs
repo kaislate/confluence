@@ -267,6 +267,9 @@ pub fn face(p: &PositionState, view: &Views, filling: bool) -> Face {
     match p.status {
         PositionStatus::Empty => Face { tag, ..Default::default() },
         PositionStatus::Off => Face { tag, name: "Switched off".into(), line1: "OFF".into(), ..Default::default() },
+        PositionStatus::Disabled => {
+            Face { tag, name, sub, line1: "OFF".into(), line2: "ROUTES KEPT".into(), ..Default::default() }
+        }
         PositionStatus::On { online } if p.pos.group == PosGroup::Vasio => Face {
             tag,
             name,

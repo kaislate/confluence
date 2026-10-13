@@ -283,3 +283,76 @@ fn virtual_devices_are_named_by_their_position() {
     }
     assert!(e.slots().iter().all(|s| !s.name.starts_with("VASIO 2") && !s.name.starts_with("VAIO 1")));
 }
+
+fn enabled(d: &mut DeviceManager, e: &mut Engine, pos: &str, on: bool) -> Option<Response> {
+    d.handle(e, &Command::SetEnabled { pos: p(pos), on })
+}
+
+#[test]
+fn a_device_switched_off_keeps_its_position_channels_and_routes() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None).with_asio_opener(fake_sized(&[("fake:a", 2, 2)]));
+    d.add(&mut e, DeviceKind::Asio, "fake:a").unwrap();
+    let (i, o) = (slot_of(&d, &e, "asio:1", true).first_input, slot_of(&d, &e, "asio:1", false).first_output);
+    route(&mut e, i, o);
+    assert!(matches!(enabled(&mut d, &mut e, "asio:1", false), Some(Response::Ok)));
+    let off = d.positions(&e).into_iter().find(|s| s.pos == p("asio:1")).unwrap();
+    assert_eq!(off.status, PositionStatus::Disabled);
+    assert_eq!(off.device.as_ref().map(|d| d.name.as_str()), Some("fake:a"), "the position keeps its device");
+    let held = slot_of(&d, &e, "asio:1", true);
+    assert!(!held.online && held.first_input == i, "its channels are held offline");
+    assert!(e.settled_points().iter().any(|pt| pt.input == i && pt.output == o), "its route is kept");
+    assert!(matches!(enabled(&mut d, &mut e, "asio:1", true), Some(Response::Ok)));
+    assert_eq!(status(&d, &e, "asio:1"), PositionStatus::Filled { online: true });
+    assert_eq!(slot_of(&d, &e, "asio:1", true).first_input, i, "back at its channels");
+    assert!(e.settled_points().iter().any(|pt| pt.input == i && pt.output == o), "and its route");
+}
+
+#[test]
+fn a_switched_off_device_stays_off_after_a_restart() {
+    setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("devices.json");
+    {
+        let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+        let (devices, _) = DeviceManager::open_file(path.clone());
+        let mut d = devices.with_asio_opener(fake(&["fake:a"]));
+        d.restore(&mut e);
+        d.handle(&mut e, &Command::FillPosition { pos: p("asio:2"), kind: DeviceKind::Asio, name: "fake:a".into() });
+        assert!(matches!(enabled(&mut d, &mut e, "asio:2", false), Some(Response::Ok)));
+    }
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let (devices, warnings) = DeviceManager::open_file(path);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut d = devices.with_asio_opener(fake(&["fake:a"]));
+    let restored = d.restore(&mut e);
+    assert!(restored.is_empty(), "a device switched off is not a missing one: {restored:?}");
+    assert_eq!(status(&d, &e, "asio:2"), PositionStatus::Disabled, "still off, not opened");
+    assert!(matches!(enabled(&mut d, &mut e, "asio:2", true), Some(Response::Ok)));
+    assert_eq!(status(&d, &e, "asio:2"), PositionStatus::Filled { online: true });
+}
+
+#[test]
+fn switching_on_and_off_is_refused_where_it_makes_no_sense() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None).with_asio_opener(fake(&["fake:m"]));
+    let ch = confluence_engine::MasterChannels { first_input: 0, inputs: 2, first_output: 0, outputs: 2 };
+    d.set_master("fake:m", ch).unwrap();
+    let master = enabled(&mut d, &mut e, "asio:1", false);
+    assert!(matches!(&master, Some(Response::Error(m)) if m.contains("master")), "{master:?}");
+    let empty = enabled(&mut d, &mut e, "win-out:4", false);
+    assert!(matches!(&empty, Some(Response::Error(m)) if m.contains("empty")), "{empty:?}");
+}
+
+#[test]
+fn a_virtual_position_switches_as_it_always_has() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None);
+    assert!(matches!(enabled(&mut d, &mut e, "vasio:B", true), Some(Response::Ok)));
+    assert!(matches!(status(&d, &e, "vasio:B"), PositionStatus::On { .. }));
+    assert!(matches!(enabled(&mut d, &mut e, "vasio:B", false), Some(Response::Ok)));
+    assert_eq!(status(&d, &e, "vasio:B"), PositionStatus::Off);
+}

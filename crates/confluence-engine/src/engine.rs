@@ -1360,6 +1360,7 @@ impl Engine {
             Command::FillPosition { .. }
             | Command::ClearPosition { .. }
             | Command::SetVirtual { .. }
+            | Command::SetEnabled { .. }
             | Command::SetMaster { .. } => Response::Error("positions are handled by the engine process".into()),
             Command::SubscribeMeters => Response::Error("subscriptions are served by the engine process".into()),
             Command::SetSlotLabel { id, channel, ref name } => match self.label_key(id, channel) {

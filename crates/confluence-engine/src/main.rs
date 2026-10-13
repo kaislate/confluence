@@ -588,6 +588,7 @@ mod app {
                     Command::RemoveSlot { .. }
                     | Command::ClearPosition { .. }
                     | Command::SetVirtual { .. }
+                    | Command::SetEnabled { .. }
                     | Command::SetMaster { .. } => journal.compact(&state_commands(engine)),
                     _ if cmd.is_mutation() => journal.append(&journal_form(engine, cmd)),
                     _ => Ok(()),
@@ -602,6 +603,7 @@ mod app {
                         Command::RemoveSlot { .. }
                             | Command::ClearPosition { .. }
                             | Command::SetVirtual { .. }
+                            | Command::SetEnabled { .. }
                             | Command::SetMaster { .. }
                     )
                 {

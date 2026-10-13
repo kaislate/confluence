@@ -12,7 +12,7 @@ pub use positions::*;
 pub use state::diff;
 
 /// Protocol version. Bump the major part for incompatible changes.
-pub const API_VERSION: u16 = 11;
+pub const API_VERSION: u16 = 12;
 
 /// Largest accepted frame, guarding against corrupt or hostile length prefixes.
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
@@ -201,6 +201,13 @@ pub enum Command {
     SetLabel {
         key: String,
         name: Option<String>,
+    },
+    /// Switches a filled position off (its device closed; its position,
+    /// channels and routes kept) or back on. A virtual position turns on or
+    /// off as with `SetVirtual`.
+    SetEnabled {
+        pos: PosId,
+        on: bool,
     },
 }
 
@@ -942,7 +949,6 @@ mod tests {
         }
         // Positions persist in devices.json (like AddDevice), not the journal.
         assert!(cmds.iter().all(|c| !c.is_mutation()));
-        assert_eq!(API_VERSION, 11);
     }
 
     #[test]
@@ -961,6 +967,19 @@ mod tests {
             assert_eq!(b[0], clear + 1 + i as u8, "{c:?} keeps its index");
             assert_eq!(&postcard::from_bytes::<Command>(&b).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn set_enabled_comes_after_the_label_commands_and_round_trips() {
+        let label = postcard::to_allocvec(&Command::SetLabel { key: String::new(), name: None }).unwrap()[0];
+        let c = Command::SetEnabled { pos: "win-out:3".parse().unwrap(), on: false };
+        let b = postcard::to_allocvec(&c).unwrap();
+        assert_eq!(b[0], label + 1, "appended: older journals still read");
+        assert_eq!(postcard::from_bytes::<Command>(&b).unwrap(), c);
+        assert!(!c.is_mutation(), "positions persist in devices.json");
+        let s = PositionStatus::Disabled;
+        assert_eq!(postcard::from_bytes::<PositionStatus>(&postcard::to_allocvec(&s).unwrap()).unwrap(), s);
+        assert_eq!(API_VERSION, 12);
     }
 
     #[test]
