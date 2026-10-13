@@ -1433,3 +1433,30 @@ fn hover_click(h: &mut egui_kittest::Harness<'static, confluence_app::app::Confl
     h.step();
     h.get_by_label(label).click();
 }
+
+#[test]
+fn a_section_cycles_full_compact_collapsed_and_is_saved() {
+    use confluence_app::rack::SectionSize;
+    let d = EngineDir::new("section-size");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "the Apps rail", LONG, |h| h.query_by_label("Apps section: full").is_some());
+    h.get_by_label("Apps section: full").scroll_to_me();
+    settle(&mut h);
+    let full = card_of(&h, "APP 1").height();
+    h.get_by_label("Apps section: full").click();
+    pump_until(&mut h, "compact", LONG, |h| h.query_by_label("Apps section: compact").is_some());
+    settle(&mut h);
+    assert!(card_of(&h, "APP 1").height() < full * 0.7, "compact trays are slimmer");
+    assert_eq!(h.state().prefs().layout.section_sizes.get("Apps"), Some(&SectionSize::Compact));
+    h.get_by_label("Apps section: compact").click();
+    pump_until(&mut h, "collapsed", LONG, |h| h.query_by_label("Apps section: collapsed").is_some());
+    settle(&mut h);
+    assert!(h.query_by_label_contains("APP 1 \u{b7} ").is_none(), "no trays while collapsed");
+    h.get_by_label("Apps section: collapsed").click();
+    pump_until(&mut h, "full again", LONG, |h| h.query_by_label("Apps section: full").is_some());
+    assert!(h.query_by_label("Windows section: full").is_some(), "other sections keep their size");
+    client(&d).call(Command::Shutdown).unwrap();
+}
