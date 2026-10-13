@@ -933,6 +933,10 @@ impl DeviceManager {
             return Err(e);
         }
         bound.pos = pos;
+        // A device put into a switched-off position plays: the position is on.
+        if let Some(p) = pos {
+            self.off.remove(&p);
+        }
         Self::key_colours(engine, &bound);
         let ids = bound.slots.clone();
         self.bound.push(bound);
@@ -1253,17 +1257,19 @@ impl DeviceManager {
         if self.master_now == Some(pos) && self.master.is_some() {
             return Err(format!("{} is the master clock: it cannot be switched off", pos.label()));
         }
+        if self.reserved.iter().any(|(_, _, r)| *r == pos) {
+            return Err(format!("{} is being filled", pos.label()));
+        }
         let Some(i) = self.bound.iter().position(|b| b.pos == Some(pos)) else {
             return Err(format!("{} is empty", pos.label()));
         };
         if on {
-            if !self.off.remove(&pos) {
-                return Ok(());
-            }
-            self.save()?;
-            let (kind, name) = (self.bound[i].binding.kind, self.bound[i].binding.name.clone());
+            let _ = i;
             // A device that cannot be opened stays offline (not off), as a missing one.
-            return self.add(engine, kind, &name).map(|_| ());
+            return match self.begin_enable(pos)? {
+                Some(pending) => self.finish_add(engine, pending.load()).map(|_| ()),
+                None => Ok(()),
+            };
         }
         if !self.off.insert(pos) {
             return Ok(());
@@ -1289,6 +1295,22 @@ impl DeviceManager {
             }
         }
         self.save()
+    }
+
+    /// First step of switching non-virtual position `pos` back on: it is no
+    /// longer off (saved), and its device is reserved to be opened as for a
+    /// fill (`None`: it was not off). Load it without the engine lock, then
+    /// [`finish_add`](Self::finish_add) (or attach, start and commit).
+    pub fn begin_enable(&mut self, pos: PosId) -> Result<Option<PendingAdd>, String> {
+        let Some(b) = self.bound.iter().find(|b| b.pos == Some(pos)) else {
+            return Err(format!("{} is empty", pos.label()));
+        };
+        let (kind, name) = (b.binding.kind, b.binding.name.clone());
+        if !self.off.remove(&pos) {
+            return Ok(None);
+        }
+        self.save()?;
+        self.begin_fill(Some(pos), kind, &name).map(Some)
     }
 
     /// Empties position `pos`: its device is closed and its routes removed.

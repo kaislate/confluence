@@ -356,3 +356,37 @@ fn a_virtual_position_switches_as_it_always_has() {
     assert!(matches!(enabled(&mut d, &mut e, "vasio:B", false), Some(Response::Ok)));
     assert_eq!(status(&d, &e, "vasio:B"), PositionStatus::Off);
 }
+
+#[test]
+fn filling_a_switched_off_position_switches_it_on() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None).with_asio_opener(fake_sized(&[("fake:a", 2, 2), ("fake:b", 2, 2)]));
+    d.add(&mut e, DeviceKind::Asio, "fake:a").unwrap();
+    assert!(matches!(enabled(&mut d, &mut e, "asio:1", false), Some(Response::Ok)));
+    let fill =
+        d.handle(&mut e, &Command::FillPosition { pos: p("asio:1"), kind: DeviceKind::Asio, name: "fake:b".into() });
+    assert!(matches!(fill, Some(Response::Ok)), "{fill:?}");
+    assert_eq!(status(&d, &e, "asio:1"), PositionStatus::Filled { online: true }, "the new device plays");
+    // A position being filled cannot be switched off under it.
+    let pending = d.begin_fill(Some(p("asio:2")), DeviceKind::Asio, "fake:a").unwrap();
+    let off = enabled(&mut d, &mut e, "asio:2", false);
+    assert!(matches!(&off, Some(Response::Error(m)) if m.contains("being filled") || m.contains("empty")), "{off:?}");
+    drop(pending);
+}
+
+#[test]
+fn turning_on_is_staged_like_a_fill() {
+    setup();
+    let (mut e, _audio) = Engine::new(EngineConfig::new(48_000.0, 256));
+    let mut d = DeviceManager::new(None).with_asio_opener(fake_sized(&[("fake:a", 2, 2)]));
+    d.add(&mut e, DeviceKind::Asio, "fake:a").unwrap();
+    assert!(d.begin_enable(p("asio:1")).unwrap().is_none(), "already on: nothing to open");
+    assert!(matches!(enabled(&mut d, &mut e, "asio:1", false), Some(Response::Ok)));
+    // The driver is loaded outside the engine lock, as for a fill.
+    let pending = d.begin_enable(p("asio:1")).unwrap().expect("a device to open");
+    let loaded = pending.load();
+    d.finish_add(&mut e, loaded).unwrap();
+    assert_eq!(status(&d, &e, "asio:1"), PositionStatus::Filled { online: true });
+    assert!(d.begin_enable(p("asio:5")).is_err(), "an empty position");
+}
