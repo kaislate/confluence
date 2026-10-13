@@ -928,6 +928,10 @@ impl ConfluenceApp {
             match a {
                 crate::inspector::Action::Edit(e) => self.send(e),
                 crate::inspector::Action::RemoveSlot(id) => self.confirm_remove = Some(id),
+                crate::inspector::Action::Unfold { input, key } => {
+                    let l = &mut self.prefs.layout;
+                    if input { &mut l.folded_inputs } else { &mut l.folded_outputs }.remove(&key);
+                }
                 crate::inspector::Action::PickPlugin(bus) => {
                     self.picker = Some(crate::plugins::Picker { bus, filter: String::new() })
                 }

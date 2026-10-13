@@ -9,7 +9,7 @@ use eframe::egui::{self, Button, Color32, DragValue, RichText, Slider};
 
 use crate::commands::Edit;
 use crate::graph::{plot, Series};
-use crate::matrix::{point_label, Selection};
+use crate::matrix::{point_label, range_label, Selection};
 use crate::skin::Look;
 use crate::theme::{fader_db, fader_pos, GAIN_MAX_DB, GAIN_MIN_DB};
 
@@ -19,6 +19,11 @@ pub enum Action {
     RemoveSlot(u32),
     /// Open the plugin picker for this bus.
     PickPlugin(u32),
+    /// Unfold a matrix band (inputs or outputs) by its layout key.
+    Unfold {
+        input: bool,
+        key: String,
+    },
 }
 
 /// What the inspector needs to show plugins between engine updates.
@@ -55,6 +60,12 @@ pub fn header(state: &State, selection: &Selection, point: Option<&PointState>) 
                 None => "NO ROUTE".into(),
             };
             (label, state_line)
+        }
+        Selection::Block { inputs, outputs } => {
+            let label =
+                format!("{} > {}", range_label(&state.slots, true, inputs), range_label(&state.slots, false, outputs));
+            let n = block_routes(state, inputs, outputs).len();
+            (label.to_uppercase(), if n == 1 { "1 ROUTE".into() } else { format!("{n} ROUTES") })
         }
         Selection::Slot(id) => match state.slots.iter().find(|s| s.id == id) {
             Some(s) => {
@@ -104,8 +115,49 @@ pub fn show(
         Selection::None => summary(ui, look, state),
         Selection::Cell { input, output } => point_panel(ui, state, input, output, point, &mut actions),
         Selection::Slot(id) => slot_panel(ui, look, view, history, state, id, plugin_ui, &mut actions),
+        Selection::Block { inputs, outputs } => block_panel(ui, state, inputs, outputs, &mut actions),
     });
     actions
+}
+
+/// The routes inside a block of inputs and outputs, in engine order.
+fn block_routes(state: &State, (i0, i1): (u32, u32), (o0, o1): (u32, u32)) -> Vec<&PointState> {
+    state.points.iter().filter(|p| (i0..i1).contains(&p.input) && (o0..o1).contains(&p.output)).collect()
+}
+
+/// A folded cell: both ends, the routes behind it, and a way to unfold it.
+fn block_panel(ui: &mut egui::Ui, state: &State, inputs: (u32, u32), outputs: (u32, u32), actions: &mut Vec<Action>) {
+    ui.heading(format!("From {}", range_label(&state.slots, true, inputs)));
+    ui.heading(format!("To {}", range_label(&state.slots, false, outputs)));
+    let routes = block_routes(state, inputs, outputs);
+    ui.label(if routes.len() == 1 { "1 route".to_string() } else { format!("{} routes", routes.len()) });
+    for p in &routes {
+        ui.label(
+            format!("{} \u{b7} {:+.1} dB", point_label(&state.slots, p.input, p.output), p.gain_db).replace("+-", "-"),
+        );
+    }
+    let keys = crate::matrix::band_keys(&state.slots, &state.positions);
+    let key_of = |input: bool, ch: u32| {
+        state
+            .slots
+            .iter()
+            .find(|s| {
+                let (first, n) = if input { (s.first_input, s.inputs) } else { (s.first_output, s.outputs) };
+                ch >= first && ch < first + n
+            })
+            .and_then(|s| keys.get(&s.id).cloned())
+    };
+    ui.horizontal(|ui| {
+        for (input, (start, end), text) in [(true, inputs, "Unfold inputs"), (false, outputs, "Unfold outputs")] {
+            if end > start + 1 {
+                if let Some(key) = key_of(input, start) {
+                    if ui.button(text).clicked() {
+                        actions.push(Action::Unfold { input, key });
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn summary(ui: &mut egui::Ui, look: &Look, state: &State) {
@@ -854,6 +906,33 @@ mod display_tests {
             h.get_by_label("Cancel").click();
         });
         assert_eq!(edits(&learning), [&Edit::CancelMidiLearn]);
+    }
+
+    #[test]
+    fn a_folded_cell_lists_the_routes_behind_it_and_unfolds() {
+        let pt = PointState { input: 1, output: 0, gain_db: -6.0, mute: false, invert: false };
+        let view = view_with(pt);
+        let look = Look::builtin();
+        let sel = Selection::Block { inputs: (0, 2), outputs: (0, 1) };
+        let mut out = Vec::new();
+        {
+            let mut h = Harness::new_ui(|ui| {
+                let pending = std::collections::HashMap::new();
+                let plugin_ui = PluginUi { pending: &pending, loading: None };
+                out.extend(show(ui, &view, &look, &sel, None, None, true, &plugin_ui));
+            });
+            h.run();
+            assert!(h.query_by_label("From S, all inputs").is_some());
+            assert!(h.query_by_label("To S out 1").is_some());
+            assert!(h.query_by_label("1 route").is_some());
+            assert!(h.query_by_label("S in 2 → S out 1 · -6.0 dB").is_some());
+            assert!(h.query_by_label("Unfold outputs").is_none(), "one output: nothing folded there");
+            h.get_by_label("Unfold inputs").click();
+            h.run();
+        }
+        assert!(out.iter().any(|a| matches!(a, Action::Unfold { input: true, key } if key == "slot:S")));
+        let state = view.state.as_ref().unwrap();
+        assert_eq!(header(state, &sel, None).1, "1 ROUTE");
     }
 
     /// A route quieter than the slider's range must still show its real gain

@@ -693,6 +693,8 @@ mod tests {
     fn a_channel_shows_its_number_and_name() {
         let band = Band {
             slot: 1,
+            key: "pos:asio:1".into(),
+            folded: false,
             name: "GoXLR".into(),
             channel_labels: vec![Some("Kick".into()), None, None],
             channel_names: vec!["Mic".into(), "Line".into(), String::new()],
