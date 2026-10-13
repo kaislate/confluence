@@ -620,10 +620,8 @@ fn pill_full(ui: &mut Ui, label: &str, accessible: &str, s: &GearSkin, lit: bool
 
 /// A small square button with a chevron: pointing down while `open` (it
 /// folds), along the row when folded (it unfolds).
-pub fn chevron_button(ui: &mut Ui, open: bool, accessible: &str, s: &GearSkin) -> Response {
-    let compact = ui.ctx().data(|d| d.get_temp::<bool>(compact_id())).unwrap_or(false);
-    let h = if compact { PILL_H - 4.0 } else { PILL_H };
-    let (r, resp) = ui.allocate_exact_size(Vec2::splat(h), Sense::click());
+pub fn chevron_button(ui: &mut Ui, r: Rect, open: bool, accessible: &str, s: &GearSkin) -> Response {
+    let resp = ui.interact(r, ui.id().with(("chevron", accessible)), Sense::click());
     let enabled = ui.is_enabled();
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, accessible));
     if !ui.is_rect_visible(r) {

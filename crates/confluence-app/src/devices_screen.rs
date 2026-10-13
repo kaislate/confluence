@@ -902,12 +902,8 @@ fn folded_face(
         painter.rect_filled(track, 0.0, paint::alpha(skin.oled, 0.14));
         painter.rect_filled(Rect::from_min_size(track.min, Vec2::new(track.width() * frac, 4.0)), 0.0, skin.oled);
     }
-    let chev = Rect::from_min_size(
-        Pos2::new(r.right() - 32.0, r.center().y - paint::PILL_H / 2.0),
-        Vec2::splat(paint::PILL_H),
-    );
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(chev));
-    if paint::chevron_button(&mut child, false, &format!("Unfold {}", p.pos.label()), &skin).clicked() {
+    let chev = Rect::from_min_size(Pos2::new(r.right() - 32.0, r.center().y - 11.0), Vec2::splat(22.0));
+    if paint::chevron_button(ui, chev, false, &format!("Unfold {}", p.pos.label()), &skin).clicked() {
         st.changes.push(CardChange::Fold(p.pos.to_string()));
     }
 }
@@ -1100,7 +1096,9 @@ fn card(
     }
     // Row 2: the name (double-click to rename it) and its sub-line.
     let ctx = ui.ctx().clone();
-    let name_rect = Rect::from_min_size(r.min + Vec2::new(12.0, 31.0), Vec2::new(w - 24.0, 20.0));
+    // A device's card keeps room on the right of its name for the fold chevron.
+    let fold_w = if movable { 28.0 } else { 0.0 };
+    let name_rect = Rect::from_min_size(r.min + Vec2::new(12.0, 31.0), Vec2::new(w - 24.0 - fold_w, 20.0));
     let first_slot = p.slots.first().copied();
     let renaming = st.renaming.as_ref().is_some_and(|(pos, _)| *pos == p.pos);
     if renaming {
@@ -1131,8 +1129,14 @@ fn card(
             &f.name,
             paint::font(&ctx, "label-bold", 15.0),
             skin.ink,
-            w - 30.0,
+            w - 30.0 - fold_w,
         );
+        if movable {
+            let chev = Rect::from_min_size(Pos2::new(r.right() - 34.0, r.top() + 31.0), Vec2::splat(22.0));
+            if paint::chevron_button(ui, chev, true, &format!("Fold {}", p.pos.label()), &skin).clicked() {
+                st.changes.push(CardChange::Fold(p.pos.to_string()));
+            }
+        }
         if !off && first_slot.is_some() {
             let name_resp = ui.interact(name_rect, id.with("name"), Sense::click());
             let what = format!("Rename {}", p.pos.label());
@@ -1159,7 +1163,7 @@ fn card(
             &f.sub,
             paint::font(&ctx, "label", 10.5),
             paint::alpha(skin.ink, 0.62),
-            w - 30.0,
+            w - 30.0 - fold_w,
         );
     }
     // The OLED: the state line on top, the meters below.
@@ -1223,9 +1227,6 @@ fn card(
                 actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: None }));
             }
         } else {
-            if movable && paint::chevron_button(row, true, &format!("Fold {label}"), &skin).clicked() {
-                st.changes.push(CardChange::Fold(p.pos.to_string()));
-            }
             if let Some(&slot) = p.slots.first() {
                 colour_menu(row, slot, &label, colour, palette, &skin, actions);
             }
