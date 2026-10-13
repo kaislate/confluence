@@ -1460,3 +1460,50 @@ fn a_section_cycles_full_compact_collapsed_and_is_saved() {
     assert!(h.query_by_label("Windows section: full").is_some(), "other sections keep their size");
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_tray_is_picked_up_and_the_others_make_room_before_it_drops() {
+    use eframe::egui::{pos2, Event, PointerButton};
+    let d = EngineDir::new("drag-tray");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 2);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO B's tray", LONG, |h| h.query_by_label("Turn off VASIO B").is_some());
+    h.get_by_label("Turn off VASIO B").scroll_to_me();
+    settle(&mut h);
+    let (a, b) = (card_of(&h, "VASIO A"), card_of(&h, "VASIO B"));
+    assert!(a.left() < b.left());
+    let before = slots(&mut c);
+    // Pick VASIO B up by its sub-line and carry it over VASIO A's left half.
+    let from = pos2(b.left() + 30.0, b.bottom() - 8.0);
+    let to = pos2(a.left() + 30.0, a.bottom() - 8.0);
+    let button = |pos, pressed| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    h.event(Event::PointerMoved(from));
+    h.event(button(from, true));
+    h.step();
+    for k in 1..=10 {
+        h.event(Event::PointerMoved(from + (to - from) * (k as f32 / 10.0)));
+        h.step();
+    }
+    for _ in 0..30 {
+        h.step();
+    }
+    // Held: VASIO A has slid aside to make room, nothing is saved yet.
+    assert!(card_of(&h, "VASIO A").left() > a.left() + 50.0, "the others make room while it is held");
+    assert!(!h.state().prefs().layout.cards.contains_key("vasio"), "nothing saved while held");
+    h.event(button(to, false));
+    settle(&mut h);
+    assert!(card_of(&h, "VASIO B").left() < card_of(&h, "VASIO A").left(), "dropped before VASIO A");
+    let order = h.state().prefs().layout.cards.get("vasio").cloned().unwrap_or_default();
+    assert_eq!(order.first().map(String::as_str), Some("vasio:B"), "{order:?}");
+    assert_eq!(slots(&mut c), before, "the engine is untouched");
+    c.call(Command::Shutdown).unwrap();
+}

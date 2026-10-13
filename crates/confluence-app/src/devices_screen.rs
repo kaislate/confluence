@@ -73,6 +73,8 @@ pub struct ScreenState {
     pub channel_drafts: HashMap<(bool, u32), (String, bool)>,
     /// Each card's LED colour and when it last changed (for the bloom).
     pub led_seen: HashMap<PosId, (Option<Color32>, f64)>,
+    /// The tray being carried (spec: round 8 §4).
+    pub tray_drag: Option<crate::rack_view::TrayDrag>,
     pub adding_bus: bool,
     pub bus_name: String,
     pub bus_channels: u32,
@@ -103,6 +105,7 @@ impl Default for ScreenState {
             pid_entry_open: false,
             channel_drafts: HashMap::new(),
             led_seen: HashMap::new(),
+            tray_drag: None,
             adding_bus: false,
             bus_name: String::new(),
             bus_channels: 2,

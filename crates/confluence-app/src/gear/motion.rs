@@ -293,6 +293,13 @@ impl Motion {
         self.spring_from(id, target, target, params)
     }
 
+    /// Puts a spring at `value`, at rest (something held it there, like a
+    /// dragged tray): when it is let go it springs from here.
+    pub fn snap(&mut self, id: Id, value: f32, params: SpringParams) {
+        let frame = self.frame;
+        self.springs.insert(id, Spring { value, velocity: 0.0, target: value, params, seen: frame });
+    }
+
     /// As [`Motion::spring`], but a new id starts at `from` and springs to `target`.
     pub fn spring_from(&mut self, id: Id, from: f32, target: f32, params: SpringParams) -> f32 {
         let frame = self.frame;

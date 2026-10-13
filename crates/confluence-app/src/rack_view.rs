@@ -31,6 +31,16 @@ pub const COLLAPSED_H: f32 = 30.0;
 /// Between sections.
 pub const SECTION_GAP: f32 = 10.0;
 
+/// A tray being carried: which, its group, where it was grabbed (from its
+/// top-left corner) and the order it would drop into.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrayDrag {
+    pub pos: PosId,
+    pub group: String,
+    pub grab: Vec2,
+    pub order: Vec<String>,
+}
+
 /// A section and its trays: each position group's positions in the user's order.
 pub struct SectionView<'a> {
     pub bay: Bay,
@@ -145,14 +155,33 @@ pub fn show_sections(
             collapsed(ui, plate, sec, base, prefs);
             continue;
         };
-        let trays: Vec<&PositionState> = sec.trays().collect();
-        let spans: Vec<usize> =
-            trays.iter().map(|p| if size == SectionSize::Compact { 1 } else { span_of(p, v, col_w, cols) }).collect();
-        let mut breaks = Vec::with_capacity(trays.len());
-        for (_, g) in &sec.groups {
-            breaks.extend((0..g.len()).map(|i| i == 0));
+        let span_at: std::collections::HashMap<PosId, usize> = sec
+            .trays()
+            .map(|p| (p.pos, if size == SectionSize::Compact { 1 } else { span_of(p, v, col_w, cols) }))
+            .collect();
+        // Where each tray goes for these groups' orders, from `origin`.
+        let layout_of = |groups: &[(String, Vec<&PositionState>)], origin: Pos2| -> (Vec<(PosId, Rect)>, usize) {
+            let (mut spans, mut breaks, mut ids) = (Vec::new(), Vec::new(), Vec::new());
+            for (_, g) in groups {
+                for (i, p) in g.iter().enumerate() {
+                    spans.push(span_at.get(&p.pos).copied().unwrap_or(1));
+                    breaks.push(i == 0);
+                    ids.push(p.pos);
+                }
+            }
+            let (rects, rows) = tray_rects(&spans, &breaks, cols, col_w, tray_h, origin);
+            (ids.into_iter().zip(rects).collect(), rows)
+        };
+        // A tray of this section being carried: its group shows the order it would drop into.
+        let carried = st.tray_drag.clone().filter(|d| sec.groups.iter().any(|(k, _)| *k == d.group));
+        let mut groups = sec.groups.clone();
+        if let Some(d) = &carried {
+            for (k, g) in groups.iter_mut().filter(|(k, _)| *k == d.group) {
+                let _ = k;
+                g.sort_by_key(|p| d.order.iter().position(|o| *o == p.pos.to_string()));
+            }
         }
-        let (_, rows) = rack::place(&spans, &breaks, cols);
+        let (_, rows) = layout_of(&groups, Pos2::ZERO);
         let bed_h = rows.max(1) as f32 * tray_h + rows.saturating_sub(1) as f32 * GAP;
         let plate_h = bed_h + 2.0 * PAD;
         let (band, _) = ui.allocate_exact_size(Vec2::new(full_w, plate_h + SECTION_GAP), Sense::hover());
@@ -163,9 +192,80 @@ pub fn show_sections(
         paint::panel(&p, plate, base, None);
         rail_face(ui, rail, sec.bay, size, base, prefs);
         paint::recess(&p, bed.expand(3.0), base, 8);
-        let (rects, _) = tray_rects(&spans, &breaks, cols, col_w, tray_h, bed.min);
-        for (pos, r) in trays.iter().zip(rects) {
-            tray(ui, r, pos, size, v, base, palette, st, motion, prefs, actions);
+        let (placed, _) = layout_of(&groups, bed.min);
+        let by_pos = |pos: PosId| sec.trays().find(|p| p.pos == pos);
+        let pointer = ui.input(|i| i.pointer.latest_pos());
+        let mut held = None;
+        for (pos, slot) in placed {
+            let Some(p) = by_pos(pos) else { continue };
+            if carried.as_ref().is_some_and(|d| d.pos == pos) {
+                held = Some((p, slot));
+                continue;
+            }
+            // Trays glide to their places (relative to the bed, so scrolling never lags).
+            let tid = Id::new(("tray-at", pos.to_string()));
+            let rel = slot.min - bed.min;
+            let x = motion.spring(tid.with("x"), rel.x, SETTLE);
+            let y = motion.spring(tid.with("y"), rel.y, SETTLE);
+            let at = Rect::from_min_size(bed.min + Vec2::new(x, y), slot.size());
+            let resp = tray(ui, at, p, size, v, base, palette, st, motion, prefs, actions);
+            if resp.drag_started() && !crate::bays::vacant(p) {
+                let from = ui.input(|i| i.pointer.press_origin()).or(pointer).unwrap_or(at.center());
+                let group = group_key(p.pos.group);
+                let order = groups
+                    .iter()
+                    .find(|(k, _)| *k == group)
+                    .map(|(_, g)| g.iter().map(|q| q.pos.to_string()).collect())
+                    .unwrap_or_default();
+                st.tray_drag = Some(TrayDrag { pos, group, grab: from - at.min, order });
+            }
+        }
+        // The carried tray: lifted, shadowed, under the pointer, kept inside its section.
+        if let (Some((p, slot)), Some(d)) = (held, carried) {
+            let to = pointer.map_or(slot.min, |ptr| ptr - d.grab);
+            let to = Pos2::new(
+                to.x.clamp(bed.left() - 4.0, bed.right() - slot.width() + 4.0),
+                to.y.clamp(bed.top() - 4.0, bed.bottom() - slot.height() + 4.0),
+            );
+            let at = Rect::from_min_size(to, slot.size());
+            let tid = Id::new(("tray-at", p.pos.to_string()));
+            motion.snap(tid.with("x"), at.min.x - bed.min.x, SETTLE);
+            motion.snap(tid.with("y"), at.min.y - bed.min.y, SETTLE);
+            ui.painter().rect_filled(
+                at.translate(Vec2::new(0.0, 7.0)).expand(3.0),
+                9.0,
+                Color32::from_black_alpha(110),
+            );
+            let lifted = Rect::from_center_size(at.center(), at.size() * 1.03);
+            let resp = tray(ui, lifted, p, size, v, base, palette, st, motion, prefs, actions);
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let let_go = resp.drag_stopped() || !ui.input(|i| i.pointer.any_down());
+            if escape {
+                st.tray_drag = None;
+            } else if let_go {
+                prefs.layout.cards.insert(d.group.clone(), d.order.clone());
+                st.tray_drag = None;
+            } else {
+                // Where it would drop: the slot nearest the tray's centre.
+                let keys = d.order.clone();
+                let centre = at.center() - bed.min.to_vec2();
+                let order = rack::candidate(&keys, &d.pos.to_string(), centre, |o: &[String]| {
+                    let mut gs = groups.clone();
+                    for (k, g) in gs.iter_mut() {
+                        if *k == d.group {
+                            g.sort_by_key(|q| o.iter().position(|x| *x == q.pos.to_string()));
+                        }
+                    }
+                    let (all, _) = layout_of(&gs, Pos2::ZERO);
+                    o.iter()
+                        .filter_map(|k| all.iter().find(|(pos, _)| pos.to_string() == *k).map(|(_, r)| *r))
+                        .collect()
+                });
+                if let Some(t) = st.tray_drag.as_mut() {
+                    t.order = order;
+                }
+                ui.ctx().request_repaint();
+            }
         }
     }
 }
@@ -300,7 +400,7 @@ fn tray(
     motion: &mut Motion,
     prefs: &ViewPrefs,
     actions: &mut Vec<ScreenAction>,
-) {
+) -> egui::Response {
     let filling = st.filling.contains(&p.pos);
     let mut f = face(p, v, filling);
     let custom = p.slots.iter().find_map(|id| v.slots.iter().find(|s| s.id == *id)).and_then(|s| s.label.clone());
@@ -313,7 +413,8 @@ fn tray(
     let empty = p.status == PositionStatus::Empty;
     let virtual_off = p.status == PositionStatus::Off;
     let disabled = p.status == PositionStatus::Disabled;
-    let resp = ui.interact(r, id, Sense::click());
+    let sense = if empty { Sense::click() } else { Sense::click_and_drag() };
+    let resp = ui.interact(r, id, sense);
     if st.picker == Some(p.pos) {
         st.picker_anchor = r;
     }
@@ -326,7 +427,7 @@ fn tray(
         if resp.clicked() {
             st.open_picker(p.pos, false, r);
         }
-        return;
+        return resp;
     }
     let colour = device_color(p, palette);
     let compact = size == SectionSize::Compact;
@@ -569,6 +670,7 @@ fn tray(
             actions.push(ScreenAction::Select(slot));
         }
     }
+    resp
 }
 
 /// An empty slot: recessed, two screws, its engraved tag and a quiet hint.
