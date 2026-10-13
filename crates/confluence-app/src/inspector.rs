@@ -136,16 +136,16 @@ fn block_panel(ui: &mut egui::Ui, state: &State, inputs: (u32, u32), outputs: (u
             format!("{} \u{b7} {:+.1} dB", point_label(&state.slots, p.input, p.output), p.gain_db).replace("+-", "-"),
         );
     }
-    let keys = crate::matrix::band_keys(&state.slots, &state.positions);
+    // The keys the matrix saves bands under (order and folding change none of them).
+    let layout = crate::matrix::GridLayout::arranged(
+        &state.slots,
+        &state.positions,
+        crate::matrix::CELL_DEFAULT,
+        &crate::prefs::LayoutPrefs::default(),
+    );
     let key_of = |input: bool, ch: u32| {
-        state
-            .slots
-            .iter()
-            .find(|s| {
-                let (first, n) = if input { (s.first_input, s.inputs) } else { (s.first_output, s.outputs) };
-                ch >= first && ch < first + n
-            })
-            .and_then(|s| keys.get(&s.id).cloned())
+        let axis = if input { &layout.rows } else { &layout.cols };
+        axis.bands.iter().find(|b| ch >= b.first_channel && ch < b.first_channel + b.channels).map(|b| b.key.clone())
     };
     ui.horizontal(|ui| {
         for (input, (start, end), text) in [(true, inputs, "Unfold inputs"), (false, outputs, "Unfold outputs")] {
@@ -933,6 +933,43 @@ mod display_tests {
         assert!(out.iter().any(|a| matches!(a, Action::Unfold { input: true, key } if key == "slot:S")));
         let state = view.state.as_ref().unwrap();
         assert_eq!(header(state, &sel, None).1, "1 ROUTE");
+    }
+
+    #[test]
+    fn unfolding_a_positions_second_slot_names_that_slot() {
+        let pt = PointState { input: 0, output: 2, gain_db: 0.0, mute: false, invert: false };
+        let mut view = view_with(pt);
+        let state = view.state.as_mut().unwrap();
+        let mut second = state.slots[0].clone();
+        (second.id, second.name, second.first_input, second.first_output) = (2, "S2".into(), 2, 2);
+        state.slots.push(second);
+        state.positions = vec![confluence_api::PositionState {
+            pos: "asio:1".parse().unwrap(),
+            status: confluence_api::PositionStatus::Filled { online: true },
+            device: None,
+            shape: None,
+            daw: None,
+            master: false,
+            color: None,
+            slots: vec![1, 2],
+        }];
+        let look = Look::builtin();
+        let sel = Selection::Block { inputs: (0, 1), outputs: (2, 4) };
+        let mut out = Vec::new();
+        {
+            let mut h = Harness::new_ui(|ui| {
+                let pending = std::collections::HashMap::new();
+                let plugin_ui = PluginUi { pending: &pending, loading: None };
+                out.extend(show(ui, &view, &look, &sel, None, None, true, &plugin_ui));
+            });
+            h.run();
+            h.get_by_label("Unfold outputs").click();
+            h.run();
+        }
+        assert!(
+            out.iter().any(|a| matches!(a, Action::Unfold { input: false, key } if key == "pos:asio:1#2")),
+            "the key the matrix saved for it"
+        );
     }
 
     /// A route quieter than the slider's range must still show its real gain

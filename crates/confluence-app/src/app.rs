@@ -510,6 +510,12 @@ impl ConfluenceApp {
             self.screen_state.picker = None;
             self.screen_state.apps = None;
         }
+        // A name being typed on the matrix is dropped once the grid is not
+        // drawn: its box would come back without focus, on a slot id that an
+        // engine restart may have given to another device.
+        if self.screen != Screen::Matrix || !self.live() || view.state.is_none() {
+            self.grid_state.renaming = None;
+        }
         if self.screen == Screen::Settings {
             // Settings work whether or not the engine is there.
             self.settings_screen(ui);
@@ -1038,12 +1044,16 @@ impl ConfluenceApp {
                 return;
             }
             let mut layout = GridLayout::arranged(&state.slots, &state.positions, self.cell, &self.prefs.layout);
-            // A selected route whose band was folded becomes the folded cell's block.
-            if let Some((r, c)) = selection_cell(&layout, &self.selection).filter(|&(r, c)| layout.folded(r, c)) {
-                if matches!(self.selection, Selection::Cell { .. }) {
-                    if let Some(s) = selection_at(&layout, r, c) {
-                        self.selection = s;
-                    }
+            // A selected route whose band was folded becomes the folded cell's
+            // block, and a block whose bands were unfolded becomes what its line now holds.
+            if let Some((r, c)) = selection_cell(&layout, &self.selection) {
+                let stale = match self.selection {
+                    Selection::Cell { .. } => layout.folded(r, c),
+                    Selection::Block { .. } => selection_at(&layout, r, c) != Some(self.selection),
+                    _ => false,
+                };
+                if let Some(s) = selection_at(&layout, r, c).filter(|_| stale) {
+                    self.selection = s;
                 }
             }
             // A band's default colour is its position's, as on the cards.

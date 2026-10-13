@@ -1251,6 +1251,11 @@ fn a_folded_cell_selects_its_block_and_routes_nothing_and_a_double_click_unfolds
         h.query_by_role_and_label(Role::Button, "VASIO A in 2 → VASIO A out 1").is_some()
     });
     assert!(h.state().prefs().layout.folded_inputs.is_empty());
+    assert_eq!(
+        h.state().selection(),
+        confluence_app::matrix::Selection::Cell { input: i, output: o },
+        "unfolded, the block's selection is a plain cell again"
+    );
     assert!(engine_points(&mut c).is_empty(), "unfolding routes nothing");
     c.call(Command::Shutdown).unwrap();
 }
@@ -1462,5 +1467,25 @@ fn a_card_is_dragged_before_another() {
     drag(&mut h, from, eframe::egui::pos2(a.left() + 20.0, a.center().y));
     settle(&mut h);
     assert!(card_of(&h, "VASIO B").left() < card_of(&h, "VASIO A").left(), "VASIO B was dropped before VASIO A");
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_rename_box_closes_when_the_matrix_is_left() {
+    let d = EngineDir::new("rename-leave");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 1);
+    let mut h = harness_fast(app_for(&d));
+    pump_until(&mut h, "the strip", LONG, |h| h.query_by_label("VASIO A inputs").is_some());
+    double_click(&mut h, "VASIO A inputs");
+    pump_until(&mut h, "the name box", LONG, |h| h.query_by(|n| n.placeholder() == Some("VASIO A")).is_some());
+    h.get_by_label("Devices").click();
+    settle(&mut h);
+    h.get_by_label("Matrix").click();
+    settle(&mut h);
+    assert!(h.query_by(|n| n.placeholder() == Some("VASIO A")).is_none(), "the box closed with the matrix");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(slots(&mut c).iter().all(|s| s.label.is_none()), "nothing was sent");
     c.call(Command::Shutdown).unwrap();
 }

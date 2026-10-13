@@ -70,6 +70,8 @@ pub struct GridState {
 /// A device or channel being renamed in place.
 pub struct Rename {
     pub slot: u32,
+    /// Its band's layout key: slot ids are reused after an engine restart.
+    pub key: String,
     /// The channel, or `None` for the device.
     pub channel: Option<confluence_api::ChannelRef>,
     pub text: String,
@@ -85,12 +87,14 @@ pub struct Rename {
 impl Rename {
     fn new(
         slot: u32,
+        key: String,
         channel: Option<confluence_api::ChannelRef>,
         custom: Option<String>,
         hint: String,
         at: Rect,
     ) -> Self {
-        Rename { slot, channel, text: custom.clone().unwrap_or_default(), original: custom, hint, at, focused: false }
+        let text = custom.clone().unwrap_or_default();
+        Rename { slot, key, channel, text, original: custom, hint, at, focused: false }
     }
 }
 
@@ -772,8 +776,8 @@ fn folded_cell(
 /// the name (an empty one puts the device's own back), Esc leaves it as it was.
 fn rename_box(ctx: &egui::Context, layout: &GridLayout, gs: &mut GridState, actions: &mut GridActions) {
     let Some(r) = gs.renaming.as_mut() else { return };
-    if layout.rows.band(r.slot).is_none() && layout.cols.band(r.slot).is_none() {
-        gs.renaming = None; // the device went away
+    if !rename_target_valid(layout, r) {
+        gs.renaming = None; // the device or channel went away
         return;
     }
     let mut done = None;
@@ -799,6 +803,19 @@ fn rename_box(ctx: &egui::Context, layout: &GridLayout, gs: &mut GridState, acti
         let name = Some(r.text.trim().to_string()).filter(|n| !n.is_empty());
         if name != r.original {
             actions.edits.push(Edit::SetSlotLabel { id: r.slot, channel: r.channel, name });
+        }
+    }
+}
+
+/// Whether the device (and channel) a rename box was opened on is still on
+/// the grid under the same slot id.
+fn rename_target_valid(layout: &GridLayout, r: &Rename) -> bool {
+    let same = |b: &&Band| b.slot == r.slot && b.key == r.key;
+    match r.channel {
+        None => layout.rows.bands.iter().chain(&layout.cols.bands).any(|b| same(&b)),
+        Some(c) => {
+            let axis = if c.input { &layout.rows } else { &layout.cols };
+            axis.bands.iter().filter(same).any(|b| c.index < b.channels)
         }
     }
 }
@@ -842,7 +859,7 @@ fn channel_label(
         let own = band.channel_names.get(k as usize).cloned().filter(|n| !n.trim().is_empty());
         let hint = own.unwrap_or_else(|| format!("{word} {}", k + 1));
         let channel = Some(confluence_api::ChannelRef { input, index: k });
-        gs.renaming = Some(Rename::new(band.slot, channel, custom, hint, at));
+        gs.renaming = Some(Rename::new(band.slot, band.key.clone(), channel, custom, hint, at));
     }
 }
 
@@ -911,7 +928,7 @@ fn strip_interact(
     });
     if rename && editable {
         let custom = (band.name != band.own_name).then(|| band.name.clone());
-        gs.renaming = Some(Rename::new(band.slot, None, custom, band.own_name.clone(), at));
+        gs.renaming = Some(Rename::new(band.slot, band.key.clone(), None, custom, band.own_name.clone(), at));
     }
 }
 
@@ -1088,6 +1105,35 @@ mod tests {
         assert_eq!(channel_text(&band, 1, "in"), "2  Line", "else the device's name");
         assert_eq!(channel_text(&band, 2, "in"), "in 3", "else the number");
         assert_eq!(channel_text(&band, 9, "out"), "out 10");
+    }
+
+    #[test]
+    fn a_rename_goes_only_to_the_device_and_channel_it_was_opened_on() {
+        let slot = |id: u32, name: &str| confluence_api::SlotState {
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+            label: None,
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
+            id,
+            name: name.into(),
+            device: String::new(),
+            role: confluence_api::ClockRole::Soft,
+            online: true,
+            first_input: 0,
+            inputs: 2,
+            first_output: 0,
+            outputs: 2,
+            color: None,
+        };
+        let layout = GridLayout::new(&[slot(1, "A")], 22.0);
+        let ch = |index| Some(confluence_api::ChannelRef { input: true, index });
+        let r = |slot, key: &str, channel| Rename::new(slot, key.into(), channel, None, String::new(), Rect::NOTHING);
+        assert!(rename_target_valid(&layout, &r(1, "slot:A", None)));
+        assert!(rename_target_valid(&layout, &r(1, "slot:A", ch(1))));
+        assert!(!rename_target_valid(&layout, &r(1, "slot:B", None)), "the id now belongs to another device");
+        assert!(!rename_target_valid(&layout, &r(2, "slot:A", None)), "the slot is gone");
+        assert!(!rename_target_valid(&layout, &r(1, "slot:A", ch(5))), "the channel is gone");
     }
 
     #[test]
