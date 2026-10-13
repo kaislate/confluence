@@ -1507,3 +1507,32 @@ fn a_tray_is_picked_up_and_the_others_make_room_before_it_drops() {
     assert_eq!(slots(&mut c), before, "the engine is untouched");
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_network_tray_is_switched_off_and_on_and_keeps_its_route() {
+    let d = EngineDir::new("tray-off");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let pos: confluence_api::PosId = "net-out:1".parse().unwrap();
+    let fill = Command::FillPosition { pos, kind: DeviceKind::NetSend, name: "127.0.0.1:9/Main:2".into() };
+    assert!(matches!(c.call(fill).unwrap(), Response::Added { .. }));
+    let net =
+        |c: &mut confluence_client::Client| slots(c).into_iter().find(|s| s.device.starts_with("net-out:")).unwrap();
+    let (i, o) = (add_vasio(&mut c, 2).0, net(&mut c).first_output);
+    c.call(Command::SetPoint { input: i, output: o, gain_db: 0.0, mute: false, invert: false }).unwrap();
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "NET OUT 1's pill", LONG, |h| h.query_by_label("Turn off NET OUT 1").is_some());
+    h.get_by_label("Turn off NET OUT 1").scroll_to_me();
+    settle(&mut h);
+    h.get_by_label("Turn off NET OUT 1").click();
+    pump_until(&mut h, "the stream off", LONG, |_| !net(&mut c).online);
+    assert!(engine_points(&mut c).contains(&(i, o)), "its route is kept while off");
+    assert_eq!(net(&mut c).first_output, o, "and its channels");
+    pump_until(&mut h, "its Turn on", LONG, |h| h.query_by_label("Turn on NET OUT 1").is_some());
+    hover_click(&mut h, "Turn on NET OUT 1");
+    pump_until(&mut h, "the stream back", LONG, |_| net(&mut c).online);
+    assert!(engine_points(&mut c).contains(&(i, o)), "its route is back with it");
+    c.call(Command::Shutdown).unwrap();
+}
