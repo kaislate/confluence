@@ -812,6 +812,11 @@ impl ConfluenceApp {
         self.grid_state.offset
     }
 
+    /// How many times the minimap has built its route dots (for tests).
+    pub fn minimap_builds(&self) -> usize {
+        self.grid_state.mini_dots.builds
+    }
+
     /// The screen shown.
     pub fn screen(&self) -> Screen {
         self.screen
@@ -1049,6 +1054,9 @@ impl ConfluenceApp {
             // Routes that appeared since last frame pop in.
             let routed: HashSet<(u32, u32)> = state.points.iter().map(|p| (p.input, p.output)).collect();
             let fresh: HashSet<(u32, u32)> = routed.difference(&self.routes_seen).copied().collect();
+            if !fresh.is_empty() || routed.len() != self.routes_seen.len() {
+                self.grid_state.routes_version += 1;
+            }
             self.routes_seen = routed;
             let inner = ui.max_rect().shrink(8.0);
             self.matrix_area = inner.size() - Vec2::new(grid_view::HEADER_W, grid_view::HEADER_H);
