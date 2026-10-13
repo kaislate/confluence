@@ -12,6 +12,7 @@ use eframe::egui::{
 };
 use egui::epaint::TextShape;
 
+use crate::arrange::{coverage, Coverage};
 use crate::commands::Edit;
 use crate::gear::motion::{Curve, Motion, POP, SETTLE};
 use crate::gear::paint;
@@ -35,6 +36,12 @@ pub struct GridActions {
     pub select: Option<Selection>,
     /// A new cell size (Ctrl+wheel).
     pub zoom: Option<f32>,
+    /// Bands to fold or unfold: (inputs?, layout key).
+    pub fold: Vec<(bool, String)>,
+    /// Bands to move: (inputs?, layout key, insertion point among the bands).
+    pub moves: Vec<(bool, String, usize)>,
+    /// Fold (true) or unfold every band of one side: (inputs?, fold?).
+    pub fold_all: Option<(bool, bool)>,
 }
 
 /// What the grid remembers between frames.
@@ -52,6 +59,43 @@ pub struct GridState {
     pub routes_version: u64,
     /// The minimap's route dots, kept between frames.
     pub mini_dots: crate::minimap::DotCache,
+    /// The band whose strip is being dragged: (inputs?, layout key).
+    pub strip_drag: Option<(bool, String)>,
+    /// Where it would land if let go now (an insertion point among the bands).
+    pub strip_drop: Option<usize>,
+    /// The name being typed for a device or channel.
+    pub renaming: Option<Rename>,
+}
+
+/// A device or channel being renamed in place.
+pub struct Rename {
+    pub slot: u32,
+    /// Its band's layout key: slot ids are reused after an engine restart.
+    pub key: String,
+    /// The channel, or `None` for the device.
+    pub channel: Option<confluence_api::ChannelRef>,
+    pub text: String,
+    /// Its custom name when the box opened.
+    pub original: Option<String>,
+    /// Its own name, shown while the box is empty.
+    pub hint: String,
+    /// Where the box sits.
+    pub at: Rect,
+    focused: bool,
+}
+
+impl Rename {
+    fn new(
+        slot: u32,
+        key: String,
+        channel: Option<confluence_api::ChannelRef>,
+        custom: Option<String>,
+        hint: String,
+        at: Rect,
+    ) -> Self {
+        let text = custom.clone().unwrap_or_default();
+        Rename { slot, key, channel, text, original: custom, hint, at, focused: false }
+    }
 }
 
 /// Pixels of touchpad (point-unit) scrolling per gain step.
@@ -132,12 +176,20 @@ pub fn show(
     motion: &mut Motion,
     gs: &mut GridState,
     lookup: &dyn Fn((u32, u32)) -> (Option<PointState>, bool),
-    selected: Option<(u32, u32)>,
+    selection: &Selection,
     fresh: &HashSet<(u32, u32)>,
     routes: &HashSet<(u32, u32)>,
     editable: bool,
 ) -> GridActions {
     let mut actions = GridActions::default();
+    let selected = match *selection {
+        Selection::Cell { input, output } => Some((input, output)),
+        _ => None,
+    };
+    let selected_block = match *selection {
+        Selection::Block { inputs, outputs } => Some((inputs, outputs)),
+        _ => None,
+    };
     let (ctrl, fine) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
     if ctrl && ui.ui_contains_pointer() {
         let n = wheel_notches(ui);
@@ -180,7 +232,7 @@ pub fn show(
             bed.rect_filled(strip, 0.0, paint::alpha(band_colour(look, skin, b), 0.10));
         }
         // The crosshair: the hovered (else selected) row and column, tinted.
-        let focus = gs.hover.or_else(|| selected.and_then(|(i, o)| layout.cell_of(i, o)));
+        let focus = gs.hover.or_else(|| crate::matrix::selection_cell(layout, selection));
         if let Some((r, c)) = focus {
             let ty = motion.tween(Id::new("cross-row"), layout.rows.pos(r), Curve::Enter, 0.09);
             let tx = motion.tween(Id::new("cross-col"), layout.cols.pos(c), Curve::Enter, 0.09);
@@ -194,6 +246,11 @@ pub fn show(
             let row_band = layout.rows.at(r).map(|(b, _)| b);
             let row_colour = row_band.map(|b| band_colour(look, skin, b)).unwrap_or(ink);
             for c in cols.clone() {
+                if layout.folded(r, c) {
+                    let at = Folded { origin, cell_area, colour: row_colour, ink, selected: selected_block };
+                    folded_cell(ui, &bed, layout, (r, c), &at, routes, skin, &mut hover_now, &mut actions);
+                    continue;
+                }
                 let Some(p) = layout.point(r, c) else { continue };
                 // Strings are built only when asked for: the label when the
                 // accessibility tree is active, the tooltip on hover.
@@ -318,7 +375,7 @@ pub fn show(
                 });
             }
         }
-        if layout.rows.len > 0 && layout.cols.len > 0 && !layout_has_routes(layout, lookup) {
+        if layout.rows.len > 0 && layout.cols.len > 0 && routes.is_empty() && !layout_has_routes(layout, lookup) {
             let hint = "No routes yet. Click a crosspoint and press Space, or double-click it.";
             let at = Pos2::new(cell_area.center().x, (grid.top() + 24.0).max(cell_area.top() + 24.0));
             paint::etched_text(&bed, at, Align2::CENTER_CENTER, hint, skin, ink, 12.0, false, 0.0, 0.55);
@@ -355,22 +412,23 @@ pub fn show(
                 }
                 rotated(
                     &painter,
-                    Pos2::new(strip.center().x, strip.bottom() - 6.0),
+                    Pos2::new(strip.center().x, strip.bottom() - SEP - 2.0),
                     &name,
                     name_font.clone(),
                     skins::ink_on(colour),
-                    strip.height() - 12.0,
+                    strip.height() - SEP - 8.0,
                 );
                 let hit = strip.intersect(top);
                 if hit.is_positive() {
-                    let resp = ui.interact(hit, Id::new(("band-out", band.slot)), Sense::click());
-                    resp.widget_info(|| {
-                        WidgetInfo::labeled(WidgetType::Button, true, format!("{} outputs", band.name))
-                    });
-                    if resp.clicked() {
-                        actions.select = Some(Selection::Slot(band.slot));
-                    }
-                    resp.on_hover_text(format!("{name}: {} outputs", band.channels));
+                    let at = Rect::from_min_size(hit.left_top() + Vec2::new(0.0, 4.0), Vec2::new(200.0, 22.0));
+                    strip_interact(ui, hit, at, band, false, &name, editable, gs, &mut actions);
+                }
+                let chev = Rect::from_min_size(
+                    Pos2::new(strip.left() + 2.0, strip.bottom() - SEP + 2.0),
+                    Vec2::splat(SEP - 4.0),
+                );
+                if fold_chevron(ui, &painter, chev.intersect(top), band, "outputs", skins::ink_on(colour)) {
+                    actions.fold.push((false, band.key.clone()));
                 }
             }
             for k in crate::matrix::channels_in(band, &cols) {
@@ -378,10 +436,26 @@ pub fn show(
                 let x = origin.x + layout.cols.pos(idx) + cell / 2.0;
                 if x > top.min.x && x < top.max.x {
                     let lit = focus_col == Some(idx);
+                    let text = if band.folded {
+                        folded_text(
+                            ui,
+                            Rect::from_center_size(Pos2::new(x, top.center().y), Vec2::new(cell, HEADER_H - 8.0))
+                                .intersect(top),
+                            band,
+                        )
+                    } else {
+                        let hit = Rect::from_min_max(
+                            Pos2::new(x - cell / 2.0, top.min.y + 4.0),
+                            Pos2::new(x + cell / 2.0, top.max.y - 2.0),
+                        );
+                        let at = Rect::from_min_size(Pos2::new(x - 10.0, top.max.y - 28.0), Vec2::new(200.0, 22.0));
+                        channel_label(ui, hit.intersect(top), at, band, k, false, editable, gs);
+                        channel_text(band, k, if band.bus { "send" } else { "out" })
+                    };
                     rotated(
                         &tp,
                         Pos2::new(x, top.max.y - 6.0),
-                        &channel_text(band, k, if band.bus { "send" } else { "out" }),
+                        &text,
                         number_font.clone(),
                         paint::alpha(ink, if lit { 1.0 } else { 0.6 }),
                         HEADER_H - 12.0,
@@ -406,21 +480,20 @@ pub fn show(
                 }
                 paint::truncated(
                     &painter,
-                    Pos2::new(strip.left() + 8.0, strip.center().y),
+                    Pos2::new(strip.left() + SEP + 2.0, strip.center().y),
                     Align2::LEFT_CENTER,
                     &name,
                     name_font.clone(),
                     skins::ink_on(colour),
-                    strip.width() - 16.0,
+                    strip.width() - SEP - 10.0,
                 );
                 let hit = strip.intersect(left);
                 if hit.is_positive() {
-                    let resp = ui.interact(hit, Id::new(("band-in", band.slot)), Sense::click());
-                    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{} inputs", band.name)));
-                    if resp.clicked() {
-                        actions.select = Some(Selection::Slot(band.slot));
-                    }
-                    resp.on_hover_text(format!("{name}: {} inputs", band.channels));
+                    strip_interact(ui, hit, strip, band, true, &name, editable, gs, &mut actions);
+                }
+                let chev = Rect::from_min_size(strip.min + Vec2::splat(2.0), Vec2::splat(SEP - 4.0));
+                if fold_chevron(ui, &painter, chev.intersect(left), band, "inputs", skins::ink_on(colour)) {
+                    actions.fold.push((true, band.key.clone()));
                 }
             }
             for k in crate::matrix::channels_in(band, &rows) {
@@ -428,16 +501,60 @@ pub fn show(
                 let y = origin.y + layout.rows.pos(idx) + cell / 2.0;
                 if y > left.min.y && y < left.max.y {
                     let lit = focus_row == Some(idx);
+                    let text = if band.folded {
+                        let r = Rect::from_center_size(Pos2::new(left.center().x, y), Vec2::new(HEADER_W - 16.0, cell));
+                        folded_text(ui, r.intersect(left), band)
+                    } else {
+                        let hit = Rect::from_min_max(
+                            Pos2::new(left.min.x + 8.0, y - cell / 2.0),
+                            Pos2::new(left.max.x - 4.0, y + cell / 2.0),
+                        );
+                        let at = Rect::from_min_size(
+                            Pos2::new(left.min.x + 6.0, y - 11.0),
+                            Vec2::new(HEADER_W - 10.0, 22.0),
+                        );
+                        channel_label(ui, hit.intersect(left), at, band, k, true, editable, gs);
+                        channel_text(band, k, if band.bus { "return" } else { "in" })
+                    };
                     paint::truncated(
                         &lp,
                         Pos2::new(left.max.x - 8.0, y),
                         Align2::RIGHT_CENTER,
-                        &channel_text(band, k, if band.bus { "return" } else { "in" }),
+                        &text,
                         number_font.clone(),
                         paint::alpha(ink, if lit { 1.0 } else { 0.6 }),
                         HEADER_W - 16.0,
                     );
                 }
+            }
+        }
+        rename_box(ui.ctx(), layout, gs, &mut actions);
+        // A drag let go away from its strip (scrolled off) lands nowhere.
+        if gs.strip_drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            gs.strip_drag = None;
+            gs.strip_drop = None;
+        }
+        // A strip being dragged: an accent line where its band would land.
+        if let Some((input, _)) = gs.strip_drag.clone() {
+            if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+                let axis = if input { &layout.rows } else { &layout.cols };
+                let o = if input { origin.y } else { origin.x };
+                let mids: Vec<f32> = axis
+                    .bands
+                    .iter()
+                    .enumerate()
+                    .map(|(bi, b)| o + axis.strip_pos(bi) + (SEP + b.lines() as f32 * cell) / 2.0)
+                    .collect();
+                let slot = crate::arrange::drop_slot(&mids, if input { p.y } else { p.x });
+                gs.strip_drop = Some(slot);
+                let at = o + axis.strip_pos(slot) - 1.0;
+                let line = if input {
+                    [Pos2::new(vp.min.x, at), Pos2::new(vp.max.x, at)]
+                } else {
+                    [Pos2::new(at, vp.min.y), Pos2::new(at, vp.max.y)]
+                };
+                ui.painter_at(vp).line_segment(line, Stroke::new(3.0, skin.accent));
+                ui.ctx().request_repaint();
             }
         }
         // The corner: a minimap of the whole matrix that moves the view.
@@ -507,7 +624,7 @@ fn minimap(
     let k = crate::minimap::scale(mini, content);
     for (bi, b) in layout.cols.bands.iter().enumerate() {
         let x = mini.left() + layout.cols.strip_pos(bi) * k.x;
-        let w = ((SEP + b.channels as f32 * layout.cell) * k.x).max(1.0);
+        let w = ((SEP + b.lines() as f32 * layout.cell) * k.x).max(1.0);
         p.rect_filled(
             Rect::from_min_size(Pos2::new(x, mini.top()), Vec2::new(w, 2.5)),
             0.0,
@@ -516,7 +633,7 @@ fn minimap(
     }
     for (bi, b) in layout.rows.bands.iter().enumerate() {
         let y = mini.top() + layout.rows.strip_pos(bi) * k.y;
-        let h = ((SEP + b.channels as f32 * layout.cell) * k.y).max(1.0);
+        let h = ((SEP + b.lines() as f32 * layout.cell) * k.y).max(1.0);
         p.rect_filled(
             Rect::from_min_size(Pos2::new(mini.left(), y), Vec2::new(2.5, h)),
             0.0,
@@ -565,9 +682,286 @@ fn minimap_key(layout: &GridLayout, routes_version: u64, mini: Vec2) -> u64 {
     // The row count first, so rows and columns can never run together.
     layout.rows.bands.len().hash(&mut h);
     for b in layout.rows.bands.iter().chain(&layout.cols.bands) {
-        (b.slot, b.start, b.first_channel, b.channels).hash(&mut h);
+        (b.slot, b.start, b.first_channel, b.channels, b.folded).hash(&mut h);
     }
     h.finish()
+}
+
+/// Where a folded cell is drawn and what it is drawn with.
+struct Folded {
+    origin: Pos2,
+    cell_area: Rect,
+    /// Its row band's colour.
+    colour: Color32,
+    ink: Color32,
+    /// The selected block, if any: (inputs, outputs).
+    selected: Option<((u32, u32), (u32, u32))>,
+}
+
+/// A cell on a folded line: how much of the block behind it is routed. A
+/// click selects the block, a double-click unfolds; it never routes.
+#[allow(clippy::too_many_arguments)]
+fn folded_cell(
+    ui: &mut egui::Ui,
+    bed: &egui::Painter,
+    layout: &GridLayout,
+    (r, c): (usize, usize),
+    at: &Folded,
+    routes: &HashSet<(u32, u32)>,
+    skin: &GearSkin,
+    hover: &mut Option<(usize, usize)>,
+    actions: &mut GridActions,
+) {
+    let Some((ins, outs)) = layout.block(r, c) else { return };
+    let cell = layout.cell;
+    let (cx, cy) = layout.cell_pos(r, c);
+    let rect = Rect::from_min_size(at.origin + Vec2::new(cx, cy), Vec2::splat(cell));
+    let hit = rect.intersect(at.cell_area);
+    if !hit.is_positive() {
+        return;
+    }
+    let key = ((ins.start, ins.end), (outs.start, outs.end));
+    let resp = ui.interact(hit, Id::new(("block", key)), Sense::click());
+    let label = layout.label(r, c).unwrap_or_default();
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
+    if resp.hovered() {
+        *hover = Some((r, c));
+    }
+    let cov = coverage(ins, outs, |i, o| routes.contains(&(i, o)));
+    let online = layout.rows.at(r).is_some_and(|(b, _)| b.online) && layout.cols.at(c).is_some_and(|(b, _)| b.online);
+    let fill = if online { at.colour } else { paint::alpha(at.colour, 0.5) };
+    let centre = rect.center();
+    match cov {
+        Coverage::None => paint::pin(bed, centre, at.ink, 0.12),
+        Coverage::Partial => {
+            let side = routed_side(cell, 1.0) * 0.7;
+            let r = Rect::from_center_size(centre, Vec2::splat(side));
+            bed.rect_stroke(r, egui::CornerRadius::same(2), Stroke::new(2.0, fill), StrokeKind::Inside);
+        }
+        Coverage::Full => {
+            let side = routed_side(cell, 1.0);
+            paint::raised(bed, Rect::from_center_size(centre, Vec2::splat(side)), fill, (side * 0.25).clamp(2.0, 4.0));
+        }
+    }
+    if at.selected == Some(key) {
+        bed.rect_stroke(
+            rect.shrink(0.5),
+            egui::CornerRadius::same(5),
+            Stroke::new(2.0, skin.accent),
+            StrokeKind::Inside,
+        );
+    }
+    let word = match cov {
+        Coverage::None => "not routed",
+        Coverage::Partial => "partly routed",
+        Coverage::Full => "all routed",
+    };
+    let ends = tooltip(&label, None);
+    let ends = ends.strip_suffix("\nno route").unwrap_or(&ends).to_string();
+    let resp = resp.on_hover_ui(|ui| {
+        ui.label(format!("{ends}\n{word}"));
+    });
+    if resp.double_clicked() {
+        for (input, band) in [(true, layout.rows.at(r)), (false, layout.cols.at(c))] {
+            if let Some((b, _)) = band.filter(|(b, _)| b.folded) {
+                actions.fold.push((input, b.key.clone()));
+            }
+        }
+    } else if resp.clicked() {
+        actions.select = Some(Selection::Block { inputs: key.0, outputs: key.1 });
+    }
+}
+
+/// The box a device or channel is renamed in: Enter or clicking away keeps
+/// the name (an empty one puts the device's own back), Esc leaves it as it was.
+fn rename_box(ctx: &egui::Context, layout: &GridLayout, gs: &mut GridState, actions: &mut GridActions) {
+    let Some(r) = gs.renaming.as_mut() else { return };
+    if !rename_target_valid(layout, r) {
+        gs.renaming = None; // the device or channel went away
+        return;
+    }
+    let mut done = None;
+    egui::Area::new(Id::new("matrix-rename")).order(egui::Order::Foreground).fixed_pos(r.at.min).show(ctx, |ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut r.text)
+                .hint_text(r.hint.clone())
+                .char_limit(confluence_api::MAX_LABEL)
+                .desired_width(r.at.width().clamp(160.0, 260.0)),
+        );
+        if !r.focused {
+            field.request_focus();
+            r.focused = true;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            done = Some(false);
+        } else if field.lost_focus() {
+            done = Some(true);
+        }
+    });
+    let Some(keep) = done else { return };
+    if let Some(r) = gs.renaming.take().filter(|_| keep) {
+        let name = Some(r.text.trim().to_string()).filter(|n| !n.is_empty());
+        if name != r.original {
+            actions.edits.push(Edit::SetSlotLabel { id: r.slot, channel: r.channel, name });
+        }
+    }
+}
+
+/// Whether the device (and channel) a rename box was opened on is still on
+/// the grid under the same slot id.
+fn rename_target_valid(layout: &GridLayout, r: &Rename) -> bool {
+    let same = |b: &&Band| b.slot == r.slot && b.key == r.key;
+    match r.channel {
+        None => layout.rows.bands.iter().chain(&layout.cols.bands).any(|b| same(&b)),
+        Some(c) => {
+            let axis = if c.input { &layout.rows } else { &layout.cols };
+            axis.bands.iter().filter(same).any(|b| c.index < b.channels)
+        }
+    }
+}
+
+/// A channel's name in the margin: double-click it (or use its menu) to rename it.
+#[allow(clippy::too_many_arguments)]
+fn channel_label(
+    ui: &mut egui::Ui,
+    hit: Rect,
+    at: Rect,
+    band: &Band,
+    k: u32,
+    input: bool,
+    editable: bool,
+    gs: &mut GridState,
+) {
+    if !hit.is_positive() {
+        return;
+    }
+    let word = match (input, band.bus) {
+        (true, false) => "in",
+        (true, true) => "return",
+        (false, false) => "out",
+        (false, true) => "send",
+    };
+    let what = format!("{} {word} {}", band.name, k + 1);
+    let resp = ui.interact(hit, Id::new(("channel-name", input, band.slot, k)), Sense::click());
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, editable, &what));
+    if !editable {
+        return;
+    }
+    let mut open = resp.double_clicked();
+    resp.context_menu(|ui| {
+        if ui.button("Rename\u{2026}").clicked() {
+            open = true;
+            ui.close();
+        }
+    });
+    if open {
+        let custom = band.channel_labels.get(k as usize).cloned().flatten();
+        let own = band.channel_names.get(k as usize).cloned().filter(|n| !n.trim().is_empty());
+        let hint = own.unwrap_or_else(|| format!("{word} {}", k + 1));
+        let channel = Some(confluence_api::ChannelRef { input, index: k });
+        gs.renaming = Some(Rename::new(band.slot, band.key.clone(), channel, custom, hint, at));
+    }
+}
+
+/// A band's strip: a click selects its slot, a drag moves the band, a
+/// double-click renames the device, and its menu folds, moves and renames.
+#[allow(clippy::too_many_arguments)]
+fn strip_interact(
+    ui: &mut egui::Ui,
+    hit: Rect,
+    at: Rect,
+    band: &Band,
+    input: bool,
+    name: &str,
+    editable: bool,
+    gs: &mut GridState,
+    actions: &mut GridActions,
+) {
+    let mut rename = false;
+    let side = if input { "inputs" } else { "outputs" };
+    let id = Id::new((if input { "band-in" } else { "band-out" }, band.slot));
+    let resp = ui.interact(hit, id, Sense::click_and_drag());
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{} {side}", band.name)));
+    if resp.clicked() {
+        actions.select = Some(Selection::Slot(band.slot));
+    }
+    rename |= resp.double_clicked();
+    if resp.drag_started() {
+        gs.strip_drag = Some((input, band.key.clone()));
+        gs.strip_drop = None;
+    }
+    if resp.drag_stopped() {
+        if let (Some((i, key)), Some(to)) = (gs.strip_drag.take(), gs.strip_drop.take()) {
+            if i == input && key == band.key {
+                actions.moves.push((input, key, to));
+            }
+        }
+    }
+    let (first, last) = if input { ("Move to top", "Move to bottom") } else { ("Move to start", "Move to end") };
+    let resp = resp.on_hover_text(format!("{name}: {} {side}", band.channels));
+    resp.context_menu(|ui| {
+        if editable && ui.button("Rename\u{2026}").clicked() {
+            rename = true;
+            ui.close();
+        }
+        if ui.button(if band.folded { "Unfold" } else { "Fold" }).clicked() {
+            actions.fold.push((input, band.key.clone()));
+            ui.close();
+        }
+        if ui.button(first).clicked() {
+            actions.moves.push((input, band.key.clone(), 0));
+            ui.close();
+        }
+        if ui.button(last).clicked() {
+            actions.moves.push((input, band.key.clone(), usize::MAX));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button(format!("Fold all {side}")).clicked() {
+            actions.fold_all = Some((input, true));
+            ui.close();
+        }
+        if ui.button(format!("Unfold all {side}")).clicked() {
+            actions.fold_all = Some((input, false));
+            ui.close();
+        }
+    });
+    if rename && editable {
+        let custom = (band.name != band.own_name).then(|| band.name.clone());
+        gs.renaming = Some(Rename::new(band.slot, band.key.clone(), None, custom, band.own_name.clone(), at));
+    }
+}
+
+/// The fold chevron on a band's strip (pointing down while open, along the
+/// strip when folded); true when it is clicked.
+fn fold_chevron(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, band: &Band, side: &str, colour: Color32) -> bool {
+    if !r.is_positive() {
+        return false;
+    }
+    let what = format!("{} {} {side}", if band.folded { "Unfold" } else { "Fold" }, band.name);
+    let resp = ui.interact(r, Id::new(("fold", side, band.slot)), Sense::click());
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &what));
+    let c = r.center();
+    let s = 3.5;
+    let pts = if band.folded {
+        [c + Vec2::new(-s * 0.5, -s), c + Vec2::new(s * 0.5, 0.0), c + Vec2::new(-s * 0.5, s)]
+    } else {
+        [c + Vec2::new(-s, -s * 0.5), c + Vec2::new(0.0, s * 0.5), c + Vec2::new(s, -s * 0.5)]
+    };
+    let ink = paint::alpha(colour, if resp.hovered() { 1.0 } else { 0.75 });
+    p.line_segment([pts[0], pts[1]], Stroke::new(1.6, ink));
+    p.line_segment([pts[1], pts[2]], Stroke::new(1.6, ink));
+    resp.on_hover_text(what).clicked()
+}
+
+/// A folded band's one margin line ("8 channels"), as an accessible label.
+fn folded_text(ui: &mut egui::Ui, r: Rect, band: &Band) -> String {
+    let text = format!("{} channels", band.channels);
+    if r.is_positive() {
+        let resp = ui.interact(r, Id::new(("folded-text", band.key.as_str(), band.start)), Sense::hover());
+        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &text));
+    }
+    text
 }
 
 /// A device's name on its strip ("… · OFFLINE" while it is missing).
@@ -692,7 +1086,10 @@ mod tests {
     #[test]
     fn a_channel_shows_its_number_and_name() {
         let band = Band {
+            own_name: "GoXLR".into(),
             slot: 1,
+            key: "pos:asio:1".into(),
+            folded: false,
             name: "GoXLR".into(),
             channel_labels: vec![Some("Kick".into()), None, None],
             channel_names: vec!["Mic".into(), "Line".into(), String::new()],
@@ -708,6 +1105,35 @@ mod tests {
         assert_eq!(channel_text(&band, 1, "in"), "2  Line", "else the device's name");
         assert_eq!(channel_text(&band, 2, "in"), "in 3", "else the number");
         assert_eq!(channel_text(&band, 9, "out"), "out 10");
+    }
+
+    #[test]
+    fn a_rename_goes_only_to_the_device_and_channel_it_was_opened_on() {
+        let slot = |id: u32, name: &str| confluence_api::SlotState {
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+            label: None,
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
+            id,
+            name: name.into(),
+            device: String::new(),
+            role: confluence_api::ClockRole::Soft,
+            online: true,
+            first_input: 0,
+            inputs: 2,
+            first_output: 0,
+            outputs: 2,
+            color: None,
+        };
+        let layout = GridLayout::new(&[slot(1, "A")], 22.0);
+        let ch = |index| Some(confluence_api::ChannelRef { input: true, index });
+        let r = |slot, key: &str, channel| Rename::new(slot, key.into(), channel, None, String::new(), Rect::NOTHING);
+        assert!(rename_target_valid(&layout, &r(1, "slot:A", None)));
+        assert!(rename_target_valid(&layout, &r(1, "slot:A", ch(1))));
+        assert!(!rename_target_valid(&layout, &r(1, "slot:B", None)), "the id now belongs to another device");
+        assert!(!rename_target_valid(&layout, &r(2, "slot:A", None)), "the slot is gone");
+        assert!(!rename_target_valid(&layout, &r(1, "slot:A", ch(5))), "the channel is gone");
     }
 
     #[test]

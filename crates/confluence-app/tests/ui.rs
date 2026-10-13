@@ -1195,3 +1195,297 @@ fn the_window_buttons_sit_by_scripts_and_work() {
     assert!(cmds.contains(&eframe::egui::ViewportCommand::Maximized(true)), "{cmds:?}");
     client(&d).call(Command::Shutdown).unwrap();
 }
+
+/// Folds VASIO A's inputs by the chevron on its strip, once the given cell shows.
+fn fold_vasio_a_inputs(h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>) {
+    pump_until(h, "the fold chevron", LONG, |h| h.query_by_label("Fold VASIO A inputs").is_some());
+    h.get_by_label("Fold VASIO A inputs").click();
+    pump_until(h, "the folded line", LONG, |h| {
+        h.query_by_role_and_label(Role::Button, "VASIO A, all inputs → VASIO A out 1").is_some()
+    });
+}
+
+#[test]
+fn a_band_folds_to_one_line_and_its_cell_shows_the_routes_behind_it() {
+    let d = EngineDir::new("fold");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_vasio(&mut c, 1);
+    c.call(Command::SetPoint { input: i + 1, output: o, gain_db: 0.0, mute: false, invert: false }).unwrap();
+    let mut h = harness_fast(app_for(&d));
+    pump_until(&mut h, "the route", LONG, |h| h.state().point(i + 1, o).is_some());
+    fold_vasio_a_inputs(&mut h);
+    assert!(h.query_by_role_and_label(Role::Button, "VASIO A in 2 → VASIO A out 1").is_none(), "its rows are gone");
+    assert_eq!(h.state().prefs().layout.folded_inputs.len(), 1, "the fold is saved");
+    assert!(h.query_by_label("Unfold VASIO A inputs").is_some());
+    assert!(h.query_by_label("2 channels").is_some(), "the folded margin says what is inside");
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_folded_cell_selects_its_block_and_routes_nothing_and_a_double_click_unfolds() {
+    let d = EngineDir::new("fold-click");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let (i, o) = add_vasio(&mut c, 1);
+    let mut h = harness_fast(app_for(&d));
+    fold_vasio_a_inputs(&mut h);
+    let cell = "VASIO A, all inputs → VASIO A out 1";
+    h.get_by_role_and_label(Role::Button, cell).click();
+    settle(&mut h);
+    assert_eq!(
+        h.state().selection(),
+        confluence_app::matrix::Selection::Block { inputs: (i, i + 2), outputs: (o, o + 1) }
+    );
+    h.key_press(eframe::egui::Key::Space);
+    std::thread::sleep(Duration::from_millis(600));
+    settle(&mut h);
+    assert!(engine_points(&mut c).is_empty(), "a folded cell routes nothing");
+    for _ in 0..40 {
+        h.step();
+    }
+    let node = h.get_by_role_and_label(Role::Button, cell);
+    node.click();
+    node.click();
+    pump_until(&mut h, "the unfolded rows", LONG, |h| {
+        h.query_by_role_and_label(Role::Button, "VASIO A in 2 → VASIO A out 1").is_some()
+    });
+    assert!(h.state().prefs().layout.folded_inputs.is_empty());
+    assert_eq!(
+        h.state().selection(),
+        confluence_app::matrix::Selection::Cell { input: i, output: o },
+        "unfolded, the block's selection is a plain cell again"
+    );
+    assert!(engine_points(&mut c).is_empty(), "unfolding routes nothing");
+    c.call(Command::Shutdown).unwrap();
+}
+
+/// Presses at `from`, moves to `to` in steps and lets go.
+fn drag(
+    h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>,
+    from: eframe::egui::Pos2,
+    to: eframe::egui::Pos2,
+) {
+    use eframe::egui::{Event, PointerButton};
+    let button = |pos, pressed| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    h.event(Event::PointerMoved(from));
+    h.event(button(from, true));
+    h.step();
+    for k in 1..=8 {
+        h.event(Event::PointerMoved(from + (to - from) * (k as f32 / 8.0)));
+        h.step();
+    }
+    h.event(button(to, false));
+    h.step();
+    h.step();
+}
+
+#[test]
+fn a_band_is_dragged_to_a_new_place_and_the_order_is_saved() {
+    let d = EngineDir::new("move-band");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 1);
+    add_vasio(&mut c, 2);
+    let mut h = harness(app_for(&d));
+    let (a, b) = ("VASIO A in 1 → VASIO A out 1", "VASIO B in 1 → VASIO A out 1");
+    pump_until(&mut h, "both devices", LONG, |h| h.query_by_role_and_label(Role::Button, b).is_some());
+    settle(&mut h);
+    let y =
+        |h: &egui_kittest::Harness<'static, _>, cell: &str| h.get_by_role_and_label(Role::Button, cell).rect().top();
+    assert!(y(&h, a) < y(&h, b), "VASIO A comes first by default");
+    // Drag VASIO B's input strip above VASIO A's.
+    let from = h.get_by_label("VASIO B inputs").rect().center();
+    let to = h.get_by_label("VASIO A inputs").rect().center_top() - eframe::egui::vec2(0.0, 2.0);
+    drag(&mut h, from, to);
+    settle(&mut h);
+    assert!(y(&h, b) < y(&h, a), "VASIO B moved above VASIO A");
+    let order = &h.state().prefs().layout.matrix_inputs;
+    assert_eq!(order.len(), 2, "the whole order is saved: {order:?}");
+    assert!(order[0].contains('B') || order[0].ends_with(":2"), "{order:?}");
+    // The strip's menu moves the outputs too.
+    let (ao, bo) = ("VASIO A in 1 → VASIO A out 1", "VASIO A in 1 → VASIO B out 1");
+    let x =
+        |h: &egui_kittest::Harness<'static, _>, cell: &str| h.get_by_role_and_label(Role::Button, cell).rect().left();
+    assert!(x(&h, ao) < x(&h, bo));
+    h.get_by_label("VASIO A outputs").click_secondary();
+    pump_until(&mut h, "the strip's menu", LONG, |h| h.query_by_label("Move to end").is_some());
+    h.get_by_label("Move to end").click();
+    settle(&mut h);
+    assert!(x(&h, bo) < x(&h, ao), "VASIO A's outputs went to the end");
+    c.call(Command::Shutdown).unwrap();
+}
+
+/// Double-clicks the node labelled `label`, past egui's double-click window
+/// from any click before.
+fn double_click(h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>, label: &str) {
+    for _ in 0..40 {
+        h.step();
+    }
+    let node = h.get_by_label(label);
+    node.click();
+    node.click();
+}
+
+#[test]
+fn a_device_is_renamed_from_its_matrix_strip() {
+    let d = EngineDir::new("rename-strip");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 1);
+    let mut h = harness_fast(app_for(&d));
+    pump_until(&mut h, "the strip", LONG, |h| h.query_by_label("VASIO A inputs").is_some());
+    double_click(&mut h, "VASIO A inputs");
+    pump_until(&mut h, "the name box", LONG, |h| h.query_by(|n| n.placeholder() == Some("VASIO A")).is_some());
+    h.get_by(|n| n.placeholder() == Some("VASIO A")).type_text("Ableton");
+    h.key_press(eframe::egui::Key::Enter);
+    pump_until(&mut h, "the name in the engine", LONG, |_| {
+        slots(&mut c).iter().any(|s| s.name == "VASIO A" && s.label.as_deref() == Some("Ableton"))
+    });
+    pump_until(&mut h, "the name on the strip", LONG, |h| h.query_by_label("Ableton inputs").is_some());
+    // An empty name puts the device's own back.
+    double_click(&mut h, "Ableton inputs");
+    pump_until(&mut h, "the name box with the name in it", LONG, |h| {
+        h.query_by(|n| n.role() == Role::TextInput && n.value().as_deref() == Some("Ableton")).is_some()
+    });
+    for _ in 0.."Ableton".len() {
+        h.key_press(eframe::egui::Key::Backspace);
+    }
+    h.key_press(eframe::egui::Key::Enter);
+    pump_until(&mut h, "the name cleared", LONG, |_| {
+        slots(&mut c).iter().any(|s| s.name == "VASIO A" && s.label.is_none())
+    });
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_channel_is_renamed_from_the_matrix_margin() {
+    let d = EngineDir::new("rename-margin");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 1);
+    let mut h = harness_fast(app_for(&d));
+    pump_until(&mut h, "the channel's name", LONG, |h| h.query_by_label("VASIO A in 1").is_some());
+    double_click(&mut h, "VASIO A in 1");
+    pump_until(&mut h, "the name box", LONG, |h| h.query_by(|n| n.placeholder() == Some("DAW out 1")).is_some());
+    h.get_by(|n| n.placeholder() == Some("DAW out 1")).type_text("Kick");
+    h.key_press(eframe::egui::Key::Enter);
+    pump_until(&mut h, "the channel name in the engine", LONG, |_| {
+        slots(&mut c)
+            .iter()
+            .any(|s| s.name == "VASIO A" && s.input_labels.first().cloned().flatten().as_deref() == Some("Kick"))
+    });
+    // Esc leaves a name as it was.
+    double_click(&mut h, "VASIO A out 2");
+    pump_until(&mut h, "the output's name box", LONG, |h| {
+        h.query_by(|n| n.placeholder() == Some("DAW in 2")).is_some()
+    });
+    h.get_by(|n| n.placeholder() == Some("DAW in 2")).type_text("Nope");
+    h.key_press(eframe::egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.query_by(|n| n.placeholder() == Some("DAW in 2")).is_none(), "the box closed");
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(slots(&mut c).iter().all(|s| s.output_labels.iter().all(|l| l.is_none())), "nothing sent");
+    c.call(Command::Shutdown).unwrap();
+}
+
+/// The Devices screen's card for `tag` ("VASIO A").
+fn card_of(h: &egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>, tag: &str) -> eframe::egui::Rect {
+    let prefix = format!("{tag} \u{b7} ");
+    h.get_by(|n| n.role() == Role::Button && n.label().is_some_and(|l| l.starts_with(&prefix))).rect()
+}
+
+#[test]
+fn a_card_folds_to_a_strip_and_back() {
+    let d = EngineDir::new("fold-card");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO A's card", LONG, |h| h.query_by_label("Fold VASIO A").is_some());
+    let tall = card_of(&h, "VASIO A").height();
+    h.get_by_label("Fold VASIO A").click();
+    pump_until(&mut h, "the folded strip", LONG, |h| h.query_by_label("Unfold VASIO A").is_some());
+    settle(&mut h);
+    assert!(h.query_by_label("Channels of VASIO A").is_none(), "the meter is folded away");
+    assert!(card_of(&h, "VASIO A").height() < tall / 2.0, "a slim strip");
+    assert!(h.state().prefs().layout.folded_cards.contains("vasio:A"));
+    h.get_by_label("Unfold VASIO A").click();
+    pump_until(&mut h, "the card's meter", LONG, |h| h.query_by_label("Channels of VASIO A").is_some());
+    assert!(h.state().prefs().layout.folded_cards.is_empty());
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_card_moves_to_the_start_of_its_bay() {
+    let d = EngineDir::new("move-card");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 2);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO B's card", LONG, |h| h.query_by_label("Fold VASIO B").is_some());
+    settle(&mut h);
+    assert!(card_of(&h, "VASIO A").left() < card_of(&h, "VASIO B").left());
+    let prefix = "VASIO B \u{b7} ";
+    h.get_by(|n| n.role() == Role::Button && n.label().is_some_and(|l| l.starts_with(prefix))).click_secondary();
+    pump_until(&mut h, "the card's menu", LONG, |h| h.query_by_label("Move to start").is_some());
+    // A real pointer reaches the item before it presses it.
+    let item = h.get_by_label("Move to start").rect();
+    h.event(eframe::egui::Event::PointerMoved(item.center()));
+    h.step();
+    h.get_by_label("Move to start").click();
+    settle(&mut h);
+    assert!(card_of(&h, "VASIO B").left() < card_of(&h, "VASIO A").left(), "VASIO B leads its bay");
+    assert_eq!(
+        h.state().prefs().layout.cards.get("Virtual").and_then(|o| o.first()).map(String::as_str),
+        Some("vasio:B")
+    );
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_card_is_dragged_before_another() {
+    let d = EngineDir::new("drag-card");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 2);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO B's card", LONG, |h| h.query_by_label("Fold VASIO B").is_some());
+    settle(&mut h);
+    let (a, b) = (card_of(&h, "VASIO A"), card_of(&h, "VASIO B"));
+    // Drag VASIO B by its sub-line (clear of its name and controls) onto VASIO A's left half.
+    let from = eframe::egui::pos2(b.center().x, b.top() + 56.0);
+    drag(&mut h, from, eframe::egui::pos2(a.left() + 20.0, a.center().y));
+    settle(&mut h);
+    assert!(card_of(&h, "VASIO B").left() < card_of(&h, "VASIO A").left(), "VASIO B was dropped before VASIO A");
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_rename_box_closes_when_the_matrix_is_left() {
+    let d = EngineDir::new("rename-leave");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 1);
+    let mut h = harness_fast(app_for(&d));
+    pump_until(&mut h, "the strip", LONG, |h| h.query_by_label("VASIO A inputs").is_some());
+    double_click(&mut h, "VASIO A inputs");
+    pump_until(&mut h, "the name box", LONG, |h| h.query_by(|n| n.placeholder() == Some("VASIO A")).is_some());
+    h.get_by_label("Devices").click();
+    settle(&mut h);
+    h.get_by_label("Matrix").click();
+    settle(&mut h);
+    assert!(h.query_by(|n| n.placeholder() == Some("VASIO A")).is_none(), "the box closed with the matrix");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(slots(&mut c).iter().all(|s| s.label.is_none()), "nothing was sent");
+    c.call(Command::Shutdown).unwrap();
+}

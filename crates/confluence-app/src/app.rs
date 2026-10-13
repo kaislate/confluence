@@ -19,7 +19,9 @@ use crate::gear::motion::Motion;
 use crate::gear::paint;
 use crate::gear::skins::{Finish, GearSkin};
 use crate::grid_view;
-use crate::matrix::{key_edit, move_selection, selection_valid, CellKey, GridLayout, Selection};
+use crate::matrix::{
+    key_edit, move_selection, selection_at, selection_cell, selection_valid, CellKey, GridLayout, Selection,
+};
 use crate::notify::Notes;
 use crate::pending::Pending;
 use crate::shell;
@@ -508,6 +510,12 @@ impl ConfluenceApp {
             self.screen_state.picker = None;
             self.screen_state.apps = None;
         }
+        // A name being typed on the matrix is dropped once the grid is not
+        // drawn: its box would come back without focus, on a slot id that an
+        // engine restart may have given to another device.
+        if self.screen != Screen::Matrix || !self.live() || view.state.is_none() {
+            self.grid_state.renaming = None;
+        }
         if self.screen == Screen::Settings {
             // Settings work whether or not the engine is there.
             self.settings_screen(ui);
@@ -568,7 +576,7 @@ impl ConfluenceApp {
         }
         if zero {
             if let Some(state) = &self.view.state {
-                let l = GridLayout::new(&state.slots, self.cell);
+                let l = GridLayout::arranged(&state.slots, &state.positions, self.cell, &self.prefs.layout);
                 self.cell =
                     fit_cell(self.matrix_area, (l.rows.len, l.rows.bands.len()), (l.cols.len, l.cols.bands.len()));
             }
@@ -928,6 +936,10 @@ impl ConfluenceApp {
             match a {
                 crate::inspector::Action::Edit(e) => self.send(e),
                 crate::inspector::Action::RemoveSlot(id) => self.confirm_remove = Some(id),
+                crate::inspector::Action::Unfold { input, key } => {
+                    let l = &mut self.prefs.layout;
+                    if input { &mut l.folded_inputs } else { &mut l.folded_outputs }.remove(&key);
+                }
                 crate::inspector::Action::PickPlugin(bus) => {
                     self.picker = Some(crate::plugins::Picker { bus, filter: String::new() })
                 }
@@ -1031,7 +1043,19 @@ impl ConfluenceApp {
                 );
                 return;
             }
-            let mut layout = GridLayout::new(&state.slots, self.cell);
+            let mut layout = GridLayout::arranged(&state.slots, &state.positions, self.cell, &self.prefs.layout);
+            // A selected route whose band was folded becomes the folded cell's
+            // block, and a block whose bands were unfolded becomes what its line now holds.
+            if let Some((r, c)) = selection_cell(&layout, &self.selection) {
+                let stale = match self.selection {
+                    Selection::Cell { .. } => layout.folded(r, c),
+                    Selection::Block { .. } => selection_at(&layout, r, c) != Some(self.selection),
+                    _ => false,
+                };
+                if let Some(s) = selection_at(&layout, r, c).filter(|_| stale) {
+                    self.selection = s;
+                }
+            }
             // A band's default colour is its position's, as on the cards.
             let by_slot: HashMap<u32, u32> = state
                 .positions
@@ -1047,10 +1071,6 @@ impl ConfluenceApp {
                 state.points.iter().map(|p| ((p.input, p.output), p)).collect();
             let pending = &self.pending;
             let lookup = |p: (u32, u32)| (pending.effective(p, by_point.get(&p).copied()), pending.is_pending(p));
-            let selected = match self.selection {
-                Selection::Cell { input, output } => Some((input, output)),
-                _ => None,
-            };
             // Routes that appeared since last frame pop in.
             let routed: HashSet<(u32, u32)> = state.points.iter().map(|p| (p.input, p.output)).collect();
             let fresh: HashSet<(u32, u32)> = routed.difference(&self.routes_seen).copied().collect();
@@ -1070,7 +1090,7 @@ impl ConfluenceApp {
                 &mut self.motion,
                 &mut self.grid_state,
                 &lookup,
-                selected,
+                &self.selection,
                 &fresh,
                 &self.routes_seen,
                 editable,
@@ -1084,6 +1104,30 @@ impl ConfluenceApp {
             for e in actions.edits {
                 self.send(e);
             }
+            let l = &mut self.prefs.layout;
+            for (input, key) in actions.fold {
+                crate::arrange::toggle(if input { &mut l.folded_inputs } else { &mut l.folded_outputs }, &key);
+            }
+            for (input, key, to) in actions.moves {
+                let axis = if input { &layout.rows } else { &layout.cols };
+                let order: Vec<String> = axis.bands.iter().map(|b| b.key.clone()).collect();
+                let mut new = crate::arrange::moved(&order, &key, to);
+                // Devices that are away keep their saved place for when they come back.
+                let saved = if input { &mut l.matrix_inputs } else { &mut l.matrix_outputs };
+                new.extend(saved.iter().filter(|k| !order.contains(k)).cloned());
+                *saved = new;
+            }
+            if let Some((input, fold)) = actions.fold_all {
+                let axis = if input { &layout.rows } else { &layout.cols };
+                let set = if input { &mut l.folded_inputs } else { &mut l.folded_outputs };
+                for b in &axis.bands {
+                    if fold {
+                        set.insert(b.key.clone());
+                    } else {
+                        set.remove(&b.key);
+                    }
+                }
+            }
         });
     }
 
@@ -1095,10 +1139,13 @@ impl ConfluenceApp {
             self.selection = Selection::None;
             return;
         }
-        let (Selection::Cell { input, output }, Some(state), true) = (self.selection, &view.state, self.live()) else {
+        let (Some(state), true) = (&view.state, self.live()) else {
             return;
         };
-        let layout = GridLayout::new(&state.slots, self.cell);
+        let layout = GridLayout::arranged(&state.slots, &state.positions, self.cell, &self.prefs.layout);
+        let Some(at) = selection_cell(&layout, &self.selection) else {
+            return;
+        };
         let (fine, keys, moves) = ui.input(|i| {
             let pressed: Vec<Key> = CELL_KEYS.iter().map(|(k, _)| *k).filter(|k| i.key_pressed(*k)).collect();
             let (keys, fine) = cell_keys(&pressed, i.modifiers);
@@ -1114,17 +1161,18 @@ impl ConfluenceApp {
             .collect();
             (fine, keys, moves)
         });
-        for key in keys {
-            let cur = self.point(input, output);
-            if let Some(e) = key_edit((input, output), cur.as_ref(), key, fine) {
-                self.send(e);
+        // Keys act on a route; a folded cell's block has none to act on.
+        if let Selection::Cell { input, output } = self.selection {
+            for key in keys {
+                let cur = self.point(input, output);
+                if let Some(e) = key_edit((input, output), cur.as_ref(), key, fine) {
+                    self.send(e);
+                }
             }
         }
-        if let (Some(at), Some(&(dr, dc))) = (layout.cell_of(input, output), moves.last()) {
-            if let Some((r, c)) = move_selection(&layout, at, dr, dc) {
-                if let Some((i, o)) = layout.point(r, c) {
-                    self.selection = Selection::Cell { input: i, output: o };
-                }
+        if let Some(&(dr, dc)) = moves.last() {
+            if let Some(s) = move_selection(&layout, at, dr, dc).and_then(|(r, c)| selection_at(&layout, r, c)) {
+                self.selection = s;
             }
         }
     }

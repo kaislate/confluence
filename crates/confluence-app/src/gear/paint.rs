@@ -618,6 +618,30 @@ fn pill_full(ui: &mut Ui, label: &str, accessible: &str, s: &GearSkin, lit: bool
     resp
 }
 
+/// A small square button with a chevron: pointing down while `open` (it
+/// folds), along the row when folded (it unfolds).
+pub fn chevron_button(ui: &mut Ui, r: Rect, open: bool, accessible: &str, s: &GearSkin) -> Response {
+    let resp = ui.interact(r, ui.id().with(("chevron", accessible)), Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, accessible));
+    if !ui.is_rect_visible(r) {
+        return resp;
+    }
+    let p = ui.painter();
+    pill_body(p, r, s, 0.0, false);
+    let c = r.center();
+    let k = 3.5;
+    let pts = if open {
+        [c + Vec2::new(-k, -k * 0.5), c + Vec2::new(0.0, k * 0.5), c + Vec2::new(k, -k * 0.5)]
+    } else {
+        [c + Vec2::new(-k * 0.5, -k), c + Vec2::new(k * 0.5, 0.0), c + Vec2::new(-k * 0.5, k)]
+    };
+    let ink = alpha(s.ink, if resp.hovered() { 1.0 } else { 0.82 });
+    p.line_segment([pts[0], pts[1]], Stroke::new(1.6, ink));
+    p.line_segment([pts[1], pts[2]], Stroke::new(1.6, ink));
+    resp
+}
+
 /// A small round colour swatch button.
 pub fn swatch(ui: &mut Ui, color: Color32, accessible: &str, s: &GearSkin) -> Response {
     let (r, resp) = ui.allocate_exact_size(Vec2::splat(PILL_H), Sense::click());
