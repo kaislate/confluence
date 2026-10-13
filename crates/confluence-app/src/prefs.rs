@@ -2,7 +2,7 @@
 //! View preferences kept by the app (eframe storage, one JSON entry), not
 //! engine state.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,8 @@ pub struct ViewPrefs {
     pub advanced: bool,
     /// One-word bay titles ("HARDWARE") instead of descriptive ones.
     pub short_bay_titles: bool,
+    /// How the devices are arranged on the matrix and the Devices screen.
+    pub layout: LayoutPrefs,
 }
 
 impl Default for ViewPrefs {
@@ -34,6 +36,7 @@ impl Default for ViewPrefs {
             bridge: BridgePrefs::default(),
             advanced: false,
             short_bay_titles: false,
+            layout: LayoutPrefs::default(),
         }
     }
 }
@@ -70,6 +73,22 @@ impl Default for BridgePrefs {
             window: None,
         }
     }
+}
+
+/// The order and folding of devices, each screen its own. Matrix bands are
+/// keyed by `matrix::band_keys` (`pos:asio:1`), cards by position (`asio:1`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayoutPrefs {
+    /// Input bands, top to bottom.
+    pub matrix_inputs: Vec<String>,
+    /// Output bands, left to right.
+    pub matrix_outputs: Vec<String>,
+    pub folded_inputs: BTreeSet<String>,
+    pub folded_outputs: BTreeSet<String>,
+    /// Each bay's cards (by bay title), in order.
+    pub cards: BTreeMap<String, Vec<String>>,
+    pub folded_cards: BTreeSet<String>,
 }
 
 impl ViewPrefs {
@@ -117,5 +136,17 @@ mod tests {
         let partial = ViewPrefs::from_storage(Some(r#"{"only_custom_names":true}"#));
         assert!(partial.only_custom_names);
         assert!(partial.bridge.shown);
+    }
+
+    #[test]
+    fn the_layout_round_trips_and_older_saves_have_none() {
+        let mut p = ViewPrefs::default();
+        p.layout.matrix_inputs = vec!["pos:vasio:B".into(), "pos:vasio:A".into()];
+        p.layout.folded_outputs.insert("pos:asio:1".into());
+        p.layout.cards.insert("Windows".into(), vec!["win-out:2".into(), "win-out:1".into()]);
+        p.layout.folded_cards.insert("win-out:3".into());
+        assert_eq!(ViewPrefs::from_storage(Some(&p.to_storage())), p);
+        let old = ViewPrefs::from_storage(Some(r#"{"only_custom_names":true}"#));
+        assert_eq!(old.layout, LayoutPrefs::default(), "older saves arrange nothing");
     }
 }
