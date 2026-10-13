@@ -38,6 +38,10 @@ pub struct GridActions {
     pub zoom: Option<f32>,
     /// Bands to fold or unfold: (inputs?, layout key).
     pub fold: Vec<(bool, String)>,
+    /// Bands to move: (inputs?, layout key, insertion point among the bands).
+    pub moves: Vec<(bool, String, usize)>,
+    /// Fold (true) or unfold every band of one side: (inputs?, fold?).
+    pub fold_all: Option<(bool, bool)>,
 }
 
 /// What the grid remembers between frames.
@@ -55,6 +59,10 @@ pub struct GridState {
     pub routes_version: u64,
     /// The minimap's route dots, kept between frames.
     pub mini_dots: crate::minimap::DotCache,
+    /// The band whose strip is being dragged: (inputs?, layout key).
+    pub strip_drag: Option<(bool, String)>,
+    /// Where it would land if let go now (an insertion point among the bands).
+    pub strip_drop: Option<usize>,
 }
 
 /// Pixels of touchpad (point-unit) scrolling per gain step.
@@ -379,14 +387,7 @@ pub fn show(
                 );
                 let hit = strip.intersect(top);
                 if hit.is_positive() {
-                    let resp = ui.interact(hit, Id::new(("band-out", band.slot)), Sense::click());
-                    resp.widget_info(|| {
-                        WidgetInfo::labeled(WidgetType::Button, true, format!("{} outputs", band.name))
-                    });
-                    if resp.clicked() {
-                        actions.select = Some(Selection::Slot(band.slot));
-                    }
-                    resp.on_hover_text(format!("{name}: {} outputs", band.channels));
+                    strip_interact(ui, hit, band, false, &name, gs, &mut actions);
                 }
                 let chev = Rect::from_min_size(
                     Pos2::new(strip.left() + 2.0, strip.bottom() - SEP + 2.0),
@@ -448,12 +449,7 @@ pub fn show(
                 );
                 let hit = strip.intersect(left);
                 if hit.is_positive() {
-                    let resp = ui.interact(hit, Id::new(("band-in", band.slot)), Sense::click());
-                    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{} inputs", band.name)));
-                    if resp.clicked() {
-                        actions.select = Some(Selection::Slot(band.slot));
-                    }
-                    resp.on_hover_text(format!("{name}: {} inputs", band.channels));
+                    strip_interact(ui, hit, band, true, &name, gs, &mut actions);
                 }
                 let chev = Rect::from_min_size(strip.min + Vec2::splat(2.0), Vec2::splat(SEP - 4.0));
                 if fold_chevron(ui, &painter, chev.intersect(left), band, "inputs", skins::ink_on(colour)) {
@@ -481,6 +477,34 @@ pub fn show(
                         HEADER_W - 16.0,
                     );
                 }
+            }
+        }
+        // A drag let go away from its strip (scrolled off) lands nowhere.
+        if gs.strip_drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            gs.strip_drag = None;
+            gs.strip_drop = None;
+        }
+        // A strip being dragged: an accent line where its band would land.
+        if let Some((input, _)) = gs.strip_drag.clone() {
+            if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+                let axis = if input { &layout.rows } else { &layout.cols };
+                let o = if input { origin.y } else { origin.x };
+                let mids: Vec<f32> = axis
+                    .bands
+                    .iter()
+                    .enumerate()
+                    .map(|(bi, b)| o + axis.strip_pos(bi) + (SEP + b.lines() as f32 * cell) / 2.0)
+                    .collect();
+                let slot = crate::arrange::drop_slot(&mids, if input { p.y } else { p.x });
+                gs.strip_drop = Some(slot);
+                let at = o + axis.strip_pos(slot) - 1.0;
+                let line = if input {
+                    [Pos2::new(vp.min.x, at), Pos2::new(vp.max.x, at)]
+                } else {
+                    [Pos2::new(at, vp.min.y), Pos2::new(at, vp.max.y)]
+                };
+                ui.painter_at(vp).line_segment(line, Stroke::new(3.0, skin.accent));
+                ui.ctx().request_repaint();
             }
         }
         // The corner: a minimap of the whole matrix that moves the view.
@@ -696,6 +720,62 @@ fn folded_cell(
     } else if resp.clicked() {
         actions.select = Some(Selection::Block { inputs: key.0, outputs: key.1 });
     }
+}
+
+/// A band's strip: a click selects its slot, a drag moves the band, and its
+/// menu folds, moves and renames.
+fn strip_interact(
+    ui: &mut egui::Ui,
+    hit: Rect,
+    band: &Band,
+    input: bool,
+    name: &str,
+    gs: &mut GridState,
+    actions: &mut GridActions,
+) {
+    let side = if input { "inputs" } else { "outputs" };
+    let id = Id::new((if input { "band-in" } else { "band-out" }, band.slot));
+    let resp = ui.interact(hit, id, Sense::click_and_drag());
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{} {side}", band.name)));
+    if resp.clicked() {
+        actions.select = Some(Selection::Slot(band.slot));
+    }
+    if resp.drag_started() {
+        gs.strip_drag = Some((input, band.key.clone()));
+        gs.strip_drop = None;
+    }
+    if resp.drag_stopped() {
+        if let (Some((i, key)), Some(to)) = (gs.strip_drag.take(), gs.strip_drop.take()) {
+            if i == input && key == band.key {
+                actions.moves.push((input, key, to));
+            }
+        }
+    }
+    let (first, last) = if input { ("Move to top", "Move to bottom") } else { ("Move to start", "Move to end") };
+    let resp = resp.on_hover_text(format!("{name}: {} {side}", band.channels));
+    resp.context_menu(|ui| {
+        if ui.button(if band.folded { "Unfold" } else { "Fold" }).clicked() {
+            actions.fold.push((input, band.key.clone()));
+            ui.close();
+        }
+        if ui.button(first).clicked() {
+            actions.moves.push((input, band.key.clone(), 0));
+            ui.close();
+        }
+        if ui.button(last).clicked() {
+            actions.moves.push((input, band.key.clone(), usize::MAX));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button(format!("Fold all {side}")).clicked() {
+            actions.fold_all = Some((input, true));
+            ui.close();
+        }
+        if ui.button(format!("Unfold all {side}")).clicked() {
+            actions.fold_all = Some((input, false));
+            ui.close();
+        }
+    });
 }
 
 /// The fold chevron on a band's strip (pointing down while open, along the

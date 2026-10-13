@@ -1254,3 +1254,64 @@ fn a_folded_cell_selects_its_block_and_routes_nothing_and_a_double_click_unfolds
     assert!(engine_points(&mut c).is_empty(), "unfolding routes nothing");
     c.call(Command::Shutdown).unwrap();
 }
+
+/// Presses at `from`, moves to `to` in steps and lets go.
+fn drag(
+    h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>,
+    from: eframe::egui::Pos2,
+    to: eframe::egui::Pos2,
+) {
+    use eframe::egui::{Event, PointerButton};
+    let button = |pos, pressed| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    h.event(Event::PointerMoved(from));
+    h.event(button(from, true));
+    h.step();
+    for k in 1..=8 {
+        h.event(Event::PointerMoved(from + (to - from) * (k as f32 / 8.0)));
+        h.step();
+    }
+    h.event(button(to, false));
+    h.step();
+    h.step();
+}
+
+#[test]
+fn a_band_is_dragged_to_a_new_place_and_the_order_is_saved() {
+    let d = EngineDir::new("move-band");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 1);
+    add_vasio(&mut c, 2);
+    let mut h = harness(app_for(&d));
+    let (a, b) = ("VASIO A in 1 → VASIO A out 1", "VASIO B in 1 → VASIO A out 1");
+    pump_until(&mut h, "both devices", LONG, |h| h.query_by_role_and_label(Role::Button, b).is_some());
+    settle(&mut h);
+    let y =
+        |h: &egui_kittest::Harness<'static, _>, cell: &str| h.get_by_role_and_label(Role::Button, cell).rect().top();
+    assert!(y(&h, a) < y(&h, b), "VASIO A comes first by default");
+    // Drag VASIO B's input strip above VASIO A's.
+    let from = h.get_by_label("VASIO B inputs").rect().center();
+    let to = h.get_by_label("VASIO A inputs").rect().center_top() - eframe::egui::vec2(0.0, 2.0);
+    drag(&mut h, from, to);
+    settle(&mut h);
+    assert!(y(&h, b) < y(&h, a), "VASIO B moved above VASIO A");
+    let order = &h.state().prefs().layout.matrix_inputs;
+    assert_eq!(order.len(), 2, "the whole order is saved: {order:?}");
+    assert!(order[0].contains('B') || order[0].ends_with(":2"), "{order:?}");
+    // The strip's menu moves the outputs too.
+    let (ao, bo) = ("VASIO A in 1 → VASIO A out 1", "VASIO A in 1 → VASIO B out 1");
+    let x =
+        |h: &egui_kittest::Harness<'static, _>, cell: &str| h.get_by_role_and_label(Role::Button, cell).rect().left();
+    assert!(x(&h, ao) < x(&h, bo));
+    h.get_by_label("VASIO A outputs").click_secondary();
+    pump_until(&mut h, "the strip's menu", LONG, |h| h.query_by_label("Move to end").is_some());
+    h.get_by_label("Move to end").click();
+    settle(&mut h);
+    assert!(x(&h, bo) < x(&h, ao), "VASIO A's outputs went to the end");
+    c.call(Command::Shutdown).unwrap();
+}

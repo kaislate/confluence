@@ -1094,9 +1094,29 @@ impl ConfluenceApp {
             for e in actions.edits {
                 self.send(e);
             }
+            let l = &mut self.prefs.layout;
             for (input, key) in actions.fold {
-                let l = &mut self.prefs.layout;
                 crate::arrange::toggle(if input { &mut l.folded_inputs } else { &mut l.folded_outputs }, &key);
+            }
+            for (input, key, to) in actions.moves {
+                let axis = if input { &layout.rows } else { &layout.cols };
+                let order: Vec<String> = axis.bands.iter().map(|b| b.key.clone()).collect();
+                let mut new = crate::arrange::moved(&order, &key, to);
+                // Devices that are away keep their saved place for when they come back.
+                let saved = if input { &mut l.matrix_inputs } else { &mut l.matrix_outputs };
+                new.extend(saved.iter().filter(|k| !order.contains(k)).cloned());
+                *saved = new;
+            }
+            if let Some((input, fold)) = actions.fold_all {
+                let axis = if input { &layout.rows } else { &layout.cols };
+                let set = if input { &mut l.folded_inputs } else { &mut l.folded_outputs };
+                for b in &axis.bands {
+                    if fold {
+                        set.insert(b.key.clone());
+                    } else {
+                        set.remove(&b.key);
+                    }
+                }
             }
         });
     }
