@@ -1388,3 +1388,79 @@ fn a_channel_is_renamed_from_the_matrix_margin() {
     assert!(slots(&mut c).iter().all(|s| s.output_labels.iter().all(|l| l.is_none())), "nothing sent");
     c.call(Command::Shutdown).unwrap();
 }
+
+/// The Devices screen's card for `tag` ("VASIO A").
+fn card_of(h: &egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>, tag: &str) -> eframe::egui::Rect {
+    let prefix = format!("{tag} \u{b7} ");
+    h.get_by(|n| n.role() == Role::Button && n.label().is_some_and(|l| l.starts_with(&prefix))).rect()
+}
+
+#[test]
+fn a_card_folds_to_a_strip_and_back() {
+    let d = EngineDir::new("fold-card");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO A's card", LONG, |h| h.query_by_label("Fold VASIO A").is_some());
+    let tall = card_of(&h, "VASIO A").height();
+    h.get_by_label("Fold VASIO A").click();
+    pump_until(&mut h, "the folded strip", LONG, |h| h.query_by_label("Unfold VASIO A").is_some());
+    settle(&mut h);
+    assert!(h.query_by_label("Channels of VASIO A").is_none(), "the meter is folded away");
+    assert!(card_of(&h, "VASIO A").height() < tall / 2.0, "a slim strip");
+    assert!(h.state().prefs().layout.folded_cards.contains("vasio:A"));
+    h.get_by_label("Unfold VASIO A").click();
+    pump_until(&mut h, "the card's meter", LONG, |h| h.query_by_label("Channels of VASIO A").is_some());
+    assert!(h.state().prefs().layout.folded_cards.is_empty());
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_card_moves_to_the_start_of_its_bay() {
+    let d = EngineDir::new("move-card");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 2);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO B's card", LONG, |h| h.query_by_label("Fold VASIO B").is_some());
+    settle(&mut h);
+    assert!(card_of(&h, "VASIO A").left() < card_of(&h, "VASIO B").left());
+    let prefix = "VASIO B \u{b7} ";
+    h.get_by(|n| n.role() == Role::Button && n.label().is_some_and(|l| l.starts_with(prefix))).click_secondary();
+    pump_until(&mut h, "the card's menu", LONG, |h| h.query_by_label("Move to start").is_some());
+    // A real pointer reaches the item before it presses it.
+    let item = h.get_by_label("Move to start").rect();
+    h.event(eframe::egui::Event::PointerMoved(item.center()));
+    h.step();
+    h.get_by_label("Move to start").click();
+    settle(&mut h);
+    assert!(card_of(&h, "VASIO B").left() < card_of(&h, "VASIO A").left(), "VASIO B leads its bay");
+    assert_eq!(
+        h.state().prefs().layout.cards.get("Virtual").and_then(|o| o.first()).map(String::as_str),
+        Some("vasio:B")
+    );
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_card_is_dragged_before_another() {
+    let d = EngineDir::new("drag-card");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 2);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO B's card", LONG, |h| h.query_by_label("Fold VASIO B").is_some());
+    settle(&mut h);
+    let (a, b) = (card_of(&h, "VASIO A"), card_of(&h, "VASIO B"));
+    // Drag VASIO B by its sub-line (clear of its name and controls) onto VASIO A's left half.
+    let from = eframe::egui::pos2(b.center().x, b.top() + 56.0);
+    drag(&mut h, from, eframe::egui::pos2(a.left() + 20.0, a.center().y));
+    settle(&mut h);
+    assert!(card_of(&h, "VASIO B").left() < card_of(&h, "VASIO A").left(), "VASIO B was dropped before VASIO A");
+    c.call(Command::Shutdown).unwrap();
+}
