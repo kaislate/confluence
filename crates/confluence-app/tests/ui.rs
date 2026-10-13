@@ -1536,3 +1536,46 @@ fn a_network_tray_is_switched_off_and_on_and_keeps_its_route() {
     assert!(engine_points(&mut c).contains(&(i, o)), "its route is back with it");
     c.call(Command::Shutdown).unwrap();
 }
+
+#[test]
+fn a_trays_led_is_its_power_switch_and_clips_clear_from_its_menu() {
+    let d = EngineDir::new("led-switch");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO C's LED", LONG, |h| h.query_by_label("Turn on VASIO C").is_some());
+    h.get_by_label("Turn on VASIO C").scroll_to_me();
+    settle(&mut h);
+    let led = h.get_by_label("Turn on VASIO C").rect();
+    assert!(led.width() <= 16.0 && led.height() <= 16.0, "the switch is the LED, not a pill: {led:?}");
+    let tray = card_of(&h, "VASIO C");
+    assert!(led.left() < tray.left() + 24.0 && led.top() < tray.top() + 24.0, "top left of its tray");
+    h.get_by_label("Turn on VASIO C").click();
+    pump_until(&mut h, "VASIO C on", LONG, |_| slots(&mut c).iter().any(|s| s.name == "VASIO C"));
+    pump_until(&mut h, "its LED turns it off", LONG, |h| h.query_by_label("Turn off VASIO C").is_some());
+    menu_item(&mut h, "VASIO A", "Clear clips");
+    settle(&mut h);
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn sections_are_shown_and_hidden_from_settings() {
+    let d = EngineDir::new("hide-sections");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Settings").click();
+    pump_until(&mut h, "the Devices switches", LONG, |h| h.query_by_label("Show Apps").is_some());
+    h.get_by_label("Show Apps").scroll_to_me();
+    settle(&mut h);
+    h.get_by_label("Show Apps").click();
+    settle(&mut h);
+    assert!(h.state().prefs().layout.hidden_sections.contains("Apps"));
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "the sections", LONG, |h| h.query_by_label("Windows section: full").is_some());
+    assert!(h.query_by_label("Apps section: full").is_none(), "Apps is hidden");
+    assert!(h.query_by_label_contains("APP 1 \u{b7} ").is_none());
+    client(&d).call(Command::Shutdown).unwrap();
+}

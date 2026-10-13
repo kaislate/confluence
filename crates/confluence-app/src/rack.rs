@@ -71,30 +71,26 @@ pub fn place(spans: &[usize], breaks: &[bool], cols: usize) -> (Vec<(usize, usiz
     (at, rows)
 }
 
-/// The order with `dragged` moved to wherever its slot lands nearest
-/// `pointer`; `rects_for` lays a candidate order out (one rect per key, in
-/// that order).
-pub fn candidate(
-    order: &[String],
-    dragged: &str,
-    pointer: Pos2,
-    rects_for: impl Fn(&[String]) -> Vec<Rect>,
-) -> Vec<String> {
+/// The order with `dragged` moved to where the pointer `at` is over the
+/// trays as shown (`rects`, one per key of `order`): before the tray under
+/// (or nearest) it when left of that tray's centre, else after it. Over its
+/// own slot nothing moves, so a wide neighbour cannot make it flicker.
+pub fn drop_order(order: &[String], dragged: &str, rects: &[Rect], at: Pos2) -> Vec<String> {
     let Some(from) = order.iter().position(|k| k == dragged) else { return order.to_vec() };
-    let mut others = order.to_vec();
-    let key = others.remove(from);
-    let mut best = (f32::INFINITY, order.to_vec());
-    for to in 0..=others.len() {
-        let mut o = others.clone();
-        o.insert(to, key.clone());
-        let Some(r) = rects_for(&o).get(to).copied() else { continue };
-        let d = r.center().distance_sq(pointer);
-        // Ties keep the earlier place, so a tray over its own slot stays put.
-        if d < best.0 || (d == best.0 && o == order) {
-            best = (d, o);
+    if rects.get(from).is_some_and(|r| r.contains(at)) {
+        return order.to_vec();
+    }
+    let mut others: Vec<String> = Vec::with_capacity(order.len());
+    let mut shown: Vec<Rect> = Vec::with_capacity(order.len());
+    for (i, k) in order.iter().enumerate() {
+        if i != from {
+            others.push(k.clone());
+            shown.push(rects.get(i).copied().unwrap_or(Rect::NOTHING));
         }
     }
-    best.1
+    let to = crate::arrange::drop_index(&shown, at).min(others.len());
+    others.insert(to, order[from].clone());
+    others
 }
 
 /// How big a section's trays are drawn.
@@ -137,7 +133,7 @@ impl SectionSize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui::{pos2, vec2};
+    use eframe::egui::pos2;
 
     #[test]
     fn a_bed_holds_as_many_columns_as_fit_and_at_least_one() {
@@ -185,17 +181,22 @@ mod tests {
     }
 
     #[test]
-    fn a_dragged_tray_goes_where_its_slot_lands_nearest_the_pointer() {
-        let order: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
-        // One row of 100-wide slots, 10 apart.
-        let lay = |o: &[String]| -> Vec<Rect> {
-            (0..o.len()).map(|i| Rect::from_min_size(pos2(i as f32 * 110.0, 0.0), vec2(100.0, 50.0))).collect()
-        };
+    fn a_dragged_tray_drops_beside_the_tray_under_the_pointer_wide_or_not() {
+        let order: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        // a: 0..100, b (two columns): 110..320, c: 330..430.
+        let rects = [
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 50.0)),
+            Rect::from_min_max(pos2(110.0, 0.0), pos2(320.0, 50.0)),
+            Rect::from_min_max(pos2(330.0, 0.0), pos2(430.0, 50.0)),
+        ];
         let keys = |v: Vec<String>| v.join("");
-        assert_eq!(keys(candidate(&order, "d", pos2(40.0, 20.0), lay)), "dabc", "over the first slot");
-        assert_eq!(keys(candidate(&order, "a", pos2(370.0, 20.0), lay)), "bcda", "over the last");
-        assert_eq!(keys(candidate(&order, "b", pos2(120.0, 20.0), lay)), "abcd", "over its own slot: unchanged");
-        assert_eq!(keys(candidate(&order, "x", pos2(0.0, 0.0), lay)), "abcd", "an unknown tray changes nothing");
+        assert_eq!(keys(drop_order(&order, "a", &rects, pos2(40.0, 20.0))), "abc", "over its own slot");
+        assert_eq!(keys(drop_order(&order, "a", &rects, pos2(150.0, 20.0))), "abc", "left half of the wide tray");
+        assert_eq!(keys(drop_order(&order, "a", &rects, pos2(280.0, 20.0))), "bac", "right half of the wide tray");
+        assert_eq!(keys(drop_order(&order, "a", &rects, pos2(420.0, 20.0))), "bca", "past the last");
+        assert_eq!(keys(drop_order(&order, "c", &rects, pos2(30.0, 20.0))), "cab", "left half of the first");
+        assert_eq!(keys(drop_order(&order, "c", &rects, pos2(200.0, 20.0))), "acb", "left half of the wide tray");
+        assert_eq!(keys(drop_order(&order, "x", &rects, pos2(0.0, 0.0))), "abc", "an unknown tray");
     }
 
     #[test]
