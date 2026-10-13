@@ -594,9 +594,11 @@ mod tests {
     #[test]
     fn bands_follow_the_saved_order_and_new_ones_go_last() {
         let (slots, ps) = three();
-        let mut lp = crate::prefs::LayoutPrefs::default();
-        lp.matrix_inputs = vec!["pos:vasio:C".into(), "gone".into(), "pos:vasio:A".into()];
-        lp.matrix_outputs = vec!["pos:vasio:B".into()];
+        let lp = crate::prefs::LayoutPrefs {
+            matrix_inputs: vec!["pos:vasio:C".into(), "gone".into(), "pos:vasio:A".into()],
+            matrix_outputs: vec!["pos:vasio:B".into()],
+            ..Default::default()
+        };
         let l = GridLayout::arranged(&slots, &ps, CELL_DEFAULT, &lp);
         let rows: Vec<(u32, usize)> = l.rows.bands.iter().map(|b| (b.slot, b.start)).collect();
         assert_eq!(rows, vec![(3, 0), (1, 2), (2, 4)], "saved first, then the rest in position order");
