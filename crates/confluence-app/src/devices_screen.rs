@@ -11,25 +11,12 @@ use confluence_api::{
 };
 use eframe::egui::{self, Align, Align2, Color32, Id, Key, Pos2, Rect, Sense, TextEdit, Vec2, WidgetInfo, WidgetType};
 
-use crate::bays::{Bay, BayView};
 use crate::commands::Edit;
-use crate::gear::motion::{Curve, Motion, ENTER, PHOSPHOR_TAU, POP, SETTLE};
-use crate::gear::oled_meter::{Chan, Geom, Group};
+use crate::gear::motion::{Curve, Motion, ENTER};
+use crate::gear::oled_meter::{Chan, Group};
 use crate::gear::paint;
 use crate::gear::skins::{self, GearSkin, AMBER, GREEN, RED};
 use crate::prefs::ViewPrefs;
-
-/// A change to how a bay's cards are arranged, made while drawing and saved after.
-#[derive(Clone, Debug, PartialEq)]
-pub enum CardChange {
-    /// Fold or unfold the card at this position.
-    Fold(String),
-    /// Move a card to an insertion point among its bay's devices.
-    Move { bay: Bay, pos: String, to: usize },
-}
-
-/// A folded card's height: one slim row.
-pub const FOLDED_H: f32 = 46.0;
 
 /// What the screen asks the app to do.
 #[derive(Clone, Debug, PartialEq)]
@@ -66,8 +53,6 @@ pub struct ScreenState {
     pub filling: HashSet<PosId>,
     /// Positions that just appeared (their card pops in).
     pub just_filled: HashSet<PosId>,
-    /// Bays showing every position, not only the next free ones.
-    pub expanded: HashSet<Bay>,
     pub confirm: Option<Confirm>,
     /// The device being renamed on its card, and the text so far.
     pub renaming: Option<(PosId, String)>,
@@ -88,11 +73,6 @@ pub struct ScreenState {
     pub channel_drafts: HashMap<(bool, u32), (String, bool)>,
     /// Each card's LED colour and when it last changed (for the bloom).
     pub led_seen: HashMap<PosId, (Option<Color32>, f64)>,
-    /// The card being dragged, and where it would land among its bay's devices.
-    pub card_drag: Option<PosId>,
-    pub card_drop: Option<usize>,
-    /// Arrangement changes from this frame, saved once the bays are drawn.
-    pub changes: Vec<CardChange>,
     pub adding_bus: bool,
     pub bus_name: String,
     pub bus_channels: u32,
@@ -113,7 +93,6 @@ impl Default for ScreenState {
             search: String::new(),
             filling: HashSet::new(),
             just_filled: HashSet::new(),
-            expanded: HashSet::new(),
             confirm: None,
             renaming: None,
             name_click: None,
@@ -124,9 +103,6 @@ impl Default for ScreenState {
             pid_entry_open: false,
             channel_drafts: HashMap::new(),
             led_seen: HashMap::new(),
-            card_drag: None,
-            card_drop: None,
-            changes: Vec::new(),
             adding_bus: false,
             bus_name: String::new(),
             bus_channels: 2,
@@ -140,7 +116,7 @@ impl Default for ScreenState {
 }
 
 impl ScreenState {
-    fn open_picker(&mut self, pos: PosId, swap: bool, anchor: Rect) {
+    pub(crate) fn open_picker(&mut self, pos: PosId, swap: bool, anchor: Rect) {
         self.picker = Some(pos);
         self.swap = swap;
         self.picker_anchor = anchor;
@@ -167,7 +143,7 @@ fn kinds(g: PosGroup) -> &'static [DeviceKind] {
 }
 
 /// VASIO shapes per direction (as the engine offers them).
-const SHAPES: [u32; 5] = [2, 4, 8, 16, 32];
+pub(crate) const SHAPES: [u32; 5] = [2, 4, 8, 16, 32];
 
 /// A device name split for the card: the name, and the vendor noise or
 /// the kind as a sub-line. "Game (4- TC-HELICON GoXLR)" is "Game" over
@@ -344,90 +320,8 @@ pub fn device_color(p: &PositionState, palette: &[Color32]) -> Color32 {
     skins::palette_color(palette, position_palette(p.pos))
 }
 
-/// Card size, gaps and the bays' chrome.
-pub const CARD_W: f32 = 220.0;
-pub const CARD_H: f32 = 150.0;
-pub const GAP: f32 = 12.0;
-/// Between bays.
-pub const BAY_GAP: f32 = 14.0;
-/// The OLED well's inset from the card's sides, and the meter's from the well's.
-const WELL_INSET: f32 = 8.0;
-const METER_INSET: f32 = 5.0;
-/// The width a single card's meter has.
-pub const CARD_METER_W: f32 = CARD_W - 2.0 * (WELL_INSET + METER_INSET);
-/// A bay's padding and its header strip.
-pub const BAY_PAD: f32 = 12.0;
-pub const BAY_HEADER: f32 = 30.0;
 /// Content is centred and capped at this width on very wide windows.
 pub const CONTENT_MAX: f32 = 1760.0;
-
-/// How many columns a card takes: two when its meter, at full card bars,
-/// is wider than a single card's meter. Worked out from the segment
-/// geometry whatever the style, so switching style never moves cards.
-pub fn card_span(groups: &[Group]) -> usize {
-    let full = Geom::card().resolve(crate::gear::oled_meter::MeterStyle::Segments, 1.0, 50.0);
-    (1..=MAX_SPAN)
-        .find(|&span| {
-            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(card_meter_w(span), 50.0));
-            !crate::gear::oled_meter::meter_layout(groups, r, &full).overflow
-        })
-        .unwrap_or(MAX_SPAN)
-}
-
-/// The most columns a card spans (a 32x32 device).
-pub const MAX_SPAN: usize = 4;
-
-/// The meter width of a card `span` columns wide.
-pub fn card_meter_w(span: usize) -> f32 {
-    card_width(span) - 2.0 * (WELL_INSET + METER_INSET)
-}
-
-/// Whether position `p`'s card is folded to a strip (only devices fold).
-fn is_folded(p: &PositionState, prefs: &ViewPrefs) -> bool {
-    !crate::bays::vacant(p) && prefs.layout.folded_cards.contains(&p.pos.to_string())
-}
-
-/// The span of position `p`'s card (empty, switched-off and folded cards are single).
-fn span_of(p: &PositionState, v: &Views, folded: bool) -> usize {
-    if folded || crate::bays::vacant(p) || matches!(p.status, PositionStatus::Off) {
-        1
-    } else {
-        card_span(&device_groups(p, v))
-    }
-}
-
-/// The width of a card `span` columns wide.
-fn card_width(span: usize) -> f32 {
-    span as f32 * CARD_W + span.saturating_sub(1) as f32 * GAP
-}
-
-/// A bay's size for `cols` columns and rows of cards `rows` tall.
-pub fn bay_size(cols: usize, rows: &[f32]) -> Vec2 {
-    let cols = cols.max(1);
-    let (tall, n) = if rows.is_empty() { (CARD_H, 1) } else { (rows.iter().sum(), rows.len()) };
-    Vec2::new(
-        cols as f32 * CARD_W + (cols - 1) as f32 * GAP + 2.0 * BAY_PAD,
-        BAY_HEADER + tall + (n - 1) as f32 * GAP + BAY_PAD,
-    )
-}
-
-/// Saves a frame's arrangement changes; `views` are the bays as drawn.
-fn apply_changes(changes: Vec<CardChange>, views: &[BayView], prefs: &mut ViewPrefs) {
-    for ch in changes {
-        match ch {
-            CardChange::Fold(pos) => crate::arrange::toggle(&mut prefs.layout.folded_cards, &pos),
-            CardChange::Move { bay, pos, to } => {
-                let Some(bv) = views.iter().find(|b| b.bay == bay) else { continue };
-                let order: Vec<String> = bv.cards[..bv.movable].iter().map(|p| p.pos.to_string()).collect();
-                let mut new = crate::arrange::moved(&order, &pos, to);
-                let saved = prefs.layout.cards.entry(bay.title().to_string()).or_default();
-                // Devices that are away keep their saved place for when they come back.
-                new.extend(saved.iter().filter(|k| !order.contains(k)).cloned());
-                *saved = new;
-            }
-        }
-    }
-}
 
 /// The channels of position `p`'s slots as meter groups: one IN and one OUT
 /// group, each channel with its number, name (custom or the device's) and
@@ -467,6 +361,11 @@ fn chan(v: &Views, input: bool, c: u32, number: u32, name: String) -> Chan {
         None => silent,
     }
 }
+
+/// The bus tray's unit width.
+const BUS_TRAY_W: f32 = 220.0;
+/// Between the bus tray's halves.
+const GAP: f32 = 12.0;
 
 /// Shows the screen; `palette` is the colours offered for a device.
 #[allow(clippy::too_many_arguments)]
@@ -542,56 +441,22 @@ pub fn show(
             let full = ui.available_width();
             let width = (full - 32.0).min(CONTENT_MAX);
             let left = ui.max_rect().left() + (full - width) / 2.0;
-            let max_cols = (((width - 2.0 * BAY_PAD + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
-            let views = crate::bays::bay_views(&state.positions, &st.expanded, &prefs.layout);
-            let spans: Vec<Vec<usize>> =
-                views.iter().map(|b| b.cards.iter().map(|p| span_of(p, &v, is_folded(p, prefs))).collect()).collect();
-            let heights: Vec<Vec<f32>> = views
-                .iter()
-                .map(|b| b.cards.iter().map(|p| if is_folded(p, prefs) { FOLDED_H } else { CARD_H }).collect())
-                .collect();
-            let sizes: Vec<Vec2> = spans
-                .iter()
-                .zip(&heights)
-                .map(|(s, h)| {
-                    let (places, cols, _) = crate::bays::place_cards(s, max_cols);
-                    bay_size(cols, &crate::bays::row_heights(&places, h))
-                })
-                .collect();
-            let widths: Vec<f32> = sizes.iter().map(|s| s.x).collect();
             ui.add_space(8.0);
-            for row in crate::bays::pack_bays(&widths, width, BAY_GAP) {
-                let h = row.iter().map(|&i| sizes[i].y).fold(0.0, f32::max);
-                let (band, _) = ui.allocate_exact_size(Vec2::new(full, h + BAY_GAP), Sense::hover());
-                let mut x = left;
-                for i in row {
-                    let r = Rect::from_min_size(Pos2::new(x, band.top()), sizes[i]);
-                    bay(
-                        ui,
-                        r,
-                        &views[i],
-                        &spans[i],
-                        &heights[i],
-                        max_cols,
-                        &v,
-                        skin,
-                        palette,
-                        st,
-                        motion,
-                        prefs,
-                        &mut actions,
-                    );
-                    x += sizes[i].x + BAY_GAP;
-                }
-            }
-            // A drag let go away from its card lands nowhere.
-            if st.card_drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
-                st.card_drag = None;
-                st.card_drop = None;
-            }
-            apply_changes(std::mem::take(&mut st.changes), &views, prefs);
+            crate::rack_view::show_sections(
+                ui,
+                left,
+                width,
+                &state.positions,
+                &v,
+                skin,
+                palette,
+                st,
+                motion,
+                prefs,
+                &mut actions,
+            );
             section_rule(ui, left, width, "Buses", skin);
-            bus_tray(ui, left, CARD_W, skin, st, &mut actions);
+            bus_tray(ui, left, BUS_TRAY_W, skin, st, &mut actions);
             ui.add_space(24.0);
         });
     });
@@ -705,214 +570,8 @@ fn section_rule(ui: &mut egui::Ui, left: f32, width: f32, title: &str, skin: &Ge
     r
 }
 
-/// One bay: a recessed zone with a coloured strip and its etched title, an
-/// expander when positions are folded away, and its cards.
-#[allow(clippy::too_many_arguments)]
-fn bay(
-    ui: &mut egui::Ui,
-    r: Rect,
-    bv: &BayView,
-    spans: &[usize],
-    heights: &[f32],
-    max_cols: usize,
-    v: &Views,
-    skin: &GearSkin,
-    palette: &[Color32],
-    st: &mut ScreenState,
-    motion: &mut Motion,
-    prefs: &ViewPrefs,
-    actions: &mut Vec<ScreenAction>,
-) {
-    let p = ui.painter_at(r.expand(4.0));
-    paint::recess(&p, r, skin, 16);
-    // The title: descriptive, or one word with "Short bay titles"; it
-    // leaves room for the expander on the right.
-    let expander_w = if bv.hidden > 0 || st.expanded.contains(&bv.bay) { 84.0 } else { 0.0 };
-    let at = Pos2::new(r.left() + BAY_PAD + 2.0, r.top() + 16.0);
-    let title = if prefs.short_bay_titles {
-        let title = bv.bay.title().to_uppercase();
-        paint::etched_text(&p, at, Align2::LEFT_CENTER, &title, skin, skin.ground_ink, 10.5, true, 0.16, 0.82);
-        title
-    } else {
-        let title = bv.bay.description().to_string();
-        paint::truncated(
-            &p,
-            at,
-            Align2::LEFT_CENTER,
-            &title,
-            paint::font(ui.ctx(), "label-bold", 12.5),
-            paint::alpha(skin.ground_ink, 0.85),
-            r.width() - 2.0 * BAY_PAD - expander_w - 4.0,
-        );
-        title
-    };
-    let (_, label) = ui.allocate_exact_size(Vec2::ZERO, Sense::hover());
-    label.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &title));
-    // The expander: every position of the bay, or back to the devices.
-    let expanded = st.expanded.contains(&bv.bay);
-    if bv.hidden > 0 || expanded {
-        let name = match bv.bay {
-            Bay::Hardware => "ASIO",
-            other => other.title(),
-        };
-        let (shown, accessible) = if expanded {
-            ("Show fewer".to_string(), format!("Show fewer {name} positions"))
-        } else {
-            (format!("+{} more", bv.hidden), format!("Show all {name} positions"))
-        };
-        let at =
-            Rect::from_min_size(Pos2::new(r.right() - BAY_PAD - 96.0, r.top() + 4.0), Vec2::new(96.0, paint::PILL_H));
-        let mut child =
-            ui.new_child(egui::UiBuilder::new().max_rect(at).layout(egui::Layout::right_to_left(egui::Align::Center)));
-        if paint::pill_labeled(&mut child, &shown, &accessible, skin).clicked() {
-            if expanded {
-                st.expanded.remove(&bv.bay);
-            } else {
-                st.expanded.insert(bv.bay);
-            }
-        }
-    }
-    let (places, _, _) = crate::bays::place_cards(spans, max_cols);
-    let rows = crate::bays::row_heights(&places, heights);
-    let top_of = |row: usize| BAY_HEADER + rows[..row].iter().sum::<f32>() + row as f32 * GAP;
-    let mut rects = Vec::with_capacity(bv.cards.len());
-    for (i, ((pos, &(row, col)), &span)) in bv.cards.iter().zip(&places).zip(spans).enumerate() {
-        let at = r.min + Vec2::new(BAY_PAD + col as f32 * (CARD_W + GAP), top_of(row));
-        let w = card_width(span.clamp(1, max_cols.max(1)));
-        let rect = Rect::from_min_size(at, Vec2::new(w, heights[i]));
-        rects.push(rect);
-        let movable = i < bv.movable;
-        card(ui, rect, pos, bv.bay, movable, v, skin, palette, st, motion, prefs, actions);
-    }
-    // A card of this bay being dragged: an accent bar where it would land.
-    let dragging_here = st.card_drag.is_some_and(|d| bv.cards[..bv.movable].iter().any(|p| p.pos == d));
-    if dragging_here {
-        let devices = &rects[..bv.movable];
-        st.card_drop = None;
-        if let Some(at) = ui.input(|i| i.pointer.latest_pos()).filter(|a| r.contains(*a)) {
-            let to = crate::arrange::drop_index(devices, at);
-            st.card_drop = Some(to);
-            let (x, near) = match devices.get(to) {
-                Some(c) => (c.left() - GAP / 2.0, *c),
-                None => (devices.last().map_or(r.left(), |c| c.right() + GAP / 2.0), *devices.last().unwrap_or(&r)),
-            };
-            let bar = Rect::from_min_max(Pos2::new(x - 1.5, near.top()), Pos2::new(x + 1.5, near.bottom()));
-            ui.painter().rect_filled(bar, 1.5, skin.accent);
-        }
-        ui.ctx().request_repaint();
-    }
-}
-
-/// A device card's menu: rename it or its channels, fold it, move it.
-fn card_menu(
-    resp: &egui::Response,
-    p: &PositionState,
-    bay: Bay,
-    folded: bool,
-    custom: Option<String>,
-    st: &mut ScreenState,
-) {
-    let pos = p.pos.to_string();
-    resp.context_menu(|ui| {
-        if ui.button("Rename\u{2026}").clicked() {
-            if folded {
-                st.changes.push(CardChange::Fold(pos.clone()));
-            }
-            st.renaming = Some((p.pos, custom.clone().unwrap_or_default()));
-            ui.close();
-        }
-        if ui.button("Rename channels\u{2026}").clicked() {
-            st.channels_of = Some(p.pos);
-            st.channel_drafts.clear();
-            ui.close();
-        }
-        ui.separator();
-        if ui.button(if folded { "Unfold" } else { "Fold" }).clicked() {
-            st.changes.push(CardChange::Fold(pos.clone()));
-            ui.close();
-        }
-        if ui.button("Move to start").clicked() {
-            st.changes.push(CardChange::Move { bay, pos: pos.clone(), to: 0 });
-            ui.close();
-        }
-        if ui.button("Move to end").clicked() {
-            st.changes.push(CardChange::Move { bay, pos: pos.clone(), to: usize::MAX });
-            ui.close();
-        }
-    });
-}
-
-/// A device card dragged within its bay: where it lands is found while drawing the bay.
-fn card_drag(resp: &egui::Response, p: &PositionState, bay: Bay, st: &mut ScreenState) {
-    if resp.drag_started() {
-        st.card_drag = Some(p.pos);
-        st.card_drop = None;
-    }
-    if resp.drag_stopped() {
-        if let (Some(d), Some(to)) = (st.card_drag.take(), st.card_drop.take()) {
-            if d == p.pos {
-                st.changes.push(CardChange::Move { bay, pos: p.pos.to_string(), to });
-            }
-        }
-    }
-}
-
-/// A folded card: a slim strip with its LED, name and a thin IN/OUT level
-/// meter, and a chevron to unfold it.
-#[allow(clippy::too_many_arguments)]
-fn folded_face(
-    ui: &mut egui::Ui,
-    r: Rect,
-    p: &PositionState,
-    f: &Face,
-    colour: Color32,
-    v: &Views,
-    base: &GearSkin,
-    st: &mut ScreenState,
-    motion: &mut Motion,
-    id: Id,
-) {
-    let skin = base.for_device(Some(colour));
-    let mut painter = ui.painter_at(r.expand(20.0));
-    if st.card_drag == Some(p.pos) {
-        painter.set_opacity(0.45);
-    }
-    let hovered = ui.rect_contains_pointer(r);
-    let lift = motion.spring(id.with("lift"), if hovered { 1.0 } else { 0.0 }, SETTLE);
-    paint::panel_lifted(&painter, r, &skin, None, lift, paint::PANEL_RADIUS);
-    let led_at = Pos2::new(r.left() + 17.0, r.center().y);
-    let glow = motion.phosphor(id.with("led"), if f.led.is_some() { 1.0 } else { 0.0 }, PHOSPHOR_TAU);
-    paint::led_glow(&painter, led_at, &skin, f.led.unwrap_or(Color32::GRAY), glow);
-    paint::truncated(
-        &painter,
-        Pos2::new(r.left() + 30.0, r.center().y),
-        Align2::LEFT_CENTER,
-        &f.name,
-        paint::font(ui.ctx(), "label-bold", 13.0),
-        skin.ink,
-        r.width() - 30.0 - 116.0,
-    );
-    // The meter: one bar for the loudest input, one for the loudest output.
-    let well = Rect::from_min_size(Pos2::new(r.right() - 112.0, r.center().y - 12.0), Vec2::new(76.0, 24.0));
-    paint::oled_well(&painter, well, &skin);
-    for (k, g) in device_groups(p, v).iter().take(2).enumerate() {
-        let peak = g.channels.iter().map(|c| c.peak_db).fold(f32::NEG_INFINITY, f32::max);
-        let frac = ((peak + 60.0) / 60.0).clamp(0.0, 1.0);
-        let track = Rect::from_min_size(
-            Pos2::new(well.left() + 6.0, well.top() + 6.0 + k as f32 * 8.0),
-            Vec2::new(well.width() - 12.0, 4.0),
-        );
-        painter.rect_filled(track, 0.0, paint::alpha(skin.oled, 0.14));
-        painter.rect_filled(Rect::from_min_size(track.min, Vec2::new(track.width() * frac, 4.0)), 0.0, skin.oled);
-    }
-    let chev = Rect::from_min_size(Pos2::new(r.right() - 32.0, r.center().y - 11.0), Vec2::splat(22.0));
-    if paint::chevron_button(ui, chev, false, &format!("Unfold {}", p.pos.label()), &skin).clicked() {
-        st.changes.push(CardChange::Fold(p.pos.to_string()));
-    }
-}
-
 /// The accessible label of a card: its tag, name and OLED lines.
-fn card_label(f: &Face, empty: bool) -> String {
+pub(crate) fn card_label(f: &Face, empty: bool) -> String {
     if empty {
         return format!("{} \u{b7} click to choose a device", f.tag);
     }
@@ -922,438 +581,6 @@ fn card_label(f: &Face, empty: bool) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join(" \u{b7} ")
-}
-
-#[allow(clippy::too_many_arguments)]
-fn card(
-    ui: &mut egui::Ui,
-    r: Rect,
-    p: &PositionState,
-    bay: Bay,
-    movable: bool,
-    v: &Views,
-    base: &GearSkin,
-    palette: &[Color32],
-    st: &mut ScreenState,
-    motion: &mut Motion,
-    prefs: &ViewPrefs,
-    actions: &mut Vec<ScreenAction>,
-) {
-    let colour = device_color(p, palette);
-    let filling = st.filling.contains(&p.pos);
-    let mut f = face(p, v, filling);
-    // The display name: a custom name first (spec: meter bridge §4.4).
-    let custom = p.slots.iter().find_map(|id| v.slots.iter().find(|s| s.id == *id)).and_then(|s| s.label.clone());
-    let (name, sub) = crate::names::display(custom.as_deref(), &f.name, prefs.only_custom_names);
-    if custom.is_some() {
-        f.sub = sub.unwrap_or_default();
-        f.name = name;
-    }
-    let id = Id::new(("position-card", p.pos.to_string()));
-    let empty = p.status == PositionStatus::Empty;
-    let off = p.status == PositionStatus::Off;
-    let folded = movable && is_folded(p, prefs);
-    let resp = ui.interact(r, id, if movable { Sense::click_and_drag() } else { Sense::click() });
-    if movable {
-        card_drag(&resp, p, bay, st);
-        card_menu(&resp, p, bay, folded, custom.clone(), st);
-    }
-    if st.picker == Some(p.pos) {
-        st.picker_anchor = r; // the popover follows its tray while the screen scrolls
-    }
-    let enabled = ui.is_enabled();
-    let label = card_label(&f, empty);
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &label));
-    let mut painter = ui.painter_at(r.expand(40.0));
-    if st.card_drag == Some(p.pos) {
-        painter.set_opacity(0.45);
-    }
-    if empty {
-        // A recess where a device would go, with a "+".
-        let hover = motion.spring(id.with("hover"), if resp.hovered() { 1.0 } else { 0.0 }, SETTLE);
-        paint::recess(&painter, r.shrink(1.0), base, 12);
-        let ink = base.ground_ink;
-        paint::etched_text(
-            &painter,
-            r.center() - Vec2::new(0.0, 12.0),
-            Align2::CENTER_CENTER,
-            "+",
-            base,
-            ink,
-            26.0,
-            false,
-            0.0,
-            0.55 + 0.45 * hover,
-        );
-        paint::etched_text(
-            &painter,
-            r.center() + Vec2::new(0.0, 18.0),
-            Align2::CENTER_CENTER,
-            &f.tag,
-            base,
-            ink,
-            10.5,
-            true,
-            0.14,
-            0.62 + 0.38 * hover,
-        );
-        if resp.clicked() {
-            st.open_picker(p.pos, false, r);
-        }
-        return;
-    }
-    if folded {
-        folded_face(ui, r, p, &f, colour, v, base, st, motion, id);
-        if resp.clicked() {
-            if let Some(&slot) = p.slots.first() {
-                actions.push(ScreenAction::Select(slot));
-            }
-        }
-        return;
-    }
-    let resp = if p.pos.group == PosGroup::Vasio && matches!(p.status, PositionStatus::On { .. }) {
-        resp.on_hover_text(format!(
-            "Your DAW may list this as \"Confluence VASIO {}\" until the drivers are re-registered",
-            p.pos.index + 1
-        ))
-    } else if !p.pos.group.is_virtual() && !off {
-        resp.on_hover_text("Ctrl+click to swap the device")
-    } else {
-        resp
-    };
-    let lit = base.for_device(Some(colour));
-    let skin = if off { lit.powered_off() } else { lit };
-    // Motion: a hover lift, a pop when the card appears, a crossfade between on and off.
-    let hovered = ui.rect_contains_pointer(r);
-    let lift = motion.spring(id.with("lift"), if hovered && !off { 1.0 } else { 0.0 }, SETTLE);
-    let scale = if st.just_filled.contains(&p.pos) {
-        motion.spring_from(id.with("pop"), 0.94, 1.0, POP)
-    } else {
-        motion.spring(id.with("pop"), 1.0, POP)
-    };
-    if scale >= 0.999 {
-        st.just_filled.remove(&p.pos);
-    }
-    let r = Rect::from_center_size(r.center(), r.size() * scale);
-    let power = motion.decay(id.with("power"), if off { 0.0 } else { 1.0 }, 0.12);
-    paint::panel_lifted(&painter, r, &skin, None, lift, paint::PANEL_RADIUS);
-    if power > 0.0 && power < 1.0 {
-        // The lit face fades over the dark one (or away from it).
-        let mut lit_painter = painter.clone();
-        lit_painter.set_opacity(power);
-        paint::panel_lifted(&lit_painter, r, &lit, None, lift, paint::PANEL_RADIUS);
-    }
-    let w = r.width();
-    // An app's icon, painted on the card's corner like a badge.
-    let badge = p.pos.group == PosGroup::App && !off;
-    if let (true, Some(d)) = (badge, p.device.as_ref()) {
-        let tex = st.icons.get(ui.ctx(), &d.name);
-        let (c, side, angle) = crate::app_icon::badge_rect(r);
-        paint::textured_rounded(
-            &painter,
-            r,
-            paint::PANEL_RADIUS as f32,
-            tex.id(),
-            |q| crate::app_icon::badge_uv(q, c, side, angle),
-            crate::app_icon::BADGE_TINT,
-        );
-    }
-    // Row 1: the LED, the position tag, a master tag; the controls on the right.
-    let led_at = r.min + Vec2::new(17.0, 19.0);
-    let now = motion.now();
-    let seen = st.led_seen.entry(p.pos).or_insert((f.led, now));
-    if seen.0 != f.led {
-        *seen = (f.led, now);
-    }
-    let since = seen.1;
-    let bloom = 1.0 + 0.6 * (1.0 - motion.since(since, 0.4));
-    let want = match f.led {
-        Some(_) if f.blink => f32::from(u8::from(motion.blink(2.0))),
-        Some(_) => 1.0,
-        None => 0.0,
-    };
-    let glow = motion.phosphor(id.with("led"), want, PHOSPHOR_TAU) * bloom;
-    let led_colour = f.led.unwrap_or(Color32::GRAY);
-    paint::led_glow(&painter, led_at, &skin, led_colour, glow);
-    if f.led.is_some() {
-        let led = ui.interact(Rect::from_center_size(led_at, Vec2::splat(14.0)), id.with("led"), Sense::click());
-        led.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, format!("Clear clips {}", p.pos.label())));
-        if led.clicked() {
-            actions.push(ScreenAction::Edit(Edit::ClearClip));
-        }
-    }
-    let tag_rect = paint::tag(&painter, led_at + Vec2::new(13.0, 0.0), Align2::LEFT_CENTER, &f.tag, &skin, 0.78);
-    if p.master {
-        paint::etched_text(
-            &painter,
-            Pos2::new(tag_rect.right() + 7.0, led_at.y),
-            Align2::LEFT_CENTER,
-            "MASTER",
-            &skin,
-            if skin.mould { skin.ink } else { skin.accent },
-            10.0,
-            true,
-            0.12,
-            1.0,
-        );
-    }
-    // Row 2: the name (double-click to rename it) and its sub-line.
-    let ctx = ui.ctx().clone();
-    // A device's card keeps room on the right of its name for the fold chevron.
-    let fold_w = if movable { 28.0 } else { 0.0 };
-    let name_rect = Rect::from_min_size(r.min + Vec2::new(12.0, 31.0), Vec2::new(w - 24.0 - fold_w, 20.0));
-    let first_slot = p.slots.first().copied();
-    let renaming = st.renaming.as_ref().is_some_and(|(pos, _)| *pos == p.pos);
-    if renaming {
-        let mut text = st.renaming.as_ref().map(|r| r.1.clone()).unwrap_or_default();
-        let edit = ui.put(
-            name_rect,
-            TextEdit::singleline(&mut text).hint_text("Custom name").font(paint::font(&ctx, "label-bold", 14.0)),
-        );
-        if !edit.has_focus() && !edit.lost_focus() {
-            edit.request_focus();
-        }
-        let (enter, escape) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
-        if escape {
-            st.renaming = None;
-        } else if edit.lost_focus() || enter {
-            st.renaming = None;
-            if let Some(id) = first_slot {
-                actions.push(ScreenAction::Edit(Edit::SetSlotLabel { id, channel: None, name: Some(text) }));
-            }
-        } else if let Some(r) = st.renaming.as_mut() {
-            r.1 = text;
-        }
-    } else {
-        paint::truncated(
-            &painter,
-            r.min + Vec2::new(15.0, 33.0),
-            Align2::LEFT_TOP,
-            &f.name,
-            paint::font(&ctx, "label-bold", 15.0),
-            skin.ink,
-            w - 30.0 - fold_w,
-        );
-        if movable {
-            let chev = Rect::from_min_size(Pos2::new(r.right() - 34.0, r.top() + 31.0), Vec2::splat(22.0));
-            if paint::chevron_button(ui, chev, true, &format!("Fold {}", p.pos.label()), &skin).clicked() {
-                st.changes.push(CardChange::Fold(p.pos.to_string()));
-            }
-        }
-        if !off && first_slot.is_some() {
-            let name_resp = ui.interact(name_rect, id.with("name"), Sense::click());
-            let what = format!("Rename {}", p.pos.label());
-            name_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
-            // A double-click, timed here so screen readers (whose clicks
-            // never pair up as double-clicks) can rename too.
-            if name_resp.clicked() {
-                let t = ui.input(|i| i.time);
-                match st.name_click {
-                    Some((pos, at)) if pos == p.pos && t - at < DOUBLE_CLICK_SECS => {
-                        st.name_click = None;
-                        st.renaming = Some((p.pos, custom.clone().unwrap_or_default()));
-                    }
-                    _ => st.name_click = Some((p.pos, t)),
-                }
-            }
-        }
-    }
-    if !f.sub.is_empty() {
-        paint::truncated(
-            &painter,
-            r.min + Vec2::new(15.0, 51.0),
-            Align2::LEFT_TOP,
-            &f.sub,
-            paint::font(&ctx, "label", 10.5),
-            paint::alpha(skin.ink, 0.62),
-            w - 30.0 - fold_w,
-        );
-    }
-    // The OLED: the state line on top, the meters below.
-    let well = Rect::from_min_size(r.min + Vec2::new(WELL_INSET, 66.0), Vec2::new(w - 2.0 * WELL_INSET, 74.0));
-    paint::oled_well(&painter, well, &skin);
-    let inner = well.shrink2(Vec2::new(METER_INSET, 5.0));
-    // The meter's geometry, worked out first: the grid behind takes its dots.
-    let groups = if off { Vec::new() } else { device_groups(p, v) };
-    let mrect = Rect::from_min_max(Pos2::new(inner.left(), inner.top() + 9.0), inner.max);
-    let ppp = ui.ctx().pixels_per_point();
-    let geom = crate::gear::oled_meter::fit_geom(
-        &groups,
-        mrect.width(),
-        Geom::card().resolve(prefs.meter.style, ppp, mrect.height()),
-    );
-    if prefs.meter.style == crate::gear::oled_meter::MeterStyle::DotMatrix && !off {
-        // The display's own pixel grid, behind its text and meters.
-        let dots = crate::gear::oled_meter::grid_dots(&geom, ppp, mrect.height());
-        crate::gear::oled_meter::dot_grid(&painter.with_clip_rect(well.shrink(2.0)), well.shrink(2.0), dots);
-    }
-    let state_text = if f.line2.is_empty() { f.line1.clone() } else { format!("{} {}", f.line1, f.line2) };
-    let state_text: String =
-        state_text.replace('\u{b7}', " ").replace('\u{2026}', "...").replace('\u{d7}', "X").to_uppercase();
-    let mut text_mesh = egui::epaint::Mesh::default();
-    let oled_c = paint::alpha(skin.oled, if off { 0.3 } else { 0.9 });
-    if off {
-        crate::gear::pixel_font::draw(&mut text_mesh, inner.left_top(), "OFF", 2.0, oled_c, false);
-    } else {
-        crate::gear::pixel_font::draw(&mut text_mesh, inner.left_top(), &state_text, 1.0, oled_c, false);
-    }
-    painter.with_clip_rect(inner).add(egui::Shape::mesh(text_mesh));
-    if !groups.is_empty() {
-        // The state line has its own row; the meter fills the rest.
-        let m = crate::gear::oled_meter::meter_widget(ui, id.with("meter"), mrect, &groups, &geom, prefs.meter, motion);
-        let what = format!("Channels of {}", p.pos.label());
-        m.response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
-        if m.response.clicked() {
-            st.channels_of = Some(p.pos);
-            st.channel_drafts.clear();
-        }
-    }
-    // The controls, top right: faint until the card is hovered.
-    let quiet = motion.spring(id.with("controls"), if hovered || off { 1.0 } else { 0.38 }, SETTLE);
-    // (Left of an app's badge.)
-    let right = r.right() - if badge { 44.0 } else { 10.0 };
-    let controls =
-        Rect::from_min_max(Pos2::new(r.left() + 70.0, r.top() + 7.0), Pos2::new(right, r.top() + 7.0 + paint::PILL_H));
-    let mut row = ui
-        .new_child(egui::UiBuilder::new().max_rect(controls).layout(egui::Layout::right_to_left(egui::Align::Center)));
-    row.set_opacity(quiet);
-    row.spacing_mut().item_spacing.x = 5.0;
-    let label = p.pos.label();
-    let virt = p.pos.group.is_virtual();
-    paint::compact_pills(&mut row, |row| {
-        if let Some(c) = st.confirm.filter(|c| c.pos == p.pos) {
-            row.set_opacity(1.0);
-            confirm_strip(row, c, &skin, st, actions);
-        } else if off {
-            if paint::pill_labeled(row, "Turn on", &format!("Turn on {label}"), &skin).clicked() {
-                st.just_filled.insert(p.pos);
-                actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: None }));
-            }
-        } else {
-            if let Some(&slot) = p.slots.first() {
-                colour_menu(row, slot, &label, colour, palette, &skin, actions);
-            }
-            if virt {
-                if p.pos.group == PosGroup::Vasio {
-                    shape_menu(row, p, &skin, actions);
-                }
-                if paint::pill_labeled(row, "Off", &format!("Turn off {label}"), &skin).clicked() {
-                    st.confirm = Some(Confirm { pos: p.pos, clear: false, at: now });
-                }
-            } else {
-                if paint::pill_labeled(row, "Clear\u{2026}", &format!("Clear {label}"), &skin).clicked() {
-                    st.confirm = Some(Confirm { pos: p.pos, clear: true, at: now });
-                }
-                if p.pos.group == PosGroup::Asio
-                    && !p.master
-                    && paint::pill_labeled(row, "Master", &format!("Make {label} master"), &skin).clicked()
-                {
-                    actions.push(ScreenAction::Edit(Edit::SetMaster { pos: Some(p.pos) }));
-                }
-            }
-        }
-    });
-    if resp.clicked() && !off {
-        if ui.input(|i| i.modifiers.command) && !virt {
-            st.open_picker(p.pos, true, r);
-        } else if let Some(&slot) = p.slots.first() {
-            actions.push(ScreenAction::Select(slot));
-        }
-    }
-}
-
-/// "Its routes are removed. [Yes] [No]" in the card's control row.
-fn confirm_strip(
-    ui: &mut egui::Ui,
-    c: Confirm,
-    skin: &GearSkin,
-    st: &mut ScreenState,
-    actions: &mut Vec<ScreenAction>,
-) {
-    let verb = if c.clear { "Clear" } else { "Turn off" };
-    let question = format!("{verb} {}? Its routes are removed.", c.pos.label());
-    let (r, text) = ui.allocate_exact_size(Vec2::new(96.0, paint::PILL_H), Sense::hover());
-    text.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &question));
-    paint::truncated(
-        ui.painter(),
-        r.left_center(),
-        Align2::LEFT_CENTER,
-        "Routes go too?",
-        paint::font(ui.ctx(), "label-bold", 11.5),
-        skin.ink,
-        r.width(),
-    );
-    if paint::pill_tinted(ui, "Yes", verb, RED, skin).clicked() {
-        st.confirm = None;
-        actions.push(ScreenAction::Edit(if c.clear {
-            Edit::ClearPosition { pos: c.pos }
-        } else {
-            Edit::SetVirtual { pos: c.pos, on: false, shape: None }
-        }));
-    }
-    if paint::pill_labeled(ui, "No", "Cancel", skin).clicked() {
-        st.confirm = None;
-    }
-}
-
-/// VASIO's shape, as the DAW sees it: both directions together, or each.
-fn shape_menu(ui: &mut egui::Ui, p: &PositionState, skin: &GearSkin, actions: &mut Vec<ScreenAction>) {
-    let (ins, outs) = p.shape.unwrap_or((8, 8)); // engine side: (DAW outputs, DAW inputs)
-    let pill = paint::pill_labeled(ui, "Shape\u{2026}", &format!("Shape of {}", p.pos.label()), skin);
-    egui::Popup::menu(&pill).show(|ui| {
-        for n in SHAPES {
-            if ui.button(format!("{n}\u{d7}{n}")).clicked() {
-                actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: Some((n, n)) }));
-            }
-        }
-        ui.separator();
-        ui.label("DAW inputs");
-        ui.horizontal(|ui| {
-            for n in SHAPES {
-                if ui.selectable_label(outs == n, n.to_string()).clicked() {
-                    actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: Some((ins, n)) }));
-                }
-            }
-        });
-        ui.label("DAW outputs");
-        ui.horizontal(|ui| {
-            for n in SHAPES {
-                if ui.selectable_label(ins == n, n.to_string()).clicked() {
-                    actions.push(ScreenAction::Edit(Edit::SetVirtual { pos: p.pos, on: true, shape: Some((n, outs)) }));
-                }
-            }
-        });
-    });
-}
-
-fn colour_menu(
-    ui: &mut egui::Ui,
-    slot: u32,
-    label: &str,
-    current: Color32,
-    palette: &[Color32],
-    skin: &GearSkin,
-    actions: &mut Vec<ScreenAction>,
-) {
-    let swatch = paint::swatch(ui, current, &format!("Colour of {label}"), skin);
-    egui::Popup::menu(&swatch).show(|ui| {
-        ui.horizontal_wrapped(|ui| {
-            for c in palette {
-                let rgb = [c.r(), c.g(), c.b()];
-                let (r, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
-                ui.painter().circle_filled(r.center(), 8.0, *c);
-                if current == *c {
-                    ui.painter().circle_stroke(r.center(), 9.5, egui::Stroke::new(2.0, skin.ground_ink));
-                }
-                if resp.clicked() {
-                    actions.push(ScreenAction::Edit(Edit::SetSlotColor { id: slot, color: Some(rgb) }));
-                }
-            }
-        });
-        if ui.button("Default").clicked() {
-            actions.push(ScreenAction::Edit(Edit::SetSlotColor { id: slot, color: None }));
-        }
-    });
 }
 
 /// Adding an insert bus: a tray with an OLED name field and a channel stepper.
@@ -1832,44 +1059,6 @@ fn name_to_send(draft: &str, current: &str, edited: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn io(ins: usize, outs: usize) -> Vec<Group> {
-        let chans = |n: usize| (0..n).map(|i| Chan { number: i as u32 + 1, ..Chan::silent() }).collect::<Vec<_>>();
-        [("IN", ins), ("OUT", outs)]
-            .into_iter()
-            .filter(|(_, n)| *n > 0)
-            .map(|(l, n)| Group { label: format!("{l} {n}"), channels: chans(n) })
-            .collect()
-    }
-
-    #[test]
-    fn big_devices_span_three_or_four_columns() {
-        assert_eq!(card_span(&io(22, 22)), 3, "about 490 pt of meter");
-        assert_eq!(card_span(&io(32, 32)), 4);
-        assert_eq!(card_span(&io(64, 64)), 4, "four at most; its bars narrow");
-        for span in 1..=4 {
-            assert!(card_meter_w(span) > card_meter_w(span.max(2) - 1) || span == 1);
-        }
-    }
-
-    #[test]
-    fn many_channel_devices_take_double_cards() {
-        for (ins, outs) in [(2, 0), (8, 8), (0, 2), (0, 8)] {
-            assert_eq!(card_span(&io(ins, outs)), 1, "{ins}x{outs}");
-        }
-        for (ins, outs) in [(16, 16), (23, 10)] {
-            assert_eq!(card_span(&io(ins, outs)), 2, "{ins}x{outs}");
-        }
-        // Whatever the style or scale, a single card's meter holds what card_span gave it.
-        use crate::gear::oled_meter::{fit_geom, meter_layout, MeterStyle};
-        for style in MeterStyle::all() {
-            let g = io(8, 8);
-            let full = Geom::card().resolve(style, 1.0, 50.0);
-            assert_eq!(fit_geom(&g, CARD_METER_W, full), full, "{style:?}: an 8x8 card keeps full bars at 100 %");
-            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(CARD_METER_W, 50.0));
-            assert!(!meter_layout(&g, r, &full).overflow);
-        }
-    }
 
     #[test]
     fn a_channel_name_is_sent_only_when_edited_and_changed() {

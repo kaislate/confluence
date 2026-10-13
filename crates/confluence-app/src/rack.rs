@@ -6,14 +6,13 @@
 use eframe::egui::{Pos2, Rect};
 use serde::{Deserialize, Serialize};
 
-/// A one-column tray is at least this wide.
-pub const TRAY_MIN_W: f32 = 220.0;
+/// A one-column tray is at least this wide (a group of eight fits one row
+/// of a 1600-wide window).
+pub const TRAY_MIN_W: f32 = 176.0;
 /// Between trays, both ways.
 pub const GAP: f32 = 8.0;
 /// A tray's text part (LED, tag, strip, sub-line) at its narrowest.
 pub const INFO_W: f32 = 120.0;
-/// The narrowest a meter bar may be drawn (bar and its gap).
-pub const BAR_PITCH: f32 = 6.0;
 /// The most columns a tray spans.
 pub const MAX_SPAN: usize = 4;
 
@@ -40,14 +39,16 @@ pub fn oled_w(w: f32) -> f32 {
     (w - INFO_W).max(w * 0.4)
 }
 
-/// The fewest columns (up to [`MAX_SPAN`] and `cols`) whose OLED window holds
-/// a bar per channel, with a gap between the inputs and the outputs.
-pub fn tray_span(ins: u32, outs: u32, col_w: f32, cols: usize) -> usize {
+/// The meter's width inside a tray `span` columns wide: its OLED window less
+/// the module's and the window's insets (as the tray is drawn).
+pub fn meter_w(span: usize, col_w: f32) -> f32 {
+    oled_w(tray_w(span, col_w) - 4.0) - 16.0
+}
+
+/// The fewest columns (up to [`MAX_SPAN`] and `cols`) whose meter `fits`.
+pub fn tray_span(col_w: f32, cols: usize, fits: impl Fn(f32) -> bool) -> usize {
     let most = MAX_SPAN.min(cols.max(1));
-    let between = if ins > 0 && outs > 0 { BAR_PITCH } else { 0.0 };
-    // The window's own padding, left and right.
-    let needed = (ins + outs) as f32 * BAR_PITCH + between + 10.0;
-    (1..=most).find(|&s| oled_w(tray_w(s, col_w)) >= needed).unwrap_or(most)
+    (1..=most).find(|&s| fits(meter_w(s, col_w))).unwrap_or(most)
 }
 
 /// Places trays of `spans` row by row in `cols` columns; a tray that does not
@@ -140,10 +141,11 @@ mod tests {
 
     #[test]
     fn a_bed_holds_as_many_columns_as_fit_and_at_least_one() {
-        assert_eq!(columns(1800.0), 7, "7 × 220 + 6 × 8 = 1588 fits, 8 do not");
-        assert_eq!(columns(220.0), 1);
+        assert_eq!(columns(1800.0), 9, "9 × 176 + 8 × 8 = 1648 fits, 10 do not");
+        assert!(columns(1520.0) >= 8, "a group of eight fits one row of a 1600-wide window");
+        assert_eq!(columns(176.0), 1);
         assert_eq!(columns(100.0), 1, "too narrow: still one");
-        assert_eq!(columns(448.0), 2);
+        assert_eq!(columns(360.0), 2);
         let w = col_width(1000.0, 4);
         assert!((4.0 * w + 3.0 * GAP - 1000.0).abs() < 1e-3, "columns fill the bed");
         assert_eq!(tray_w(2, 100.0), 208.0);
@@ -160,13 +162,13 @@ mod tests {
     #[test]
     fn a_tray_spans_the_fewest_columns_that_hold_its_meters() {
         let cw = 228.0;
-        assert_eq!(tray_span(2, 2, cw, 7), 1, "a stereo device");
-        assert_eq!(tray_span(8, 8, cw, 7), 2, "an 8×8 VASIO");
-        assert_eq!(tray_span(23, 10, cw, 7), 2, "the GoXLR");
-        assert_eq!(tray_span(32, 32, cw, 7), 3);
-        assert_eq!(tray_span(64, 64, cw, 7), MAX_SPAN, "capped");
-        assert_eq!(tray_span(32, 32, cw, 2), 2, "never wider than the bed");
-        assert_eq!(tray_span(0, 0, cw, 7), 1, "an empty tray");
+        let needs = |w: f32| move |have: f32| have >= w;
+        assert_eq!(meter_w(1, cw), 88.0);
+        assert_eq!(tray_span(cw, 7, needs(80.0)), 1, "a stereo device");
+        assert_eq!(tray_span(cw, 7, needs(200.0)), 2);
+        assert_eq!(tray_span(cw, 7, needs(500.0)), 3);
+        assert_eq!(tray_span(cw, 7, needs(5000.0)), MAX_SPAN, "capped");
+        assert_eq!(tray_span(cw, 2, needs(500.0)), 2, "never wider than the bed");
     }
 
     #[test]
