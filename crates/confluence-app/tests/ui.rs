@@ -227,14 +227,10 @@ fn a_vasio_is_turned_on_from_the_devices_screen() {
     let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
     h.get_by_label("Devices").click();
-    // The wall is collapsed: only the next switched-off position (B) shows
-    // until the group is opened.
-    pump_until(&mut h, "the collapsed Virtual group", LONG, |h| {
-        h.query_by_label("Show all Virtual positions").is_some()
-    });
-    assert!(h.query_by_label("Turn on VASIO C").is_none(), "C is folded away");
-    h.get_by_label("Show all Virtual positions").click();
-    pump_until(&mut h, "VASIO C's card", LONG, |h| h.query_by_label("Turn on VASIO C").is_some());
+    // Every position has its tray: a switched-off one shows its OFF pill.
+    pump_until(&mut h, "VASIO C's tray", LONG, |h| h.query_by_label("Turn on VASIO C").is_some());
+    h.get_by_label("Turn on VASIO C").scroll_to_me();
+    settle(&mut h);
     h.get_by_label("Turn on VASIO C").click();
     pump_until(&mut h, "the new slot", LONG, |_| slots(&mut client(&d)).iter().any(|s| s.name == "VASIO C"));
     pump_until(&mut h, "the notification", LONG, |h| h.query_by_label_contains("Turned on VASIO C").is_some());
@@ -759,12 +755,12 @@ fn a_filled_position_is_cleared_after_confirming() {
     let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
     h.get_by_label("Devices").click();
-    pump_until(&mut h, "the Clear pill", LONG, |h| h.query_by_label("Clear NET OUT 1").is_some());
-    h.get_by_label("Clear NET OUT 1").scroll_to_me();
+    pump_until(&mut h, "NET OUT 1's tray", LONG, |h| h.query_by_label("Turn off NET OUT 1").is_some());
+    h.get_by_label("Turn off NET OUT 1").scroll_to_me();
     settle(&mut h);
-    h.get_by_label("Clear NET OUT 1").click();
+    menu_item(&mut h, "NET OUT 1", "Clear\u{2026}");
     pump_until(&mut h, "the question", LONG, |h| h.query_by_label_contains("Its routes are removed").is_some());
-    h.get_by_label("Clear").click();
+    hover_click(&mut h, "Clear");
     pump_until(&mut h, "the slot gone", LONG, |_| !slots(&mut c).iter().any(|s| s.device.starts_with("net-out:")));
     c.call(Command::Shutdown).unwrap();
 }
@@ -778,10 +774,12 @@ fn turning_a_vasio_off_asks_first() {
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
     h.get_by_label("Devices").click();
     pump_until(&mut h, "VASIO A's Turn off", LONG, |h| h.query_by_label("Turn off VASIO A").is_some());
+    h.get_by_label("Turn off VASIO A").scroll_to_me();
+    settle(&mut h);
     h.get_by_label("Turn off VASIO A").click();
     pump_until(&mut h, "the question", LONG, |h| h.query_by_label_contains("Its routes are removed").is_some());
     assert!(slots(&mut c).iter().any(|s| s.name == "VASIO A"), "nothing happens before the answer");
-    h.get_by_label("Turn off").click();
+    hover_click(&mut h, "Turn off");
     pump_until(&mut h, "VASIO A off", LONG, |_| !slots(&mut c).iter().any(|s| s.name == "VASIO A"));
     c.call(Command::Shutdown).unwrap();
 }
@@ -805,26 +803,21 @@ fn the_meter_style_is_chosen_in_settings() {
 }
 
 #[test]
-fn devices_sit_in_bays_by_type() {
+fn devices_sit_in_sections_with_every_position_shown() {
     let d = EngineDir::new("bays");
     let _engine = Engine::spawn(&d);
     let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
     h.get_by_label("Devices").click();
-    // Descriptive titles by default…
-    pump_until(&mut h, "the bays", LONG, |h| h.query_by_label("Audio interfaces").is_some());
-    for bay in ["Windows playback & recording", "Virtual devices for DAWs", "Network streams", "Captured apps"] {
-        assert!(h.query_by_label(bay).is_some(), "{bay}");
+    pump_until(&mut h, "the sections", LONG, |h| h.query_by_label("Hardware section: full").is_some());
+    for sec in ["Windows", "Virtual", "Network", "Apps"] {
+        assert!(h.query_by_label(&format!("{sec} section: full")).is_some(), "{sec}");
     }
-    assert!(h.query_by_label("HARDWARE").is_none());
-    // …and one word each with "Short bay titles".
-    let mut prefs = h.state().prefs().clone();
-    prefs.short_bay_titles = true;
-    h.state_mut().set_prefs(prefs);
-    pump_until(&mut h, "short titles", LONG, |h| h.query_by_label("HARDWARE").is_some());
-    for bay in ["WINDOWS", "VIRTUAL", "NETWORK", "APPS"] {
-        assert!(h.query_by_label(bay).is_some(), "{bay}");
+    // No "+N more": the last position of each group has its tray.
+    for tag in ["ASIO 8", "WIN IN 8", "WIN OUT 8", "NET OUT 4", "APP 4"] {
+        assert!(h.query_by_label(&format!("{tag} \u{b7} click to choose a device")).is_some(), "{tag}");
     }
+    assert!(h.query_by_label_contains("more").is_none(), "no expanders");
     client(&d).call(Command::Shutdown).unwrap();
 }
 
@@ -837,6 +830,8 @@ fn a_device_is_renamed_on_its_card() {
     pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
     h.get_by_label("Devices").click();
     pump_until(&mut h, "VASIO A's name", LONG, |h| h.query_by_label("Rename VASIO A").is_some());
+    h.get_by_label("Rename VASIO A").scroll_to_me();
+    settle(&mut h);
     let name = h.get_by_label("Rename VASIO A");
     name.click();
     name.click();
@@ -927,9 +922,8 @@ fn a_sixteen_channel_vasio_gets_a_double_card() {
     pump_until(&mut h, "the meters", LONG, |h| h.query_by_label("Channels of VASIO B").is_some());
     settle(&mut h);
     let wide = h.get_by_label("Channels of VASIO B").rect().width();
-    let single = h.get_by_label("Channels of VASIO A").rect().width();
-    assert!(wide > 400.0, "16x16 takes a double card: its meter is {wide} wide");
-    assert!(single < 220.0, "8x8 stays single: its meter is {single} wide");
+    let narrow = h.get_by_label("Channels of VASIO A").rect().width();
+    assert!(wide > narrow + 150.0, "16x16 takes a wider tray than 8x8: {wide} vs {narrow}");
     c.call(Command::Shutdown).unwrap();
 }
 
@@ -1401,76 +1395,6 @@ fn card_of(h: &egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp
 }
 
 #[test]
-fn a_card_folds_to_a_strip_and_back() {
-    let d = EngineDir::new("fold-card");
-    let _engine = Engine::spawn(&d);
-    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
-    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
-    h.get_by_label("Devices").click();
-    pump_until(&mut h, "VASIO A's card", LONG, |h| h.query_by_label("Fold VASIO A").is_some());
-    let tall = card_of(&h, "VASIO A").height();
-    h.get_by_label("Fold VASIO A").click();
-    pump_until(&mut h, "the folded strip", LONG, |h| h.query_by_label("Unfold VASIO A").is_some());
-    settle(&mut h);
-    assert!(h.query_by_label("Channels of VASIO A").is_none(), "the meter is folded away");
-    assert!(card_of(&h, "VASIO A").height() < tall / 2.0, "a slim strip");
-    assert!(h.state().prefs().layout.folded_cards.contains("vasio:A"));
-    h.get_by_label("Unfold VASIO A").click();
-    pump_until(&mut h, "the card's meter", LONG, |h| h.query_by_label("Channels of VASIO A").is_some());
-    assert!(h.state().prefs().layout.folded_cards.is_empty());
-    client(&d).call(Command::Shutdown).unwrap();
-}
-
-#[test]
-fn a_card_moves_to_the_start_of_its_bay() {
-    let d = EngineDir::new("move-card");
-    let _engine = Engine::spawn(&d);
-    let mut c = client(&d);
-    add_vasio(&mut c, 2);
-    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
-    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
-    h.get_by_label("Devices").click();
-    pump_until(&mut h, "VASIO B's card", LONG, |h| h.query_by_label("Fold VASIO B").is_some());
-    settle(&mut h);
-    assert!(card_of(&h, "VASIO A").left() < card_of(&h, "VASIO B").left());
-    let prefix = "VASIO B \u{b7} ";
-    h.get_by(|n| n.role() == Role::Button && n.label().is_some_and(|l| l.starts_with(prefix))).click_secondary();
-    pump_until(&mut h, "the card's menu", LONG, |h| h.query_by_label("Move to start").is_some());
-    // A real pointer reaches the item before it presses it.
-    let item = h.get_by_label("Move to start").rect();
-    h.event(eframe::egui::Event::PointerMoved(item.center()));
-    h.step();
-    h.get_by_label("Move to start").click();
-    settle(&mut h);
-    assert!(card_of(&h, "VASIO B").left() < card_of(&h, "VASIO A").left(), "VASIO B leads its bay");
-    assert_eq!(
-        h.state().prefs().layout.cards.get("Virtual").and_then(|o| o.first()).map(String::as_str),
-        Some("vasio:B")
-    );
-    c.call(Command::Shutdown).unwrap();
-}
-
-#[test]
-fn a_card_is_dragged_before_another() {
-    let d = EngineDir::new("drag-card");
-    let _engine = Engine::spawn(&d);
-    let mut c = client(&d);
-    add_vasio(&mut c, 2);
-    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
-    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
-    h.get_by_label("Devices").click();
-    pump_until(&mut h, "VASIO B's card", LONG, |h| h.query_by_label("Fold VASIO B").is_some());
-    settle(&mut h);
-    let (a, b) = (card_of(&h, "VASIO A"), card_of(&h, "VASIO B"));
-    // Drag VASIO B by its sub-line (clear of its name and controls) onto VASIO A's left half.
-    let from = eframe::egui::pos2(b.center().x, b.top() + 56.0);
-    drag(&mut h, from, eframe::egui::pos2(a.left() + 20.0, a.center().y));
-    settle(&mut h);
-    assert!(card_of(&h, "VASIO B").left() < card_of(&h, "VASIO A").left(), "VASIO B was dropped before VASIO A");
-    c.call(Command::Shutdown).unwrap();
-}
-
-#[test]
 fn a_rename_box_closes_when_the_matrix_is_left() {
     let d = EngineDir::new("rename-leave");
     let _engine = Engine::spawn(&d);
@@ -1487,5 +1411,128 @@ fn a_rename_box_closes_when_the_matrix_is_left() {
     assert!(h.query_by(|n| n.placeholder() == Some("VASIO A")).is_none(), "the box closed with the matrix");
     std::thread::sleep(Duration::from_millis(300));
     assert!(slots(&mut c).iter().all(|s| s.label.is_none()), "nothing was sent");
+    c.call(Command::Shutdown).unwrap();
+}
+
+/// Opens the right-click menu of the tray tagged `tag` and clicks `item`.
+fn menu_item(h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>, tag: &str, item: &str) {
+    let prefix = format!("{tag} \u{b7} ");
+    h.get_by(|n| n.role() == Role::Button && n.label().is_some_and(|l| l.starts_with(&prefix))).click_secondary();
+    pump_until(h, "the tray's menu", LONG, |h| h.query_by_label(item).is_some());
+    // A real pointer reaches the item before it presses it.
+    let at = h.get_by_label(item).rect().center();
+    h.event(eframe::egui::Event::PointerMoved(at));
+    h.step();
+    h.get_by_label(item).click();
+}
+
+/// Moves the pointer onto `label`, then clicks it (as a real mouse does).
+fn hover_click(h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>, label: &str) {
+    let at = h.get_by_label(label).rect().center();
+    h.event(eframe::egui::Event::PointerMoved(at));
+    h.step();
+    h.get_by_label(label).click();
+}
+
+#[test]
+fn a_section_cycles_full_compact_collapsed_and_is_saved() {
+    use confluence_app::rack::SectionSize;
+    let d = EngineDir::new("section-size");
+    let _engine = Engine::spawn(&d);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "the Apps rail", LONG, |h| h.query_by_label("Apps section: full").is_some());
+    h.get_by_label("Apps section: full").scroll_to_me();
+    settle(&mut h);
+    let full = card_of(&h, "APP 1").height();
+    h.get_by_label("Apps section: full").click();
+    pump_until(&mut h, "compact", LONG, |h| h.query_by_label("Apps section: compact").is_some());
+    settle(&mut h);
+    assert!(card_of(&h, "APP 1").height() < full * 0.7, "compact trays are slimmer");
+    assert_eq!(h.state().prefs().layout.section_sizes.get("Apps"), Some(&SectionSize::Compact));
+    h.get_by_label("Apps section: compact").click();
+    pump_until(&mut h, "collapsed", LONG, |h| h.query_by_label("Apps section: collapsed").is_some());
+    settle(&mut h);
+    assert!(h.query_by_label_contains("APP 1 \u{b7} ").is_none(), "no trays while collapsed");
+    h.get_by_label("Apps section: collapsed").click();
+    pump_until(&mut h, "full again", LONG, |h| h.query_by_label("Apps section: full").is_some());
+    assert!(h.query_by_label("Windows section: full").is_some(), "other sections keep their size");
+    client(&d).call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_tray_is_picked_up_and_the_others_make_room_before_it_drops() {
+    use eframe::egui::{pos2, Event, PointerButton};
+    let d = EngineDir::new("drag-tray");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 2);
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "VASIO B's tray", LONG, |h| h.query_by_label("Turn off VASIO B").is_some());
+    h.get_by_label("Turn off VASIO B").scroll_to_me();
+    settle(&mut h);
+    let (a, b) = (card_of(&h, "VASIO A"), card_of(&h, "VASIO B"));
+    assert!(a.left() < b.left());
+    let before = slots(&mut c);
+    // Pick VASIO B up by its sub-line and carry it over VASIO A's left half.
+    let from = pos2(b.left() + 30.0, b.bottom() - 8.0);
+    let to = pos2(a.left() + 30.0, a.bottom() - 8.0);
+    let button = |pos, pressed| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    h.event(Event::PointerMoved(from));
+    h.event(button(from, true));
+    h.step();
+    for k in 1..=10 {
+        h.event(Event::PointerMoved(from + (to - from) * (k as f32 / 10.0)));
+        h.step();
+    }
+    for _ in 0..30 {
+        h.step();
+    }
+    // Held: VASIO A has slid aside to make room, nothing is saved yet.
+    assert!(card_of(&h, "VASIO A").left() > a.left() + 50.0, "the others make room while it is held");
+    assert!(!h.state().prefs().layout.cards.contains_key("vasio"), "nothing saved while held");
+    h.event(button(to, false));
+    settle(&mut h);
+    assert!(card_of(&h, "VASIO B").left() < card_of(&h, "VASIO A").left(), "dropped before VASIO A");
+    let order = h.state().prefs().layout.cards.get("vasio").cloned().unwrap_or_default();
+    assert_eq!(order.first().map(String::as_str), Some("vasio:B"), "{order:?}");
+    assert_eq!(slots(&mut c), before, "the engine is untouched");
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_network_tray_is_switched_off_and_on_and_keeps_its_route() {
+    let d = EngineDir::new("tray-off");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    let pos: confluence_api::PosId = "net-out:1".parse().unwrap();
+    let fill = Command::FillPosition { pos, kind: DeviceKind::NetSend, name: "127.0.0.1:9/Main:2".into() };
+    assert!(matches!(c.call(fill).unwrap(), Response::Added { .. }));
+    let net =
+        |c: &mut confluence_client::Client| slots(c).into_iter().find(|s| s.device.starts_with("net-out:")).unwrap();
+    let (i, o) = (add_vasio(&mut c, 2).0, net(&mut c).first_output);
+    c.call(Command::SetPoint { input: i, output: o, gain_db: 0.0, mute: false, invert: false }).unwrap();
+    let mut h = harness_sized(app_for(&d), 1600.0, 1000.0);
+    pump_until(&mut h, "Live", LONG, |h| h.query_by_label("Live").is_some());
+    h.get_by_label("Devices").click();
+    pump_until(&mut h, "NET OUT 1's pill", LONG, |h| h.query_by_label("Turn off NET OUT 1").is_some());
+    h.get_by_label("Turn off NET OUT 1").scroll_to_me();
+    settle(&mut h);
+    h.get_by_label("Turn off NET OUT 1").click();
+    pump_until(&mut h, "the stream off", LONG, |_| !net(&mut c).online);
+    assert!(engine_points(&mut c).contains(&(i, o)), "its route is kept while off");
+    assert_eq!(net(&mut c).first_output, o, "and its channels");
+    pump_until(&mut h, "its Turn on", LONG, |h| h.query_by_label("Turn on NET OUT 1").is_some());
+    hover_click(&mut h, "Turn on NET OUT 1");
+    pump_until(&mut h, "the stream back", LONG, |_| net(&mut c).online);
+    assert!(engine_points(&mut c).contains(&(i, o)), "its route is back with it");
     c.call(Command::Shutdown).unwrap();
 }

@@ -86,9 +86,10 @@ pub struct LayoutPrefs {
     pub matrix_outputs: Vec<String>,
     pub folded_inputs: BTreeSet<String>,
     pub folded_outputs: BTreeSet<String>,
-    /// Each bay's cards (by bay title), in order.
+    /// Each position group's trays on the Devices screen (by group: `win-out`), in order.
     pub cards: BTreeMap<String, Vec<String>>,
-    pub folded_cards: BTreeSet<String>,
+    /// Each Devices section's size (by its title: `Windows`).
+    pub section_sizes: BTreeMap<String, crate::rack::SectionSize>,
 }
 
 impl ViewPrefs {
@@ -144,9 +145,12 @@ mod tests {
         p.layout.matrix_inputs = vec!["pos:vasio:B".into(), "pos:vasio:A".into()];
         p.layout.folded_outputs.insert("pos:asio:1".into());
         p.layout.cards.insert("Windows".into(), vec!["win-out:2".into(), "win-out:1".into()]);
-        p.layout.folded_cards.insert("win-out:3".into());
+        p.layout.section_sizes.insert("Apps".into(), crate::rack::SectionSize::Collapsed);
         assert_eq!(ViewPrefs::from_storage(Some(&p.to_storage())), p);
         let old = ViewPrefs::from_storage(Some(r#"{"only_custom_names":true}"#));
         assert_eq!(old.layout, LayoutPrefs::default(), "older saves arrange nothing");
+        let round7 =
+            ViewPrefs::from_storage(Some(r#"{"layout":{"folded_cards":["app:1"],"cards":{"Windows":["win-out:2"]}}}"#));
+        assert_eq!(round7.layout.cards.get("Windows").map(Vec::len), Some(1), "round 7 saves still read");
     }
 }

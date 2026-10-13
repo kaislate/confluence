@@ -160,9 +160,16 @@ pub fn all_positions() -> Vec<PosId> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionStatus {
     Empty,
-    Filled { online: bool },
+    Filled {
+        online: bool,
+    },
     Off,
-    On { online: bool },
+    On {
+        online: bool,
+    },
+    /// A filled position switched off: its device is closed, its channels and
+    /// routes are kept.
+    Disabled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -124,6 +124,16 @@ enum Cmd {
         #[arg(value_parser = parse_pos)]
         pos: PosId,
     },
+    /// Switch position POS off: its device is closed, its channels and routes kept.
+    Off {
+        #[arg(value_parser = parse_pos)]
+        pos: PosId,
+    },
+    /// Switch position POS back on.
+    On {
+        #[arg(value_parser = parse_pos)]
+        pos: PosId,
+    },
     /// Turn VASIO LETTER on (with the DAW's inputs x outputs, e.g. 16x4) or off.
     Vasio {
         #[arg(value_parser = parse_vasio_letter)]
@@ -299,6 +309,8 @@ impl Cmd {
             Cmd::Watch | Cmd::Positions => Command::Subscribe,
             Cmd::Fill { pos, kind, ref name } => Command::FillPosition { pos, kind: kind.into(), name: name.clone() },
             Cmd::Clear { pos } => Command::ClearPosition { pos },
+            Cmd::Off { pos } => Command::SetEnabled { pos, on: false },
+            Cmd::On { pos } => Command::SetEnabled { pos, on: true },
             Cmd::Vasio { letter, state, shape } => {
                 let on = matches!(state, OnOff::On);
                 Command::SetVirtual { pos: letter, on, shape: shape.filter(|_| on) }
@@ -341,7 +353,7 @@ fn render_positions(positions: &[confluence_api::PositionState]) -> String {
                 PositionStatus::Empty => "Empty".to_string(),
                 PositionStatus::Filled { online: true } => "Filled".into(),
                 PositionStatus::Filled { online: false } => "Filled (offline)".into(),
-                PositionStatus::Off => "Off".into(),
+                PositionStatus::Off | PositionStatus::Disabled => "Off".into(),
                 PositionStatus::On { online } => match (&p.daw, online) {
                     (Some(daw), _) => format!("On (DAW: {daw})"),
                     (None, true) => "On (connected)".into(),
@@ -884,6 +896,11 @@ asio:1     Filled  GoXLR ASIO Driver  slots [1, 2]  MASTER"
         assert_eq!(parse(&["master", "internal"]).unwrap(), Command::SetMaster { pos: None });
         assert_eq!(parse(&["clear-clip"]).unwrap(), Command::ClearClip);
         assert!(parse(&["clear", "asio:9"]).is_err());
+        assert_eq!(
+            parse(&["off", "win-out:3"]).unwrap(),
+            Command::SetEnabled { pos: "win-out:3".parse().unwrap(), on: false }
+        );
+        assert_eq!(parse(&["on", "asio:2"]).unwrap(), Command::SetEnabled { pos: "asio:2".parse().unwrap(), on: true });
     }
 
     #[test]

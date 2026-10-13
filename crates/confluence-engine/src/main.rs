@@ -517,10 +517,18 @@ mod app {
                         Err(e) => Response::Error(e),
                     };
                 }
-                Command::AddDevice { .. } | Command::FillPosition { .. } => {
+                Command::AddDevice { .. } | Command::FillPosition { .. } | Command::SetEnabled { on: true, .. }
+                    if !matches!(cmd, Command::SetEnabled { pos, .. } if pos.group.is_virtual()) =>
+                {
                     let begun = {
                         let mut s = lock(state);
                         match cmd {
+                            // Back on: its driver is loaded outside the lock too.
+                            Command::SetEnabled { pos, .. } => match s.devices.begin_enable(*pos) {
+                                Ok(Some(p)) => Ok(p),
+                                Ok(None) => return Response::Ok,
+                                Err(e) => Err(e),
+                            },
                             Command::FillPosition { pos, kind, name } if !pos.group.is_virtual() => {
                                 s.devices.begin_fill(Some(*pos), *kind, name)
                             }
@@ -557,9 +565,17 @@ mod app {
                                 return Response::Error(format!("applied but not saved: {e}"));
                             }
                             let version = publish(&mut s);
-                            Response::Added { ids, version }
+                            if matches!(cmd, Command::SetEnabled { .. }) {
+                                Response::Applied { version }
+                            } else {
+                                Response::Added { ids, version }
+                            }
                         }
-                        Err(e) => Response::Error(e),
+                        Err(e) => {
+                            // Still offline (no longer off): show it.
+                            publish(&mut s);
+                            Response::Error(e)
+                        }
                     };
                 }
                 _ => {}
@@ -588,6 +604,7 @@ mod app {
                     Command::RemoveSlot { .. }
                     | Command::ClearPosition { .. }
                     | Command::SetVirtual { .. }
+                    | Command::SetEnabled { .. }
                     | Command::SetMaster { .. } => journal.compact(&state_commands(engine)),
                     _ if cmd.is_mutation() => journal.append(&journal_form(engine, cmd)),
                     _ => Ok(()),
@@ -602,6 +619,7 @@ mod app {
                         Command::RemoveSlot { .. }
                             | Command::ClearPosition { .. }
                             | Command::SetVirtual { .. }
+                            | Command::SetEnabled { .. }
                             | Command::SetMaster { .. }
                     )
                 {

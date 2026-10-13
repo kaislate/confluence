@@ -107,6 +107,11 @@ pub enum Edit {
     ClearPosition {
         pos: confluence_api::PosId,
     },
+    /// Switch a filled position off (routes kept) or on.
+    SetEnabled {
+        pos: confluence_api::PosId,
+        on: bool,
+    },
     SetVirtual {
         pos: confluence_api::PosId,
         on: bool,
@@ -174,6 +179,7 @@ impl Edit {
             }
             Edit::ClearPosition { pos } => Command::ClearPosition { pos: *pos },
             Edit::SetVirtual { pos, on, shape } => Command::SetVirtual { pos: *pos, on: *on, shape: *shape },
+            Edit::SetEnabled { pos, on } => Command::SetEnabled { pos: *pos, on: *on },
             Edit::SetMaster { pos } => Command::SetMaster { pos: *pos },
             Edit::ClearClip => Command::ClearClip,
             Edit::SetSlotLabel { id, channel, name } => {

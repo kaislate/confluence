@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use confluence_api::{
     all_positions, ClockRole, Command, DeviceInfo, DeviceKind, PosGroup, PosId, PositionDevice, PositionState,
@@ -114,6 +114,9 @@ struct SavedPosition {
     on: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shape: Option<(u32, u32)>,
+    /// A filled position switched off (its device is not opened).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    off: bool,
     /// The device and its channel placement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     binding: Option<Binding>,
@@ -444,6 +447,8 @@ pub struct DeviceManager {
     /// The position of the master running now (the flag may name another
     /// for the next start).
     master_now: Option<PosId>,
+    /// Filled positions switched off: their devices stay closed (spec: round 8 §5).
+    off: BTreeSet<PosId>,
 }
 
 impl DeviceManager {
@@ -474,6 +479,7 @@ impl DeviceManager {
             migration_notes: Vec::new(),
             color_rekeys: Vec::new(),
             master_now: None,
+            off: BTreeSet::new(),
         }
     }
 
@@ -565,6 +571,9 @@ impl DeviceManager {
                         }
                     }
                 } else if let Some(b) = sp.binding {
+                    if sp.off {
+                        m.off.insert(sp.pos);
+                    }
                     m.restore_list.push((Some(sp.pos), b));
                 }
             }
@@ -924,6 +933,10 @@ impl DeviceManager {
             return Err(e);
         }
         bound.pos = pos;
+        // A device put into a switched-off position plays: the position is on.
+        if let Some(p) = pos {
+            self.off.remove(&p);
+        }
         Self::key_colours(engine, &bound);
         let ids = bound.slots.clone();
         self.bound.push(bound);
@@ -1044,6 +1057,9 @@ impl DeviceManager {
     pub fn remove(&mut self, engine: &mut Engine, slot: u32) -> Result<bool, String> {
         let Some(i) = self.bound.iter().position(|b| b.slots.contains(&slot)) else { return Ok(false) };
         let b = self.bound.remove(i);
+        if let Some(p) = b.pos {
+            self.off.remove(&p);
+        }
         self.unplaced.retain(|u| !same_device(u, b.binding.kind, &b.binding.name));
         if let Some(p) = b.pos.filter(|p| p.group.is_virtual()) {
             let _ = self.table.set_virtual(p, false, None);
@@ -1077,6 +1093,21 @@ impl DeviceManager {
                 continue;
             }
             let pos = pos.or_else(|| self.default_pos(&b));
+            if pos.is_some_and(|p| self.off.contains(&p)) {
+                // Switched off: its channels are held, its device stays closed.
+                match Self::park_offline(engine, b.clone()) {
+                    Ok(mut parked) => {
+                        parked.pos = pos;
+                        Self::key_colours(engine, &parked);
+                        self.bound.push(parked);
+                    }
+                    Err(e) => {
+                        warnings.push(e);
+                        self.unplaced.push(b);
+                    }
+                }
+                continue;
+            }
             let net = self.net.as_ref().map(NetCtx::snapshot);
             let opened = load(&self.asio_open, b.kind, &b.name, b.endpoint_id.as_deref(), net.as_ref())
                 .and_then(|loaded| self.attach(engine, b.kind, &b.name, Some(&b), loaded))
@@ -1216,8 +1247,75 @@ impl DeviceManager {
         Ok(ids)
     }
 
+    /// Switches filled position `pos` off (its device closed; its position,
+    /// channels and routes kept, like an app that exited) or back on. A
+    /// virtual position turns on or off as with [`set_virtual`](Self::set_virtual).
+    pub fn set_enabled(&mut self, engine: &mut Engine, pos: PosId, on: bool) -> Result<(), String> {
+        if pos.group.is_virtual() {
+            return self.set_virtual(engine, pos, on, None).map(|_| ());
+        }
+        if self.master_now == Some(pos) && self.master.is_some() {
+            return Err(format!("{} is the master clock: it cannot be switched off", pos.label()));
+        }
+        if self.reserved.iter().any(|(_, _, r)| *r == pos) {
+            return Err(format!("{} is being filled", pos.label()));
+        }
+        let Some(i) = self.bound.iter().position(|b| b.pos == Some(pos)) else {
+            return Err(format!("{} is empty", pos.label()));
+        };
+        if on {
+            let _ = i;
+            // A device that cannot be opened stays offline (not off), as a missing one.
+            return match self.begin_enable(pos)? {
+                Some(pending) => self.finish_add(engine, pending.load()).map(|_| ()),
+                None => Ok(()),
+            };
+        }
+        if !self.off.insert(pos) {
+            return Ok(());
+        }
+        if !self.bound[i].handles.is_empty() {
+            let Bound { binding, slots, handles, pos: at } = self.bound.remove(i);
+            drop(handles); // stop the device before its slots are detached
+            for id in &slots {
+                let _ = engine.detach_slot(*id);
+            }
+            match Self::park_offline(engine, binding.clone()) {
+                Ok(mut parked) => {
+                    parked.pos = at;
+                    Self::key_colours(engine, &parked);
+                    self.bound.push(parked);
+                }
+                Err(e) => {
+                    self.unplaced.push(binding);
+                    self.off.remove(&pos);
+                    let _ = self.save();
+                    return Err(e);
+                }
+            }
+        }
+        self.save()
+    }
+
+    /// First step of switching non-virtual position `pos` back on: it is no
+    /// longer off (saved), and its device is reserved to be opened as for a
+    /// fill (`None`: it was not off). Load it without the engine lock, then
+    /// [`finish_add`](Self::finish_add) (or attach, start and commit).
+    pub fn begin_enable(&mut self, pos: PosId) -> Result<Option<PendingAdd>, String> {
+        let Some(b) = self.bound.iter().find(|b| b.pos == Some(pos)) else {
+            return Err(format!("{} is empty", pos.label()));
+        };
+        let (kind, name) = (b.binding.kind, b.binding.name.clone());
+        if !self.off.remove(&pos) {
+            return Ok(None);
+        }
+        self.save()?;
+        self.begin_fill(Some(pos), kind, &name).map(Some)
+    }
+
     /// Empties position `pos`: its device is closed and its routes removed.
     pub fn clear_position(&mut self, engine: &mut Engine, pos: PosId) -> Result<(), String> {
+        self.off.remove(&pos);
         if pos.group.is_virtual() {
             return self.set_virtual(engine, pos, false, None).map(|_| ());
         }
@@ -1272,7 +1370,12 @@ impl DeviceManager {
                     let status = if on { PositionStatus::On { online } } else { PositionStatus::Off };
                     (status, v.map(|v| v.shape), device, ids)
                 } else if let Some(b) = b {
-                    (PositionStatus::Filled { online: !b.handles.is_empty() }, None, device, ids)
+                    let status = if self.off.contains(&pos) {
+                        PositionStatus::Disabled
+                    } else {
+                        PositionStatus::Filled { online: !b.handles.is_empty() }
+                    };
+                    (status, None, device, ids)
                 } else if Some(pos) == self.master_now && self.master.is_some() {
                     let m =
                         self.master.as_ref().map(|m| PositionDevice { kind: DeviceKind::Asio, name: m.name.clone() });
@@ -1296,6 +1399,7 @@ impl DeviceManager {
             .bound
             .iter()
             .filter(|b| b.handles.is_empty() && matches!(b.binding.kind, DeviceKind::NetSend | DeviceKind::NetReceive))
+            .filter(|b| !b.pos.is_some_and(|p| self.off.contains(&p)))
             .filter(|b| {
                 parse_net(&b.binding.name).is_ok_and(|n| peers.iter().any(|p| p.name.eq_ignore_ascii_case(&n.peer)))
             })
@@ -1332,6 +1436,7 @@ impl DeviceManager {
             .bound
             .iter()
             .filter(|b| b.binding.kind == DeviceKind::AppCapture)
+            .filter(|b| !b.pos.is_some_and(|p| self.off.contains(&p)))
             .filter(|b| !self.app_retry_failed.iter().any(|(n, _)| *n == b.binding.name))
             .map(|b| AppCaptureState {
                 name: b.binding.name.clone(),
@@ -1441,6 +1546,10 @@ impl DeviceManager {
                 Ok(_) => Response::Ok,
                 Err(e) => Response::Error(e),
             },
+            Command::SetEnabled { pos, on } => match self.set_enabled(engine, *pos, *on) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e),
+            },
             Command::SetMaster { pos } => match self.set_master_pos(*pos) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error(e),
@@ -1531,6 +1640,7 @@ impl DeviceManager {
                         pos,
                         on: v.map(|v| v.on),
                         shape: v.map(|v| v.shape),
+                        off: self.off.contains(&pos),
                         binding: Some(b.binding.clone()),
                     });
                 }
@@ -1540,7 +1650,13 @@ impl DeviceManager {
         // Devices read but not restored yet (e.g. saved before restore ran).
         for (pos, b) in &self.restore_list {
             if let Some(pos) = pos.filter(|p| !positions.iter().any(|q| q.pos == *p)) {
-                positions.push(SavedPosition { pos, on: None, shape: None, binding: Some(b.clone()) });
+                positions.push(SavedPosition {
+                    pos,
+                    on: None,
+                    shape: None,
+                    off: self.off.contains(&pos),
+                    binding: Some(b.clone()),
+                });
             }
         }
         for (pos, v) in self.table.virtuals() {
@@ -1549,6 +1665,7 @@ impl DeviceManager {
                     pos,
                     on: Some(v.on),
                     shape: Some(v.shape),
+                    off: false,
                     binding: self.virtual_at.get(&pos).cloned(),
                 });
             }
