@@ -63,6 +63,35 @@ pub struct GridState {
     pub strip_drag: Option<(bool, String)>,
     /// Where it would land if let go now (an insertion point among the bands).
     pub strip_drop: Option<usize>,
+    /// The name being typed for a device or channel.
+    pub renaming: Option<Rename>,
+}
+
+/// A device or channel being renamed in place.
+pub struct Rename {
+    pub slot: u32,
+    /// The channel, or `None` for the device.
+    pub channel: Option<confluence_api::ChannelRef>,
+    pub text: String,
+    /// Its custom name when the box opened.
+    pub original: Option<String>,
+    /// Its own name, shown while the box is empty.
+    pub hint: String,
+    /// Where the box sits.
+    pub at: Rect,
+    focused: bool,
+}
+
+impl Rename {
+    fn new(
+        slot: u32,
+        channel: Option<confluence_api::ChannelRef>,
+        custom: Option<String>,
+        hint: String,
+        at: Rect,
+    ) -> Self {
+        Rename { slot, channel, text: custom.clone().unwrap_or_default(), original: custom, hint, at, focused: false }
+    }
 }
 
 /// Pixels of touchpad (point-unit) scrolling per gain step.
@@ -387,7 +416,8 @@ pub fn show(
                 );
                 let hit = strip.intersect(top);
                 if hit.is_positive() {
-                    strip_interact(ui, hit, band, false, &name, gs, &mut actions);
+                    let at = Rect::from_min_size(hit.left_top() + Vec2::new(0.0, 4.0), Vec2::new(200.0, 22.0));
+                    strip_interact(ui, hit, at, band, false, &name, editable, gs, &mut actions);
                 }
                 let chev = Rect::from_min_size(
                     Pos2::new(strip.left() + 2.0, strip.bottom() - SEP + 2.0),
@@ -410,6 +440,12 @@ pub fn show(
                             band,
                         )
                     } else {
+                        let hit = Rect::from_min_max(
+                            Pos2::new(x - cell / 2.0, top.min.y + 4.0),
+                            Pos2::new(x + cell / 2.0, top.max.y - 2.0),
+                        );
+                        let at = Rect::from_min_size(Pos2::new(x - 10.0, top.max.y - 28.0), Vec2::new(200.0, 22.0));
+                        channel_label(ui, hit.intersect(top), at, band, k, false, editable, gs);
                         channel_text(band, k, if band.bus { "send" } else { "out" })
                     };
                     rotated(
@@ -449,7 +485,7 @@ pub fn show(
                 );
                 let hit = strip.intersect(left);
                 if hit.is_positive() {
-                    strip_interact(ui, hit, band, true, &name, gs, &mut actions);
+                    strip_interact(ui, hit, strip, band, true, &name, editable, gs, &mut actions);
                 }
                 let chev = Rect::from_min_size(strip.min + Vec2::splat(2.0), Vec2::splat(SEP - 4.0));
                 if fold_chevron(ui, &painter, chev.intersect(left), band, "inputs", skins::ink_on(colour)) {
@@ -465,6 +501,15 @@ pub fn show(
                         let r = Rect::from_center_size(Pos2::new(left.center().x, y), Vec2::new(HEADER_W - 16.0, cell));
                         folded_text(ui, r.intersect(left), band)
                     } else {
+                        let hit = Rect::from_min_max(
+                            Pos2::new(left.min.x + 8.0, y - cell / 2.0),
+                            Pos2::new(left.max.x - 4.0, y + cell / 2.0),
+                        );
+                        let at = Rect::from_min_size(
+                            Pos2::new(left.min.x + 6.0, y - 11.0),
+                            Vec2::new(HEADER_W - 10.0, 22.0),
+                        );
+                        channel_label(ui, hit.intersect(left), at, band, k, true, editable, gs);
                         channel_text(band, k, if band.bus { "return" } else { "in" })
                     };
                     paint::truncated(
@@ -479,6 +524,7 @@ pub fn show(
                 }
             }
         }
+        rename_box(ui.ctx(), layout, gs, &mut actions);
         // A drag let go away from its strip (scrolled off) lands nowhere.
         if gs.strip_drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
             gs.strip_drag = None;
@@ -722,17 +768,99 @@ fn folded_cell(
     }
 }
 
-/// A band's strip: a click selects its slot, a drag moves the band, and its
-/// menu folds, moves and renames.
+/// The box a device or channel is renamed in: Enter or clicking away keeps
+/// the name (an empty one puts the device's own back), Esc leaves it as it was.
+fn rename_box(ctx: &egui::Context, layout: &GridLayout, gs: &mut GridState, actions: &mut GridActions) {
+    let Some(r) = gs.renaming.as_mut() else { return };
+    if layout.rows.band(r.slot).is_none() && layout.cols.band(r.slot).is_none() {
+        gs.renaming = None; // the device went away
+        return;
+    }
+    let mut done = None;
+    egui::Area::new(Id::new("matrix-rename")).order(egui::Order::Foreground).fixed_pos(r.at.min).show(ctx, |ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut r.text)
+                .hint_text(r.hint.clone())
+                .char_limit(confluence_api::MAX_LABEL)
+                .desired_width(r.at.width().clamp(160.0, 260.0)),
+        );
+        if !r.focused {
+            field.request_focus();
+            r.focused = true;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            done = Some(false);
+        } else if field.lost_focus() {
+            done = Some(true);
+        }
+    });
+    let Some(keep) = done else { return };
+    if let Some(r) = gs.renaming.take().filter(|_| keep) {
+        let name = Some(r.text.trim().to_string()).filter(|n| !n.is_empty());
+        if name != r.original {
+            actions.edits.push(Edit::SetSlotLabel { id: r.slot, channel: r.channel, name });
+        }
+    }
+}
+
+/// A channel's name in the margin: double-click it (or use its menu) to rename it.
+#[allow(clippy::too_many_arguments)]
+fn channel_label(
+    ui: &mut egui::Ui,
+    hit: Rect,
+    at: Rect,
+    band: &Band,
+    k: u32,
+    input: bool,
+    editable: bool,
+    gs: &mut GridState,
+) {
+    if !hit.is_positive() {
+        return;
+    }
+    let word = match (input, band.bus) {
+        (true, false) => "in",
+        (true, true) => "return",
+        (false, false) => "out",
+        (false, true) => "send",
+    };
+    let what = format!("{} {word} {}", band.name, k + 1);
+    let resp = ui.interact(hit, Id::new(("channel-name", input, band.slot, k)), Sense::click());
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, editable, &what));
+    if !editable {
+        return;
+    }
+    let mut open = resp.double_clicked();
+    resp.context_menu(|ui| {
+        if ui.button("Rename\u{2026}").clicked() {
+            open = true;
+            ui.close();
+        }
+    });
+    if open {
+        let custom = band.channel_labels.get(k as usize).cloned().flatten();
+        let own = band.channel_names.get(k as usize).cloned().filter(|n| !n.trim().is_empty());
+        let hint = own.unwrap_or_else(|| format!("{word} {}", k + 1));
+        let channel = Some(confluence_api::ChannelRef { input, index: k });
+        gs.renaming = Some(Rename::new(band.slot, channel, custom, hint, at));
+    }
+}
+
+/// A band's strip: a click selects its slot, a drag moves the band, a
+/// double-click renames the device, and its menu folds, moves and renames.
+#[allow(clippy::too_many_arguments)]
 fn strip_interact(
     ui: &mut egui::Ui,
     hit: Rect,
+    at: Rect,
     band: &Band,
     input: bool,
     name: &str,
+    editable: bool,
     gs: &mut GridState,
     actions: &mut GridActions,
 ) {
+    let mut rename = false;
     let side = if input { "inputs" } else { "outputs" };
     let id = Id::new((if input { "band-in" } else { "band-out" }, band.slot));
     let resp = ui.interact(hit, id, Sense::click_and_drag());
@@ -740,6 +868,7 @@ fn strip_interact(
     if resp.clicked() {
         actions.select = Some(Selection::Slot(band.slot));
     }
+    rename |= resp.double_clicked();
     if resp.drag_started() {
         gs.strip_drag = Some((input, band.key.clone()));
         gs.strip_drop = None;
@@ -754,6 +883,10 @@ fn strip_interact(
     let (first, last) = if input { ("Move to top", "Move to bottom") } else { ("Move to start", "Move to end") };
     let resp = resp.on_hover_text(format!("{name}: {} {side}", band.channels));
     resp.context_menu(|ui| {
+        if editable && ui.button("Rename\u{2026}").clicked() {
+            rename = true;
+            ui.close();
+        }
         if ui.button(if band.folded { "Unfold" } else { "Fold" }).clicked() {
             actions.fold.push((input, band.key.clone()));
             ui.close();
@@ -776,6 +909,10 @@ fn strip_interact(
             ui.close();
         }
     });
+    if rename && editable {
+        let custom = (band.name != band.own_name).then(|| band.name.clone());
+        gs.renaming = Some(Rename::new(band.slot, None, custom, band.own_name.clone(), at));
+    }
 }
 
 /// The fold chevron on a band's strip (pointing down while open, along the
@@ -932,6 +1069,7 @@ mod tests {
     #[test]
     fn a_channel_shows_its_number_and_name() {
         let band = Band {
+            own_name: "GoXLR".into(),
             slot: 1,
             key: "pos:asio:1".into(),
             folded: false,

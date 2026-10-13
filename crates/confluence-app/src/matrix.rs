@@ -29,6 +29,8 @@ pub struct Band {
     pub folded: bool,
     /// The device's custom name if it has one, else the slot's name.
     pub name: String,
+    /// The slot's own name, whatever it is called.
+    pub own_name: String,
     /// Custom names of its channels in this direction (one per channel).
     pub channel_labels: Vec<Option<String>>,
     /// The device's own names for those channels ("Front L", "DAW out 1").
@@ -128,6 +130,7 @@ impl Axis {
                 color: s.color,
                 slot: s.id,
                 name: s.label.clone().unwrap_or_else(|| s.name.clone()),
+                own_name: s.name.clone(),
                 channel_labels,
                 channel_names,
                 online: s.online,

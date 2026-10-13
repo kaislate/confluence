@@ -1315,3 +1315,76 @@ fn a_band_is_dragged_to_a_new_place_and_the_order_is_saved() {
     assert!(x(&h, bo) < x(&h, ao), "VASIO A's outputs went to the end");
     c.call(Command::Shutdown).unwrap();
 }
+
+/// Double-clicks the node labelled `label`, past egui's double-click window
+/// from any click before.
+fn double_click(h: &mut egui_kittest::Harness<'static, confluence_app::app::ConfluenceApp>, label: &str) {
+    for _ in 0..40 {
+        h.step();
+    }
+    let node = h.get_by_label(label);
+    node.click();
+    node.click();
+}
+
+#[test]
+fn a_device_is_renamed_from_its_matrix_strip() {
+    let d = EngineDir::new("rename-strip");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 1);
+    let mut h = harness_fast(app_for(&d));
+    pump_until(&mut h, "the strip", LONG, |h| h.query_by_label("VASIO A inputs").is_some());
+    double_click(&mut h, "VASIO A inputs");
+    pump_until(&mut h, "the name box", LONG, |h| h.query_by(|n| n.placeholder() == Some("VASIO A")).is_some());
+    h.get_by(|n| n.placeholder() == Some("VASIO A")).type_text("Ableton");
+    h.key_press(eframe::egui::Key::Enter);
+    pump_until(&mut h, "the name in the engine", LONG, |_| {
+        slots(&mut c).iter().any(|s| s.name == "VASIO A" && s.label.as_deref() == Some("Ableton"))
+    });
+    pump_until(&mut h, "the name on the strip", LONG, |h| h.query_by_label("Ableton inputs").is_some());
+    // An empty name puts the device's own back.
+    double_click(&mut h, "Ableton inputs");
+    pump_until(&mut h, "the name box with the name in it", LONG, |h| {
+        h.query_by(|n| n.role() == Role::TextInput && n.value().as_deref() == Some("Ableton")).is_some()
+    });
+    for _ in 0.."Ableton".len() {
+        h.key_press(eframe::egui::Key::Backspace);
+    }
+    h.key_press(eframe::egui::Key::Enter);
+    pump_until(&mut h, "the name cleared", LONG, |_| {
+        slots(&mut c).iter().any(|s| s.name == "VASIO A" && s.label.is_none())
+    });
+    c.call(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn a_channel_is_renamed_from_the_matrix_margin() {
+    let d = EngineDir::new("rename-margin");
+    let _engine = Engine::spawn(&d);
+    let mut c = client(&d);
+    add_vasio(&mut c, 1);
+    let mut h = harness_fast(app_for(&d));
+    pump_until(&mut h, "the channel's name", LONG, |h| h.query_by_label("VASIO A in 1").is_some());
+    double_click(&mut h, "VASIO A in 1");
+    pump_until(&mut h, "the name box", LONG, |h| h.query_by(|n| n.placeholder() == Some("DAW out 1")).is_some());
+    h.get_by(|n| n.placeholder() == Some("DAW out 1")).type_text("Kick");
+    h.key_press(eframe::egui::Key::Enter);
+    pump_until(&mut h, "the channel name in the engine", LONG, |_| {
+        slots(&mut c)
+            .iter()
+            .any(|s| s.name == "VASIO A" && s.input_labels.first().cloned().flatten().as_deref() == Some("Kick"))
+    });
+    // Esc leaves a name as it was.
+    double_click(&mut h, "VASIO A out 2");
+    pump_until(&mut h, "the output's name box", LONG, |h| {
+        h.query_by(|n| n.placeholder() == Some("DAW in 2")).is_some()
+    });
+    h.get_by(|n| n.placeholder() == Some("DAW in 2")).type_text("Nope");
+    h.key_press(eframe::egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.query_by(|n| n.placeholder() == Some("DAW in 2")).is_none(), "the box closed");
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(slots(&mut c).iter().all(|s| s.output_labels.iter().all(|l| l.is_none())), "nothing sent");
+    c.call(Command::Shutdown).unwrap();
+}
