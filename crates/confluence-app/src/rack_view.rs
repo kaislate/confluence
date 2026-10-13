@@ -147,6 +147,9 @@ pub fn show_sections(
     let cols = rack::columns(bed_w);
     let col_w = rack::col_width(bed_w, cols);
     for sec in &secs {
+        if prefs.layout.hidden_sections.contains(sec.bay.title()) {
+            continue;
+        }
         let size = size_of(prefs, sec.bay);
         let full_w = ui.available_width();
         let Some(tray_h) = size.tray_h() else {
@@ -188,7 +191,8 @@ pub fn show_sections(
         let plate = Rect::from_min_size(Pos2::new(left, band.top()), Vec2::new(width, plate_h));
         let rail = Rect::from_min_size(plate.min + Vec2::new(PAD, PAD), Vec2::new(RAIL_W, bed_h));
         let bed = Rect::from_min_max(Pos2::new(rail.right() + PAD, rail.top()), plate.max - Vec2::new(PAD, PAD));
-        let p = ui.painter_at(plate.expand(4.0));
+        // Room for the plate's light and shadow (clipped close, their corners show square).
+        let p = ui.painter_at(plate.expand(40.0));
         paint::panel(&p, plate, base, None);
         rail_face(ui, rail, sec.bay, size, base, prefs);
         paint::recess(&p, bed.expand(3.0), base, 8);
@@ -246,21 +250,15 @@ pub fn show_sections(
                 prefs.layout.cards.insert(d.group.clone(), d.order.clone());
                 st.tray_drag = None;
             } else {
-                // Where it would drop: the slot nearest the tray's centre.
-                let keys = d.order.clone();
-                let centre = at.center() - bed.min.to_vec2();
-                let order = rack::candidate(&keys, &d.pos.to_string(), centre, |o: &[String]| {
-                    let mut gs = groups.clone();
-                    for (k, g) in gs.iter_mut() {
-                        if *k == d.group {
-                            g.sort_by_key(|q| o.iter().position(|x| *x == q.pos.to_string()));
-                        }
-                    }
-                    let (all, _) = layout_of(&gs, Pos2::ZERO);
-                    o.iter()
-                        .filter_map(|k| all.iter().find(|(pos, _)| pos.to_string() == *k).map(|(_, r)| *r))
-                        .collect()
-                });
+                // Where it would drop: beside the tray under the pointer, as shown now.
+                let (all, _) = layout_of(&groups, bed.min);
+                let rects: Vec<Rect> = d
+                    .order
+                    .iter()
+                    .map(|k| all.iter().find(|(pos, _)| pos.to_string() == *k).map_or(Rect::NOTHING, |(_, r)| *r))
+                    .collect();
+                let at_ptr = pointer.unwrap_or(at.center());
+                let order = rack::drop_order(&d.order, &d.pos.to_string(), &rects, at_ptr);
                 if let Some(t) = st.tray_drag.as_mut() {
                     t.order = order;
                 }
@@ -315,7 +313,7 @@ fn upward(p: &egui::Painter, bottom: Pos2, text: &str, base: &GearSkin, room: f3
 
 /// A collapsed section: one band, its name and how many positions are in use.
 fn collapsed(ui: &mut egui::Ui, r: Rect, sec: &SectionView, base: &GearSkin, prefs: &mut ViewPrefs) {
-    let p = ui.painter_at(r.expand(4.0));
+    let p = ui.painter_at(r.expand(40.0));
     paint::panel(&p, r, base, None);
     let total = sec.trays().count();
     let used = sec.trays().filter(|t| !crate::bays::vacant(t)).count();
@@ -421,7 +419,7 @@ fn tray(
     let enabled = ui.is_enabled();
     let label = card_label(&f, empty);
     resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &label));
-    let painter = ui.painter_at(r.expand(12.0));
+    let painter = ui.painter_at(r.expand(36.0));
     if empty {
         empty_slot(ui, &painter, r, &f.tag, size, base, resp.hovered(), motion, id);
         if resp.clicked() {
@@ -472,12 +470,28 @@ fn tray(
     };
     let glow = motion.phosphor(id.with("led"), want, PHOSPHOR_TAU) * bloom;
     paint::led_glow(&painter, led_at, &skin, f.led.unwrap_or(Color32::GRAY), glow);
-    if f.led.is_some() {
-        let led = ui.interact(Rect::from_center_size(led_at, Vec2::splat(12.0)), id.with("led"), Sense::click());
-        led.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, format!("Clear clips {}", p.pos.label())));
-        if led.clicked() {
-            actions.push(ScreenAction::Edit(Edit::ClearClip));
+    // The LED is the tray's power switch (asking first where routes would go);
+    // the master clock is always on.
+    let led = ui.interact(Rect::from_center_size(led_at, Vec2::splat(14.0)), id.with("led"), Sense::click());
+    if !p.master || p.pos.group.is_virtual() {
+        let label = p.pos.label();
+        let what = if off { format!("Turn on {label}") } else { format!("Turn off {label}") };
+        led.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
+        if led.hovered() {
+            painter.circle_stroke(led_at, 7.0, Stroke::new(1.0, paint::alpha(skin.ink, 0.5)));
         }
+        if led.on_hover_text(if off { "Turn on" } else { "Turn off" }).clicked() {
+            if off {
+                st.just_filled.insert(p.pos);
+                actions.push(ScreenAction::Edit(switch_edit(p, true)));
+            } else if p.pos.group.is_virtual() {
+                st.confirm = Some(Confirm { pos: p.pos, clear: false, at: now });
+            } else {
+                actions.push(ScreenAction::Edit(switch_edit(p, false)));
+            }
+        }
+    } else {
+        led.on_hover_text("The master clock is always on");
     }
     let tag_r = paint::tag(&painter, led_at + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, &f.tag, &skin, 0.78);
     let mut x = tag_r.right() + 6.0;
@@ -485,7 +499,8 @@ fn tray(
     if compact {
         strip_left = x;
     } else {
-        if p.master {
+        // Pills only where they fit before the meter window.
+        if p.master && x + 52.0 <= m.left() + info_w {
             let gold = Color32::from_rgb(0xf3, 0xc2, 0x4f);
             let (pr, _) = mini_pill(
                 ui,
@@ -498,36 +513,6 @@ fn tray(
                 None,
             );
             x = pr.right() + 4.0;
-        }
-        // The ON/OFF pill switches the tray (asking first where routes would go).
-        let label = p.pos.label();
-        let (text, what) = if off { ("OFF", format!("Turn on {label}")) } else { ("ON", format!("Turn off {label}")) };
-        let (fill, ink) = if off {
-            (Color32::from_rgb(0x2e, 0x30, 0x35), Color32::from_rgb(0x9a, 0x9d, 0xa4))
-        } else {
-            (Color32::from_rgb(0x1f, 0x5d, 0x36), Color32::from_rgb(0x9d, 0xf0, 0xb9))
-        };
-        let can_switch = !p.master || p.pos.group.is_virtual();
-        let (pr, clicked) = mini_pill(
-            ui,
-            &painter,
-            Pos2::new(x, row1),
-            text,
-            fill,
-            ink,
-            id.with("onoff"),
-            can_switch.then_some(what.as_str()),
-        );
-        x = pr.right() + 4.0;
-        if clicked {
-            if off {
-                st.just_filled.insert(p.pos);
-                actions.push(ScreenAction::Edit(switch_edit(p, true)));
-            } else if p.pos.group.is_virtual() {
-                st.confirm = Some(Confirm { pos: p.pos, clear: false, at: now });
-            } else {
-                actions.push(ScreenAction::Edit(switch_edit(p, false)));
-            }
         }
         if let (Some((ins, outs)), PosGroup::Vasio, false) = (p.shape, p.pos.group, off) {
             let text = format!("{outs}\u{d7}{ins}");
@@ -549,6 +534,8 @@ fn tray(
         Pos2::new(strip_left, name_y - if compact { 8.0 } else { 9.5 }),
         Vec2::new((gal.size().x + 14.0).min(room), if compact { 16.0 } else { 19.0 }),
     );
+    // Parts of the tray drawn over it (strip, meter): its menu opens from them too.
+    let mut parts: Vec<egui::Response> = Vec::new();
     let renaming = st.renaming.as_ref().is_some_and(|(pos, _)| *pos == p.pos);
     if virtual_off {
         paint::truncated(
@@ -580,6 +567,7 @@ fn tray(
         );
         if !p.slots.is_empty() {
             let name_resp = ui.interact(strip, id.with("name"), Sense::click());
+            parts.push(name_resp.clone());
             let what = format!("Rename {}", p.pos.label());
             name_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
             if name_resp.clicked() {
@@ -651,6 +639,7 @@ fn tray(
             }
             let mw =
                 crate::gear::oled_meter::meter_widget(ui, id.with("meter"), mrect, &groups, &geom, prefs.meter, motion);
+            parts.push(mw.response.clone());
             let what = format!("Channels of {}", p.pos.label());
             mw.response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &what));
             if mw.response.clicked() {
@@ -662,7 +651,10 @@ fn tray(
     if st.confirm.is_some_and(|c| c.pos == p.pos) {
         confirm_popup(ui.ctx(), r, &skin, st, actions);
     }
-    tray_menu(&resp, p, palette, colour, custom, off, now, st, actions, r);
+    // The tray's menu opens from anywhere on it, its strip and meter too.
+    for part in std::iter::once(&resp).chain(&parts) {
+        tray_menu(part, p, palette, colour, custom.clone(), off, now, st, actions, r);
+    }
     if resp.clicked() {
         if ui.input(|i| i.modifiers.command) && !p.pos.group.is_virtual() {
             st.open_picker(p.pos, true, r);
@@ -910,6 +902,10 @@ fn tray_menu(
         }
         if p.pos.group == PosGroup::Asio && !p.master && ui.button("Make master").clicked() {
             actions.push(ScreenAction::Edit(Edit::SetMaster { pos: Some(p.pos) }));
+            ui.close();
+        }
+        if !off && ui.button("Clear clips").clicked() {
+            actions.push(ScreenAction::Edit(Edit::ClearClip));
             ui.close();
         }
         ui.separator();

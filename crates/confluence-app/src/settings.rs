@@ -18,7 +18,7 @@ pub const FINISH_KEY: &str = "skin_finish";
 pub const REDUCE_MOTION_KEY: &str = "reduce_motion";
 
 /// The screen's sections, in order.
-const SECTIONS: [&str; 5] = ["Appearance", "Meters", "Names", "Motion", "Advanced"];
+const SECTIONS: [&str; 6] = ["Appearance", "Meters", "Names", "Motion", "Devices", "Advanced"];
 /// The section list's width.
 const NAV_W: f32 = 180.0;
 /// Panes sit side by side from this content width.
@@ -114,9 +114,30 @@ pub fn screen(
         section(ui, 3, motion_r);
         names_pane(ui, names, prefs, skin);
         motion_pane(ui, motion_r, reduce, skin);
+        // Devices: which sections the Devices screen shows.
+        let bays = crate::bays::Bay::all();
+        let per_row = if two { 3 } else { 2 };
+        let rows = bays.len().div_ceil(per_row);
+        let r =
+            pane(ui, width, 58.0 + rows as f32 * 52.0 + 8.0, "DEVICES", "Sections shown on the Devices screen.", skin);
+        section(ui, 4, r);
+        let cell_w = (r.width() - 2.0 * PANE_PAD) / per_row as f32;
+        for (i, bay) in bays.iter().enumerate() {
+            let at = r.min + Vec2::new(PANE_PAD + (i % per_row) as f32 * cell_w, 58.0 + (i / per_row) as f32 * 52.0);
+            let sw = Rect::from_min_size(at, Vec2::new(cell_w - 12.0, 44.0));
+            let mut shown = !prefs.layout.hidden_sections.contains(bay.title());
+            let label = format!("Show {}", bay.title());
+            if paint::switch(ui, sw, &mut shown, &label, bay.description(), skin).clicked() {
+                if shown {
+                    prefs.layout.hidden_sections.remove(bay.title());
+                } else {
+                    prefs.layout.hidden_sections.insert(bay.title().to_string());
+                }
+            }
+        }
         // Advanced.
         let r = pane(ui, width, 128.0, "ADVANCED", "Options most people never need.", skin);
-        section(ui, 4, r);
+        section(ui, 5, r);
         let sw = Rect::from_min_size(r.min + Vec2::new(PANE_PAD, 58.0), Vec2::new(r.width() - 2.0 * PANE_PAD, 44.0));
         paint::switch(
             ui,

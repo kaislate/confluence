@@ -90,6 +90,8 @@ pub struct LayoutPrefs {
     pub cards: BTreeMap<String, Vec<String>>,
     /// Each Devices section's size (by its title: `Windows`).
     pub section_sizes: BTreeMap<String, crate::rack::SectionSize>,
+    /// Devices sections not shown (by title), from Settings.
+    pub hidden_sections: BTreeSet<String>,
 }
 
 impl ViewPrefs {
